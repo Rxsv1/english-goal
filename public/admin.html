@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <title>Lesson Manager</title>
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <main class="page">
+    <header class="appbar">
+      <a class="brand" href="/"><img src="/icons/icon.svg" alt="">English Goal</a>
+      <div class="tools"><button id="logout" class="btn btn-ghost btn-sm" type="button" hidden>Log out</button></div>
+    </header>
+
+    <!-- Login -->
+    <section id="login-view" hidden>
+      <h1>Lesson Manager</h1>
+      <p class="subtitle">Log in to add and edit lessons.</p>
+      <form id="login-form" class="card form">
+        <label for="password">Admin password</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+        <button class="btn btn-primary btn-block" type="submit">Log in</button>
+        <p id="login-msg" class="form-msg" role="alert"></p>
+      </form>
+    </section>
+
+    <!-- Lesson list -->
+    <section id="list-view" hidden>
+      <h1>Lessons</h1>
+      <p class="subtitle">Drag ☰ to change the order. Students see only published lessons.</p>
+      <div class="toolbar">
+        <button id="new-btn" class="btn btn-primary" type="button">+ New lesson</button>
+        <button id="import-btn" class="btn btn-ghost btn-sm" type="button">Import JSON</button>
+        <a id="export-btn" class="btn btn-ghost btn-sm" href="/api/admin/export">Export all</a>
+        <input id="import-file" type="file" accept="application/json,.json" hidden>
+      </div>
+      <ul id="lesson-list" class="admin-list"></ul>
+      <p id="list-msg" class="state" hidden></p>
+    </section>
+
+    <!-- Editor -->
+    <section id="edit-view" hidden>
+      <h1 id="edit-title">New lesson</h1>
+      <form id="edit-form" class="card form" novalidate>
+        <div class="grid-2">
+          <div class="field grow">
+            <label for="f-title">Title</label>
+            <input id="f-title" maxlength="80" required placeholder="e.g. At the Restaurant">
+          </div>
+          <div class="field emoji-field">
+            <label for="f-emoji">Icon</label>
+            <input id="f-emoji" maxlength="8" placeholder="📘">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field grow">
+            <label for="f-slug">Link name</label>
+            <div class="slug-wrap"><span class="muted" id="slug-prefix">/lesson/</span><input id="f-slug" maxlength="60" placeholder="at-the-restaurant" autocapitalize="off" spellcheck="false"></div>
+          </div>
+          <div class="field">
+            <label for="f-level">Level</label>
+            <select id="f-level"></select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-desc">Short description <span class="muted">(optional)</span></label>
+          <input id="f-desc" maxlength="200" placeholder="Order food and ask for the bill.">
+        </div>
+        <div class="field">
+          <label for="f-sentences">Sentences <span class="muted">(one per line, 2 to 20 words each)</span></label>
+          <textarea id="f-sentences" rows="10" spellcheck="true" placeholder="Can I see the menu, please?&#10;I would like a glass of water.&#10;The bill, please."></textarea>
+          <div id="sentence-check" class="check"></div>
+        </div>
+        <label class="switch"><input id="f-published" type="checkbox" checked> <span>Published (visible to students)</span></label>
+        <p id="edit-msg" class="form-msg" role="alert"></p>
+        <div class="toolbar end">
+          <button id="delete-btn" class="btn btn-danger btn-sm" type="button" hidden>Delete</button>
+          <span class="spacer"></span>
+          <button id="cancel-btn" class="btn btn-ghost" type="button">Cancel</button>
+          <button id="save-btn" class="btn btn-primary" type="submit">Save lesson</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/vendor/Sortable.min.js"></script>
+  <script src="/admin.js"></script>
+</body>
+</html>
