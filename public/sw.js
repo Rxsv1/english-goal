@@ -1,6 +1,7 @@
-/* Offline support: the app shell is cached. API calls always go to the network
-   (progress is queued by the app itself when offline). */
-const VERSION = 'v2';
+/* Offline support. Everything is fetched from the network first, so updates show up
+   immediately; the saved copy is only used when there is no internet.
+   API calls are never cached (progress is queued by the app itself when offline). */
+const VERSION = 'v3';
 const SHELL = `shell-${VERSION}`;
 const SHELL_FILES = ['/', '/app.js', '/style.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
 
@@ -22,18 +23,15 @@ self.addEventListener('fetch', e => {
   if (req.method !== 'GET' || url.origin !== location.origin) return;
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin')) return;
 
-  if (req.mode === 'navigate') {
-    e.respondWith(fetch(req).catch(() => caches.match('/')));
-    return;
-  }
-  // Static files: serve from cache, refresh in the background.
   e.respondWith(
-    caches.match(req).then(hit => {
-      const fresh = fetch(req).then(res => {
-        if (res.ok) caches.open(SHELL).then(c => c.put(req, res.clone()));
+    fetch(req)
+      .then(res => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(SHELL).then(c => c.put(req.mode === 'navigate' ? '/' : req, copy));
+        }
         return res;
-      });
-      return hit || fresh;
-    })
+      })
+      .catch(() => caches.match(req.mode === 'navigate' ? '/' : req).then(hit => hit || caches.match('/')))
   );
 });
