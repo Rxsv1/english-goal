@@ -1,7 +1,7 @@
 'use strict';
 
 // Starter lessons, inserted only when the database is empty.
-module.exports = [
+const lessons = [
   {
     slug: 'greetings',
     title: 'Greetings',
@@ -111,3 +111,43 @@ module.exports = [
     ],
   },
 ];
+
+// Split each lesson into two units of four sentences.
+const UNIT_TITLES = {
+  "greetings": [
+    "Saying hello",
+    "Getting to know someone"
+  ],
+  "daily-routine": [
+    "Morning",
+    "Afternoon and evening"
+  ],
+  "food-and-drinks": [
+    "At a caf\u00e9",
+    "What we eat"
+  ],
+  "at-school": [
+    "In the classroom",
+    "School life"
+  ],
+  "travel": [
+    "Getting around",
+    "At the hotel"
+  ],
+  "past-weekend": [
+    "What we did",
+    "How it ended"
+  ]
+};
+module.exports = lessons.map(l => {
+  const [a, b] = UNIT_TITLES[l.slug];
+  const half = Math.ceil(l.sentences.length / 2);
+  const { sentences, ...rest } = l;
+  return {
+    ...rest,
+    units: [
+      { id: l.slug.replace(/-/g, '').slice(0, 10) + '1', title: a, sentences: sentences.slice(0, half) },
+      { id: l.slug.replace(/-/g, '').slice(0, 10) + '2', title: b, sentences: sentences.slice(half) },
+    ],
+  };
+});

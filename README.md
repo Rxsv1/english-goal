@@ -1,54 +1,56 @@
-# Faisal English Goal
+# WordStack
 
-A web app for practising English: learners put shuffled words in the right order to build sentences.
-You manage lessons from a private admin page, and every lesson has its own link you can share.
+Learn English one sentence at a time. Students log in, **learn** each lesson's sentences with
+audio cards, then **build** them by putting shuffled words in order. Every step is saved on the server,
+and the teacher dashboard shows exactly what each student has done.
 
-- **Students:** `https://your-app.cranl.net/` (all lessons) or `https://your-app.cranl.net/lesson/greetings` (one lesson)
-- **You:** `https://your-app.cranl.net/admin` (add, edit, reorder, publish/hide, import/export lessons)
+- **Students:** `https://your-app.cranl.net/`
+- **Teacher:** `https://your-app.cranl.net/admin`
 
 ## Features
 
-- Tap words **or** drag them into place (works well on phones, tablets and computers)
-- Wrong words turn red, hints place the next correct word, and up to 3 stars per sentence
-- Sentences are read aloud after solving (normal and slow speed)
-- Progress and stars are saved on each learner's device; a "practise hard sentences" round at the end
-- "Practise your own text": paste any English text and it becomes a puzzle
-- Installable as an app on phones (PWA), works offline for lessons already opened, and has a dark mode
+**Students**
+- Sign up with name, email and password (or get an account from the teacher)
+- Lessons are split into **units** (e.g. "At the airport", "At the hotel"). Units open in order: finishing one unlocks the next.
+- Each unit has 2 steps: **1. Learn** (cards: read, listen normally or slowly, tap a word to hear it)
+  and **2. Build** (tap or drag words into order; hints, stars, red marks for wrong words). Build unlocks after the cards.
+- Progress is saved after every card and every sentence. It never goes backwards, and the best stars are kept.
+  Students can stop at any time and continue on any device ("Continue where you stopped").
+- Works offline for a while: finished sentences are queued and sent when the connection returns
+- Home page with stars, sentences, day streak and lessons completed; profile page to change name and password
+- "Practise your own text" (not tracked)
 
-## Deploy on CranL
+**Teacher (`/admin`)**
+- **Overview:** students, activity today and this week, a chart of sentences built per day, and a live activity feed
+- **Students:** search, add a student, open a student to see every lesson's status (cards, sentences built, stars,
+  time, last activity), a 14-day chart and a full activity log. Edit details, reset the password,
+  disable or enable the account, or delete it.
+- **Private lessons:** set a lesson to "Only selected students" and pick who gets it, from the lesson editor or
+  from the student's page
+- **Lessons:** create and edit units (add, rename, reorder, remove), draft or published, reorder, copy the link, per-lesson progress report, import or export JSON
+- **Download progress** as a CSV spreadsheet (opens in Excel)
 
-1. **Put the code on GitHub.** Create a new repository and upload this folder (without `node_modules` and `data`).
-2. **Create the app.** In CranL, click New Application, pick the repository and branch, and choose
-   **Railpack** as the build type (it detects Node.js automatically). Set the **Port** to `3000`.
-3. **Add a database.** Create a **PostgreSQL** database in the same project and select this app as the target.
-   CranL then adds `DATABASE_URL` to the app for you. *Without a database, lessons are kept in a file that
-   is wiped on every redeploy.*
-4. **Set environment variables** on the app:
+## Environment variables (CranL → app → Environment)
 
-   | Name | Value |
-   |---|---|
-   | `ADMIN_PASSWORD` | A strong password for the `/admin` page (**required** to manage lessons) |
-   | `SESSION_SECRET` | Optional. Any long random text; signs admin logins |
-   | `PGSSL` | Optional. Set to `true` only if your database requires SSL connections |
+| Name | Required | What it is |
+|---|---|---|
+| `DATABASE_URL` | yes | PostgreSQL connection string (Internal) |
+| `PGPASSWORD` | if needed | Database password, used if `DATABASE_URL` has no password in it |
+| `ADMIN_PASSWORD` | yes | Password for the teacher dashboard |
+| `SESSION_SECRET` | recommended | Long random text. Keeps students logged in across restarts |
+| `APP_NAME` | no | App name shown everywhere (default `WordStack`) |
+| `ALLOW_SIGNUP` | no | Set to `false` so only the teacher can create student accounts |
+| `PGSSL` | no | `true` if the database requires SSL |
 
-5. **Deploy.** On first start the app creates its table and adds 6 starter lessons.
-   Open `https://<your-app>.cranl.net/admin` to log in.
+Upgrading is automatic: on start the app adds any new tables, turns older lessons into a single unit, and keeps all lessons and student progress.
 
-A custom domain can be added in CranL with a CNAME record; SSL is automatic.
+## Deploy / update on CranL
 
-## Managing lessons
+1. Upload all the files to your GitHub repository (replace the old ones).
+2. CranL builds the new version (or click **Redeploy**).
+3. Logs should show `WordStack running on http://0.0.0.0:3000`.
 
-In `/admin`:
-
-- **New lesson:** title, icon (an emoji), level (A1–C2), short description, and sentences, **one per line**
-  (2–20 words each). The link name is filled in from the title; you can change it.
-- **Draft vs. published:** untick *Published* to hide a lesson while you work on it.
-- **Order:** drag the ☰ handle; students see lessons in this order.
-- **Copy link:** copies the lesson's share link to send to students.
-- **Export all / Import JSON:** back up your lessons or upload many at once. On import, lessons with the
-  same link name are replaced, and new ones are added.
-
-Import file format:
+## Lesson import format
 
 ```json
 {
@@ -60,46 +62,53 @@ Import file format:
       "emoji": "🍽️",
       "description": "Order food and ask for the bill.",
       "published": true,
-      "sentences": [
-        { "en": "Can I see the menu, please?" },
-        { "en": "I would like a glass of water." }
+      "visibility": "public",
+      "units": [
+        {
+          "title": "Ordering",
+          "sentences": [
+            { "en": "Can I see the menu, please?" },
+            { "en": "I would like a glass of water." }
+          ]
+        },
+        {
+          "title": "Paying",
+          "sentences": [
+            { "en": "Can we have the bill, please?" },
+            { "en": "Can I pay by card?" }
+          ]
+        }
       ]
     }
   ]
 }
 ```
 
+A lesson can also use a plain `"sentences": [...]` list instead of `units`; it then becomes a single unit.
+A sentence may appear only once per lesson. `visibility` is `"public"` (all students) or `"assigned"` (only students you select afterwards in the dashboard).
+Importing a lesson with an existing `slug` updates it and keeps student progress (units are matched by title). If a sentence's text changes,
+students need to build that one sentence again.
+
 ## Run locally
+
+Requires Node 18+ and PostgreSQL.
 
 ```bash
 npm install
-ADMIN_PASSWORD=test123 npm start
+DATABASE_URL=postgres://user:pass@localhost:5432/wordstack ADMIN_PASSWORD=test123 SESSION_SECRET=dev npm start
 ```
-
-Then open http://localhost:3000. Without `DATABASE_URL`, lessons are stored in `data/lessons.json`.
 
 ## Project layout
 
 ```
-server.js            Express server and API
-src/store.js         Storage: PostgreSQL (DATABASE_URL) or a local JSON file
-src/validate.js      Lesson validation rules
-src/seed.js          Starter lessons (added only when the database is empty)
-public/index.html    Student app (library, game, practice)  -> public/app.js
-public/admin.html    Lesson manager                         -> public/admin.js
-public/sw.js         Offline support
+server.js               Express app, security headers, pages
+src/db.js               PostgreSQL connection + automatic table setup
+src/auth.js             Passwords (scrypt), sessions (signed cookies), rate limits
+src/progress.js         Stars, lesson status, streaks
+src/routes/student.js   Sign-up/login, lessons, saving progress
+src/routes/admin.js     Teacher API: overview, students, lessons, assignments, CSV
+src/validate.js         Input rules
+src/seed.js             6 starter lessons (only added to an empty database)
+public/app.js           Student app
+public/admin.js         Teacher dashboard
 ```
-
-### API
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/lessons` | – | Published lessons |
-| GET | `/api/lessons/:slug` | – | One published lesson with sentences |
-| POST | `/api/admin/login` | – | `{password}` → `{token}` (valid 7 days) |
-| GET/POST | `/api/admin/lessons` | Bearer | List all / create |
-| GET/PUT/DELETE | `/api/admin/lessons/:id` | Bearer | Read / update / delete |
-| POST | `/api/admin/reorder` | Bearer | `{ids:[...]}` |
-| POST | `/api/admin/import` | Bearer | `{lessons:[...]}` |
-| GET | `/api/admin/export` | Bearer | Download all lessons |
-| GET | `/healthz` | – | Health check |

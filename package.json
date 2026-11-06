@@ -1,8 +1,8 @@
 {
-  "name": "sentence-puzzle",
-  "version": "1.0.0",
+  "name": "wordstack",
+  "version": "2.0.0",
   "private": true,
-  "description": "Faisal English Goal - an English sentence-building web app with shareable lessons",
+  "description": "WordStack - learn English one sentence at a time",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

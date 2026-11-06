@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Faisal English Goal</title>
-  <meta name="description" content="Build English sentences word by word. Free lessons for every level.">
+  <title>{{APP_NAME}}</title>
+  <meta name="app-name" content="{{APP_NAME}}">
+  <meta name="description" content="Learn English one sentence at a time.">
   <meta name="theme-color" content="#F4F7FB" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#111821" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="English Goal">
+  <meta name="apple-mobile-web-app-title" content="{{APP_NAME}}">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
@@ -20,8 +21,8 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main id="app" class="page" aria-live="polite"></main>
-  <div id="toast" class="toast" role="status"></div>
+  <main id="app" class="page"></main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <canvas id="confetti" aria-hidden="true"></canvas>
   <script src="/vendor/Sortable.min.js"></script>
   <script src="/app.js"></script>

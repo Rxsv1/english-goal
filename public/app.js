@@ -1,14 +1,16 @@
-/* Faisal English Goal - sentence-building game */
+/* WordStack - student app */
 (function () {
   'use strict';
 
   const app = document.getElementById('app');
+  const APP_NAME = (document.querySelector('meta[name="app-name"]') || {}).content || 'WordStack';
   const MAX_PRACTICE = 30;
   const ICON = {
     back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
     next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>',
     reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg>',
-    share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
   };
 
   /* ================================================================ */
@@ -19,7 +21,7 @@
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v === null || v === undefined || v === false) continue;
       if (k === 'class') el.className = v;
-      else if (k === 'html') el.innerHTML = v; // only used with our own static SVG strings
+      else if (k === 'html') el.innerHTML = v; // only ever used with the static ICON strings above
       else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v === true ? '' : v);
     }
@@ -34,16 +36,8 @@
     set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode */ } },
   };
 
-  const settings = Object.assign({ sound: true, speak: true }, storage.get('sp:settings', {}));
-  const saveSettings = () => storage.set('sp:settings', settings);
-
-  // progress = { [lessonSlug]: { [sentenceText]: bestStars } } - keyed by text so edits don't shift results
-  const progress = storage.get('sp:progress', {});
-  const saveProgress = () => storage.set('sp:progress', progress);
-  function lessonStars(slug, sentences) {
-    const p = progress[slug] || {};
-    return sentences.reduce((sum, s) => sum + (p[s.en || s] || 0), 0);
-  }
+  const settings = Object.assign({ sound: true }, storage.get('ws:settings', {}));
+  const saveSettings = () => storage.set('ws:settings', settings);
 
   let toastTimer;
   function toast(msg) {
@@ -51,23 +45,79 @@
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 2400);
   }
 
-  async function api(url) {
-    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  function formatTime(sec) {
+    if (sec < 60) return `${sec}s`;
+    const m = Math.round(sec / 60);
+    return m < 60 ? `${m} min` : `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+
+  /* ---------- API ---------- */
+  let me = null;
+  let config = { appName: APP_NAME, allowSignup: true };
+
+  async function api(method, url, body) {
+    const res = await fetch(url, {
+      method,
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}) },
+      body: method === 'GET' ? undefined : JSON.stringify(body || {}),
+    });
+    if (res.status === 204) return {};
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) { const e = new Error(data.error || 'Request failed'); e.status = res.status; throw e; }
+    if (!res.ok) {
+      const e = new Error(data.error || `Something went wrong (${res.status}).`);
+      e.status = res.status;
+      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; goLogin(); }
+      if (res.status === 403 && /disabled/i.test(e.message)) { me = null; toast(e.message); goLogin(); }
+      throw e;
+    }
     return data;
   }
 
-  async function shareLink(title, path) {
-    const url = location.origin + path;
-    if (navigator.share) {
-      try { await navigator.share({ title, text: `Practise English: ${title}`, url }); return; } catch (e) { if (e.name === 'AbortError') return; }
-    }
-    try { await navigator.clipboard.writeText(url); toast('Link copied!'); } catch (e) { prompt('Copy this link:', url); }
-  }
+  /* ---------- Offline-safe progress saving ---------- */
+  // Progress calls go through an outbox: if the network fails they are kept and sent later,
+  // so a finished sentence is never lost.
+  const outbox = {
+    key: 'ws:outbox',
+    items() { return storage.get(this.key, []); },
+    save(list) { storage.set(this.key, list); },
+    flushing: false,
+    async send(url, body) {
+      const item = { id: uid(), user: me && me.id, url, body };
+      try {
+        return await api('POST', url, body);
+      } catch (e) {
+        if (!e.status || e.status >= 500 || e.status === 429) {
+          this.save([...this.items(), item]);
+          return null;
+        }
+        throw e;
+      }
+    },
+    async flush() {
+      if (this.flushing || !me) return;
+      this.flushing = true;
+      try {
+        for (const item of this.items()) {
+          if (item.user !== me.id) continue;
+          try {
+            await api('POST', item.url, item.body);
+          } catch (e) {
+            if (!e.status || e.status >= 500 || e.status === 429 || e.status === 401) break; // try again later
+          }
+          this.save(this.items().filter(x => x.id !== item.id));
+        }
+      } finally {
+        this.flushing = false;
+      }
+    },
+  };
+  window.addEventListener('online', () => outbox.flush());
 
   /* ---------- Sound, speech, confetti ---------- */
   let audioCtx;
@@ -86,6 +136,7 @@
     tap: () => tone(660, 0, 0.06, 'sine'),
     wrong: () => { tone(220, 0, 0.15, 'square'); tone(196, 0.12, 0.2, 'square'); },
     hint: () => tone(440, 0, 0.12),
+    card: () => tone(880, 0, 0.05, 'sine'),
     win: () => { tone(523, 0, 0.15); tone(659, 0.12, 0.15); tone(784, 0.24, 0.3); },
     finish: () => { tone(523, 0, 0.15); tone(659, 0.15, 0.15); tone(784, 0.3, 0.15); tone(1047, 0.45, 0.4); },
   };
@@ -99,13 +150,14 @@
       || vs.find(v => /en[-_](US|GB)/i.test(v.lang)) || vs[0] || null;
   }
   if (canSpeak) { pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
-  function speak(text, slow) {
+  function speak(text, slow, onEnd) {
     if (!canSpeak) return;
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.lang = voice ? voice.lang : 'en-US';
     if (voice) u.voice = voice;
     u.rate = slow ? 0.6 : 0.9;
+    if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
     speechSynthesis.speak(u);
   }
   const stopSpeech = () => { if (canSpeak) speechSynthesis.cancel(); };
@@ -134,17 +186,11 @@
     })();
   }
 
-  /* ================================================================ */
-  /* Text processing                                                   */
-  /* ================================================================ */
+  /* ---------- Text processing ---------- */
   const stripEdges = t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const tokenize = sentence => sentence.trim().split(/\s+/).map(stripEdges).filter(Boolean);
 
-  /** Sentence -> list of word tiles. Keeps numbers, apostrophes and hyphens inside words. */
-  function tokenize(sentence) {
-    return sentence.trim().split(/\s+/).map(stripEdges).filter(Boolean);
-  }
-
-  /** Lower-cases the first word so the capital letter doesn't reveal it (keeps "I", "I'm", acronyms). */
+  /** Lower-cases the first word so its capital letter doesn't give it away (keeps "I", "I'm", acronyms). */
   function hideCapital(words) {
     const out = [...words];
     const w = out[0];
@@ -154,7 +200,6 @@
   }
 
   const ABBR = /(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|No|e\.g|i\.e|a\.m|p\.m|U\.S|U\.K|[A-Z])\.$/i;
-  /** Splits pasted text into sentences. Handles "Mr. Smith", "3.5", "U.S." and line breaks. */
   function splitSentences(text) {
     const out = [];
     for (const line of text.replace(/\r/g, '').split(/\n+/)) {
@@ -166,7 +211,7 @@
       if (buf.trim()) out.push(buf.trim());
     }
     return out
-      .map(s => s.split(/\s+/).filter(t => /[\p{Script=Latin}\p{N}]/u.test(t)).join(' ')) // drop non-English tokens
+      .map(s => s.split(/\s+/).filter(t => /[\p{Script=Latin}\p{N}]/u.test(t)).join(' '))
       .filter(s => /\p{Script=Latin}/u.test(s) && tokenize(s).length >= 2);
   }
 
@@ -181,9 +226,7 @@
   }
 
   const starsFor = penalty => (penalty === 0 ? 3 : penalty <= 2 ? 2 : 1);
-  function starNodes(n, max = 3) {
-    return [h('span', null, '★'.repeat(n)), h('span', { class: 'off' }, '★'.repeat(max - n))];
-  }
+  const starNodes = (n, max = 3) => [h('span', null, '★'.repeat(n)), h('span', { class: 'off' }, '★'.repeat(Math.max(0, max - n)))];
 
   /* ================================================================ */
   /* Router                                                            */
@@ -193,190 +236,465 @@
     if (replace) history.replaceState(null, '', path); else history.pushState(null, '', path);
     route();
   }
+  function goLogin() {
+    const here = location.pathname + location.search;
+    if (/^\/(login|signup)/.test(location.pathname)) return;
+    navigate('/login' + (here && here !== '/' ? `?next=${encodeURIComponent(here)}` : ''), true);
+  }
+
   function route() {
     if (cleanup) { cleanup(); cleanup = null; }
     stopSpeech();
     window.scrollTo(0, 0);
     const path = location.pathname.replace(/\/+$/, '') || '/';
-    const m = path.match(/^\/lesson\/([a-z0-9-]+)$/);
-    if (m) return showLesson(m[1]);
+    if (path === '/login') return showAuth('login');
+    if (path === '/signup') return showAuth('signup');
+    if (!me) return goLogin();
+    let m;
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)$/))) return showLessonHub(m[1]);
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|review)$/i))) return showLessonStep(m[1], m[2], m[3]);
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/(learn|build|review)$/))) return navigate(`/lesson/${m[1]}`, true);
     if (path === '/practice') return showPractice();
+    if (path === '/profile') return showProfile();
     if (path !== '/') history.replaceState(null, '', '/');
-    showLibrary();
+    showHome();
   }
   window.addEventListener('popstate', route);
-  app.addEventListener('contextmenu', e => { if (e.target.closest('.tile')) e.preventDefault(); });
   document.addEventListener('click', e => {
     const a = e.target.closest('a[data-link]');
     if (!a || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
     e.preventDefault();
     navigate(a.getAttribute('href'));
   });
+  app.addEventListener('contextmenu', e => { if (e.target.closest('.tile')) e.preventDefault(); });
 
-  function setView(...nodes) {
-    app.replaceChildren(...nodes);
+  const setView = (...nodes) => app.replaceChildren(...nodes.flat().filter(n => n !== null && n !== undefined && n !== false));
+  const loading = text => setView(h('div', { class: 'state' }, h('div', { class: 'spinner' }), text || 'Loading…'));
+  function errorView(e, retry) {
+    setView(appBar(), h('div', { class: 'state' },
+      h('div', { class: 'big' }, e.status === 404 ? '🔍' : '📡'),
+      h('p', null, e.status === 404 ? "This lesson doesn't exist or isn't available to you." : e.message || "Couldn't connect. Check your internet."),
+      h('div', { class: 'row-actions' },
+        retry && e.status !== 404 ? h('button', { class: 'btn btn-ghost', type: 'button', onclick: retry }, 'Try again') : null,
+        h('a', { class: 'btn btn-primary', href: '/', 'data-link': true }, 'Go home'))));
   }
 
   function soundButton() {
     const b = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Sound on or off' });
     const sync = () => { b.textContent = settings.sound ? '🔊' : '🔇'; b.setAttribute('aria-pressed', String(settings.sound)); };
-    b.addEventListener('click', () => {
-      settings.sound = !settings.sound; settings.speak = settings.sound; saveSettings(); sync();
-      if (!settings.sound) stopSpeech();
-    });
+    b.addEventListener('click', () => { settings.sound = !settings.sound; saveSettings(); sync(); if (!settings.sound) stopSpeech(); });
     sync();
     return b;
   }
 
+  function avatar(name, cls) {
+    return h('span', { class: 'avatar ' + (cls || ''), 'aria-hidden': 'true' }, (name || '?').trim().charAt(0).toUpperCase());
+  }
+
   function appBar() {
     return h('header', { class: 'appbar' },
-      h('a', { class: 'brand', href: '/', 'data-link': true }, h('img', { src: '/icons/icon.svg', alt: '' }), 'English Goal'),
-      h('div', { class: 'tools' }, soundButton()));
+      h('a', { class: 'brand', href: '/', 'data-link': true }, h('img', { src: '/icons/icon.svg', alt: '' }), config.appName),
+      h('div', { class: 'tools' }, soundButton(),
+        me ? h('a', { class: 'avatar-btn', href: '/profile', 'data-link': true, 'aria-label': 'My profile' }, avatar(me.name)) : null));
   }
 
   /* ================================================================ */
-  /* Library                                                           */
+  /* Login / Sign up                                                   */
   /* ================================================================ */
-  let libraryCache = null;
-  let levelFilter = storage.get('sp:level', 'All');
+  function showAuth(mode) {
+    if (me) return navigate('/', true);
+    if (mode === 'signup' && !config.allowSignup) return navigate('/login', true);
+    const isSignup = mode === 'signup';
+    document.title = `${isSignup ? 'Sign up' : 'Log in'} · ${config.appName}`;
+    const next = new URLSearchParams(location.search).get('next');
+    const safeNext = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+    const msg = h('p', { class: 'form-msg', role: 'alert' });
+    const name = h('input', { id: 'f-name', type: 'text', autocomplete: 'name', required: true, maxlength: '60', placeholder: 'e.g. Sara Ahmed' });
+    const email = h('input', { id: 'f-email', type: 'email', autocomplete: 'email', required: true, maxlength: '254', placeholder: 'you@example.com', inputmode: 'email' });
+    const password = h('input', { id: 'f-password', type: 'password', autocomplete: isSignup ? 'new-password' : 'current-password', required: true, minlength: isSignup ? '8' : null, maxlength: '128' });
+    const submit = h('button', { class: 'btn btn-primary btn-block', type: 'submit' }, isSignup ? 'Create my account' : 'Log in');
 
-  async function showLibrary() {
-    document.title = 'Faisal English Goal';
-    const grid = h('div', { class: 'lesson-grid' });
-    const chips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Filter by level' });
-    const body = h('div', null, h('div', { class: 'state' }, h('div', { class: 'spinner' }), 'Loading lessons…'));
-    setView(
-      appBar(),
-      h('h1', null, 'Faisal English Goal'),
-      h('p', { class: 'subtitle' }, 'Put the words in the right order to build each sentence.'),
-      body
-    );
+    const form = h('form', { class: 'auth-form', novalidate: true },
+      isSignup ? h('div', { class: 'field' }, h('label', { for: 'f-name' }, 'Your name'), name) : null,
+      h('div', { class: 'field' }, h('label', { for: 'f-email' }, 'Email'), email),
+      h('div', { class: 'field' }, h('label', { for: 'f-password' }, 'Password', isSignup ? h('span', { class: 'muted' }, ' (at least 8 characters)') : null), password),
+      msg, submit);
 
-    let lessons;
-    try {
-      lessons = (await api('/api/lessons')).lessons;
-      libraryCache = lessons;
-    } catch (e) {
-      lessons = libraryCache;
-      if (!lessons) {
-        body.replaceChildren(h('div', { class: 'state' }, h('div', { class: 'big' }, '📡'),
-          h('p', null, "Couldn't load lessons. Check your connection."),
-          h('button', { class: 'btn btn-ghost', type: 'button', onclick: showLibrary }, 'Try again')));
-        return;
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      msg.textContent = '';
+      if (isSignup && name.value.trim().length < 2) { msg.textContent = 'Please enter your name.'; name.focus(); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim())) { msg.textContent = 'Please enter a valid email address.'; email.focus(); return; }
+      if (isSignup && password.value.length < 8) { msg.textContent = 'Password must be at least 8 characters.'; password.focus(); return; }
+      submit.disabled = true;
+      try {
+        const body = { email: email.value, password: password.value };
+        if (isSignup) body.name = name.value;
+        await api('POST', isSignup ? '/api/auth/signup' : '/api/auth/login', body);
+        await loadMe();
+        navigate(safeNext, true);
+        if (isSignup) toast(`Welcome, ${me.name}! 🎉`);
+      } catch (err) {
+        msg.textContent = err.message;
+      } finally {
+        submit.disabled = false;
       }
+    });
+
+    const qs = next ? `?next=${encodeURIComponent(next)}` : '';
+    setView(h('section', { class: 'auth' },
+      h('div', { class: 'auth-brand' }, h('img', { src: '/icons/icon.svg', alt: '' }), h('span', null, config.appName)),
+      h('h1', null, isSignup ? 'Create your account' : 'Welcome back'),
+      h('p', { class: 'subtitle' }, isSignup ? 'Learn English one sentence at a time.' : 'Log in to continue learning.'),
+      h('div', { class: 'card' }, form),
+      h('p', { class: 'auth-switch' },
+        isSignup
+          ? ['Already have an account? ', h('a', { href: '/login' + qs, 'data-link': true }, 'Log in')]
+          : config.allowSignup ? ['New here? ', h('a', { href: '/signup' + qs, 'data-link': true }, 'Create an account')] : 'Ask your teacher for an account.'),
+      !isSignup ? h('p', { class: 'auth-switch muted' }, 'Forgot your password? Ask your teacher to reset it.') : null));
+    (isSignup ? name : email).focus();
+  }
+
+  /* ================================================================ */
+  /* Home                                                              */
+  /* ================================================================ */
+  let levelFilter = storage.get('ws:level', 'All');
+
+  const STATUS_LABEL = {
+    new: 'New',
+    learning: 'Learning',
+    building: 'In progress',
+    completed: 'Completed',
+  };
+
+  function statusText(p) {
+    if (p.completed) return '✓ Completed';
+    if (p.status === 'new' || p.currentUnit === null) return 'New';
+    const u = p.units[p.currentUnit];
+    const where = p.unitsTotal > 1 ? `Unit ${p.currentUnit + 1}/${p.unitsTotal} · ` : '';
+    return where + (u.learned ? `${u.solved}/${u.total} built` : 'learning');
+  }
+
+  function unitStepText(p) {
+    if (p.currentUnit === null) return 'Completed';
+    const u = p.units[p.currentUnit];
+    const where = p.unitsTotal > 1 ? `Unit ${p.currentUnit + 1} · ${u.title} · ` : '';
+    return where + (u.learned ? `Step 2 · ${u.solved} of ${u.total} built` : 'Step 1 · learning the sentences');
+  }
+
+  async function showHome() {
+    document.title = config.appName;
+    loading('Loading your lessons…');
+    let lessons, stats;
+    try {
+      const [l, m] = await Promise.all([api('GET', '/api/lessons'), api('GET', '/api/me')]);
+      lessons = l.lessons; stats = m.stats; me = m.user;
+    } catch (e) {
+      if (e.status !== 401) errorView(e, showHome);
+      return;
     }
+
+    const cont = lessons
+      .filter(l => !l.progress.completed && l.progress.lastActivityAt)
+      .sort((a, b) => new Date(b.progress.lastActivityAt) - new Date(a.progress.lastActivityAt))[0];
+    const assigned = lessons.filter(l => l.assigned);
 
     const levels = ['All', ...new Set(lessons.map(l => l.level))].sort((a, b) => (a === 'All' ? -1 : b === 'All' ? 1 : a.localeCompare(b)));
     if (!levels.includes(levelFilter)) levelFilter = 'All';
-
+    const chips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Filter by level' });
+    const grid = h('div', { class: 'lesson-grid' });
     const draw = () => {
       chips.replaceChildren(...(levels.length > 2 ? levels.map(lv => h('button', {
         class: 'chip', type: 'button', 'aria-pressed': String(lv === levelFilter),
-        onclick: () => { levelFilter = lv; storage.set('sp:level', lv); draw(); },
+        onclick: () => { levelFilter = lv; storage.set('ws:level', lv); draw(); },
       }, lv)) : []));
-      const shown = lessons.filter(l => levelFilter === 'All' || l.level === levelFilter);
       grid.replaceChildren(
-        ...shown.map(lessonCard),
+        ...lessons.filter(l => levelFilter === 'All' || l.level === levelFilter).map(lessonCard),
         h('a', { class: 'lesson-card card-practice', href: '/practice', 'data-link': true },
           h('div', { class: 'top' }, h('span', { class: 'emoji' }, '✍️')),
           h('div', { class: 'title' }, 'Practise your own text'),
-          h('div', { class: 'desc' }, 'Paste any English text and turn it into a puzzle.'))
-      );
+          h('div', { class: 'desc' }, 'Paste any English text and turn it into a puzzle.')));
     };
     draw();
-    body.replaceChildren(lessons.length ? chips : '', grid);
+
+    const hour = new Date().getHours();
+    const greet = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+    const firstName = me.name.split(/\s+/)[0];
+
+    setView(
+      appBar(),
+      h('h1', null, `${greet}, ${firstName} 👋`),
+      h('p', { class: 'subtitle' }, stats.sentencesSolved ? 'Keep going, you are doing great.' : 'Pick a lesson to start. First learn the sentences, then build them.'),
+      h('div', { class: 'stat-row' },
+        statTile('⭐', stats.stars, 'stars'),
+        statTile('✅', stats.sentencesSolved, 'sentences'),
+        statTile('🔥', stats.streak, stats.streak === 1 ? 'day streak' : 'day streak'),
+        statTile('🏆', stats.lessonsCompleted, 'lessons done')),
+      cont ? h('a', { class: 'continue-card', href: `/lesson/${cont.slug}`, 'data-link': true },
+        h('span', { class: 'emoji' }, cont.emoji || '📘'),
+        h('div', { class: 'info' },
+          h('div', { class: 'label' }, 'Continue where you stopped'),
+          h('div', { class: 'title' }, cont.title),
+          h('div', { class: 'muted' }, unitStepText(cont.progress))),
+        h('span', { class: 'go', html: ICON.next })) : null,
+      assigned.length ? h('section', { class: 'section' },
+        h('h2', null, '📌 Lessons for you'),
+        h('div', { class: 'lesson-grid' }, assigned.map(lessonCard))) : null,
+      h('section', { class: 'section' },
+        h('h2', null, 'All lessons'),
+        lessons.length ? chips : h('p', { class: 'muted' }, 'No lessons yet. Your teacher will add some soon.'),
+        grid)
+    );
+    outbox.flush();
+  }
+
+  function statTile(icon, value, label) {
+    return h('div', { class: 'stat' }, h('div', { class: 'v' }, h('span', { 'aria-hidden': 'true' }, icon + ' '), String(value)), h('div', { class: 'l' }, label));
   }
 
   function lessonCard(l) {
-    const max = l.count * 3;
-    const p = progress[l.slug] || {};
-    const earned = Object.values(p).reduce((a, b) => a + b, 0);
-    const pct = max ? Math.min(100, Math.round((earned / max) * 100)) : 0;
+    const p = l.progress;
+    const pct = p.total ? Math.round((p.solved / p.total) * 100) : 0;
     const fill = h('div', { class: 'mini-fill' });
     fill.style.width = pct + '%';
-    return h('a', { class: 'lesson-card' + (pct === 100 ? ' done' : ''), href: `/lesson/${l.slug}`, 'data-link': true },
-      h('div', { class: 'top' }, h('span', { class: 'emoji' }, l.emoji || '📘'), h('span', { class: 'level' }, l.level)),
+    return h('a', { class: 'lesson-card' + (p.completed ? ' done' : ''), href: `/lesson/${l.slug}`, 'data-link': true },
+      h('div', { class: 'top' },
+        h('span', { class: 'emoji' }, l.emoji || '📘'),
+        h('span', { class: 'badges' }, l.assigned ? h('span', { class: 'badge-you', title: 'Given to you by your teacher' }, 'For you') : null, h('span', { class: 'level' }, l.level))),
       h('div', { class: 'title' }, l.title),
       h('div', { class: 'desc' }, l.description || ''),
       h('div', { class: 'mini-track', 'aria-hidden': 'true' }, fill),
-      h('div', { class: 'meta' }, h('span', null, `${l.count} sentences`), h('span', null, earned ? `⭐ ${Math.min(earned, max)} / ${max}` : 'New')));
+      h('div', { class: 'meta' },
+        h('span', { class: 'status status-' + p.status }, statusText(p)),
+        h('span', null, p.stars ? `⭐ ${p.stars} / ${p.maxStars}` : p.unitsTotal > 1 ? `${plural(p.unitsTotal, 'unit')} · ${l.count} sentences` : plural(l.count, 'sentence'))));
   }
 
   /* ================================================================ */
-  /* Practice (paste your own text)                                    */
+  /* Lesson page: list of units                                        */
   /* ================================================================ */
-  function showPractice() {
-    document.title = 'Practise your text · English Goal';
-    const ta = h('textarea', { dir: 'ltr', placeholder: 'Paste English text here. Each sentence becomes a puzzle.', 'aria-label': 'Your English text' });
-    ta.value = storage.get('sp:practice', '');
-    const msg = h('p', { class: 'form-msg', role: 'alert' });
-    ta.addEventListener('input', () => { msg.textContent = ''; storage.set('sp:practice', ta.value); });
+  let lessonCache = null; // { slug, lesson, progress }
 
-    const start = () => {
-      const sentences = splitSentences(ta.value);
-      if (!sentences.length) { msg.textContent = 'Please enter at least one English sentence with two or more words.'; ta.focus(); return; }
-      if (sentences.length > MAX_PRACTICE) toast(`Using the first ${MAX_PRACTICE} of ${sentences.length} sentences.`);
-      playLesson({ slug: null, title: 'My text', sentences: sentences.slice(0, MAX_PRACTICE).map(en => ({ en })) }, null, '/practice');
-    };
+  async function loadLesson(slug) {
+    const data = await api('GET', `/api/lessons/${slug}`);
+    lessonCache = { slug, ...data };
+    return lessonCache;
+  }
+
+  const unitPath = (slug, unit, step) => `/lesson/${slug}/u/${unit.id}/${step}`;
+
+  async function showLessonHub(slug) {
+    loading('Loading lesson…');
+    let data;
+    try { data = await loadLesson(slug); } catch (e) { if (e.status !== 401) errorView(e, () => showLessonHub(slug)); return; }
+    lessonCache = null;
+    const { lesson, progress: p } = data;
+    document.title = `${lesson.title} · ${config.appName}`;
+    const multi = lesson.units.length > 1;
+
+    const pct = p.total ? Math.round((p.solved / p.total) * 100) : 0;
+    const fill = h('div', { class: 'progress-fill' });
+    fill.style.width = pct + '%';
+
+    const unitCards = lesson.units.map((unit, i) => {
+      const up = p.units[i];
+      const current = i === p.currentUnit;
+      let action = null;
+      if (current) {
+        action = up.learned
+          ? h('a', { class: 'btn btn-primary btn-block', href: unitPath(slug, unit, 'build'), 'data-link': true }, up.solved ? 'Continue building' : 'Start building')
+          : h('a', { class: 'btn btn-primary btn-block', href: unitPath(slug, unit, 'learn'), 'data-link': true }, up.status === 'learning' ? 'Continue learning' : 'Start learning');
+      } else if (up.completed) {
+        action = h('div', { class: 'unit-actions' },
+          h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'learn'), 'data-link': true }, '🃏 Review cards'),
+          h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'review'), 'data-link': true }, '🧩 Practise'));
+      }
+      const learnTxt = up.learned ? '✓' : up.status === 'learning' ? `${up.learnIndex + 1}/${up.total}` : '–';
+      return h('li', { class: 'unit' + (up.completed ? ' done' : current ? ' current' : up.locked ? ' locked' : '') },
+        h('div', { class: 'unit-head' },
+          h('span', { class: 'step-num', html: up.completed ? ICON.check : up.locked ? ICON.lock : null }, up.completed || up.locked ? null : String(i + 1)),
+          h('div', { class: 'step-body' },
+            multi ? h('div', { class: 'unit-label' }, `Unit ${i + 1}`) : null,
+            h('div', { class: 'step-title' }, multi ? unit.title : 'Your sentences'),
+            up.locked
+              ? h('div', { class: 'muted' }, `Finish Unit ${i} to open this unit`)
+              : h('div', { class: 'unit-steps' },
+                  h('span', { class: up.learned ? 'ok' : '' }, `🃏 Learn ${learnTxt}`),
+                  h('span', { class: up.completed ? 'ok' : '' }, `🧩 Build ${up.solved}/${up.total}`),
+                  up.stars ? h('span', null, `⭐ ${up.stars}`) : null))),
+        action);
+    });
 
     setView(
-      h('header', { class: 'appbar' },
-        h('a', { class: 'btn btn-ghost btn-sm', href: '/', 'data-link': true, html: ICON.back + ' Lessons' }),
-        h('div', { class: 'tools' }, soundButton())),
-      h('h1', null, 'Practise your own text'),
-      h('p', { class: 'subtitle' }, 'Sentences are split automatically. Numbers and contractions are kept.'),
-      h('div', { class: 'card' }, ta),
-      msg,
-      h('div', { class: 'row-actions' },
-        h('button', { class: 'btn btn-primary', type: 'button', onclick: start }, 'Start'),
-        h('button', {
-          class: 'btn btn-ghost', type: 'button', onclick: () => {
-            ta.value = "The quick brown fox jumps over the lazy dog. My sister reads a book every night. We are going to the beach tomorrow. Can you help me with my homework? Mr. Brown has 2 cats and a dog. She doesn't like cold weather.";
-            ta.dispatchEvent(new Event('input'));
-          },
-        }, 'Try an example'))
+      h('div', { class: 'game-top' },
+        h('a', { class: 'icon-btn', href: '/', 'data-link': true, 'aria-label': 'Back to lessons', html: ICON.back }),
+        h('div', { class: 'lesson-name' }, ''), soundButton()),
+      h('section', { class: 'hub' },
+        h('div', { class: 'hub-emoji', 'aria-hidden': 'true' }, lesson.emoji || '📘'),
+        h('h1', null, lesson.title),
+        h('p', { class: 'subtitle' }, h('span', { class: 'level' }, lesson.level), ' ', lesson.description || '', lesson.assigned ? ' · Given to you by your teacher' : ''),
+        p.completed ? h('div', { class: 'complete-banner' }, '🏆 You completed this lesson! ', h('span', null, `⭐ ${p.stars} / ${p.maxStars}`)) : null,
+        h('div', { class: 'progress-track', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' }, fill),
+        h('p', { class: 'muted center' },
+          multi ? `${p.unitsCompleted} of ${p.unitsTotal} units done · ` : '', `${p.solved} of ${p.total} sentences built${p.stars ? ` · ⭐ ${p.stars}` : ''}`),
+        !p.completed && p.status === 'new' ? h('p', { class: 'how' }, 'In each unit: 1️⃣ learn the sentences with cards, then 2️⃣ build them.') : null,
+        h('ol', { class: 'units' }, unitCards),
+        p.completed ? h('div', { class: 'hub-actions' }, h('a', { class: 'btn btn-primary btn-block', href: '/', 'data-link': true }, 'Choose another lesson')) : null)
     );
   }
 
-  /* ================================================================ */
-  /* Lesson loading                                                    */
-  /* ================================================================ */
-  async function showLesson(slug) {
-    setView(h('div', { class: 'state' }, h('div', { class: 'spinner' }), 'Loading lesson…'));
+  async function showLessonStep(slug, unitId, step) {
+    loading();
+    let data;
     try {
-      const { lesson } = await api(`/api/lessons/${slug}`);
-      playLesson(lesson, null, '/');
-    } catch (e) {
-      setView(appBar(), h('div', { class: 'state' },
-        h('div', { class: 'big' }, e.status === 404 ? '🔍' : '📡'),
-        h('p', null, e.status === 404 ? "This lesson doesn't exist or was removed." : "Couldn't load the lesson. Check your connection."),
-        h('div', { class: 'row-actions' },
-          e.status === 404 ? null : h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => showLesson(slug) }, 'Try again'),
-          h('a', { class: 'btn btn-primary', href: '/', 'data-link': true }, 'See all lessons'))));
+      data = lessonCache && lessonCache.slug === slug ? lessonCache : await loadLesson(slug);
+    } catch (e) { if (e.status !== 401) errorView(e, () => showLessonStep(slug, unitId, step)); return; }
+    lessonCache = null; // refetch next time so progress is fresh
+    const ui = data.lesson.units.findIndex(u => u.id === unitId);
+    if (ui < 0) { toast('This unit was changed by your teacher.'); return navigate(`/lesson/${slug}`, true); }
+    const unit = data.lesson.units[ui];
+    const up = data.progress.units[ui];
+    const ctx = { slug, lesson: data.lesson, unit, unitIndex: ui, up, progress: data.progress };
+    if (up.locked) { toast(`Finish Unit ${ui} first 🔒`); return navigate(`/lesson/${slug}`, true); }
+    if (step === 'learn') return runCards(ctx);
+    if (!up.learned) { toast('First learn the sentences 👀'); return navigate(unitPath(slug, unit, 'learn'), true); }
+    if (step === 'build') {
+      const items = unit.sentences.filter(s => !s.stars);
+      if (!items.length) return navigate(`/lesson/${slug}`, true);
+      return runPuzzle({ ...ctx, items, mode: 'build', exitPath: `/lesson/${slug}` });
     }
+    return runPuzzle({ ...ctx, items: unit.sentences, mode: 'review', exitPath: `/lesson/${slug}` });
+  }
+
+  const unitChip = (lesson, unitIndex, step) =>
+    lesson.units.length > 1 ? `Unit ${unitIndex + 1} · ${step}` : step;
+
+  /* ================================================================ */
+  /* Step 1 - Learning cards                                           */
+  /* ================================================================ */
+  function runCards({ slug, lesson, unit, unitIndex, up }) {
+    document.title = `Learn · ${lesson.title} · ${config.appName}`;
+    const sentences = unit.sentences;
+    const total = sentences.length;
+    const learnUrl = `/api/lessons/${slug}/units/${unit.id}/learn`;
+    let i = up.learned ? 0 : Math.min(up.learnIndex, total - 1);
+    let shownAt = Date.now();
+
+    const pill = h('div', { class: 'pill' });
+    const fill = h('div', { class: 'progress-fill' });
+    const num = h('div', { class: 'card-num' });
+    const text = h('p', { class: 'card-sentence', lang: 'en' });
+    const card = h('div', { class: 'learn-card', tabindex: '-1' }, num, text, h('p', { class: 'card-tip muted' }, 'Tap a word to hear it'));
+    const listen = h('button', { class: 'btn btn-accent', type: 'button' }, '🔊 Listen');
+    const slow = h('button', { class: 'btn btn-ghost', type: 'button' }, '🐢 Slow');
+    const prev = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.back + ' Back' });
+    const next = h('button', { class: 'btn btn-primary', type: 'button' });
+    if (!canSpeak) { listen.disabled = true; slow.disabled = true; listen.title = 'Speech is not supported on this device'; }
+
+    setView(
+      h('div', { class: 'game-top' },
+        h('a', { class: 'icon-btn', href: `/lesson/${slug}`, 'data-link': true, 'aria-label': 'Back to lesson', html: ICON.back }),
+        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, unitChip(lesson, unitIndex, 'Learn')), ' ', lesson.units.length > 1 ? unit.title : lesson.title),
+        pill, soundButton()),
+      h('div', { class: 'progress-track', role: 'progressbar' }, fill),
+      h('p', { class: 'prompt' }, 'Read and listen. You will build these sentences next.'),
+      card,
+      h('div', { class: 'listen-row' }, listen, slow),
+      h('div', { class: 'actions' }, prev, next)
+    );
+
+    function speakCard(s) {
+      card.classList.add('speaking');
+      speak(sentences[i].en, s, () => card.classList.remove('speaking'));
+    }
+
+    function render(autoSpeak) {
+      const s = sentences[i].en;
+      pill.textContent = `${i + 1} / ${total}`;
+      fill.style.width = `${((i + 1) / total) * 100}%`;
+      num.textContent = `Sentence ${i + 1}`;
+      text.replaceChildren(...s.split(/\s+/).flatMap((w, k) => [
+        k ? ' ' : '',
+        h('span', { class: 'word', role: 'button', tabindex: '0', onclick: () => speak(stripEdges(w) || w, true),
+          onkeydown: e => { if (e.key === 'Enter') speak(stripEdges(w) || w, true); } }, w),
+      ]));
+      card.classList.remove('flip-in'); void card.offsetWidth; card.classList.add('flip-in');
+      prev.disabled = i === 0;
+      next.innerHTML = i === total - 1 ? (up.learned ? 'Done ' : 'Start building ') + ICON.next : 'Next ' + ICON.next;
+      next.className = 'btn ' + (i === total - 1 ? 'btn-accent' : 'btn-primary');
+      shownAt = Date.now();
+      if (autoSpeak && settings.sound) setTimeout(() => speakCard(false), 250);
+    }
+
+    const secondsOnCard = () => Math.min(120, Math.round((Date.now() - shownAt) / 1000));
+
+    async function go(delta) {
+      const secs = secondsOnCard();
+      if (delta > 0 && i === total - 1) {
+        next.disabled = true;
+        await outbox.send(learnUrl, { index: i, done: true, seconds: secs }).catch(e => toast(e.message));
+        next.disabled = false;
+        sfx.finish();
+        if (!up.learned) { toast('Great! Now build the sentences 🧩'); navigate(unitPath(slug, unit, 'build'), true); }
+        else navigate(`/lesson/${slug}`, true);
+        return;
+      }
+      i = Math.max(0, Math.min(total - 1, i + delta));
+      sfx.card();
+      if (delta > 0 && !up.learned) outbox.send(learnUrl, { index: i, seconds: secs }).catch(() => {});
+      render(true);
+    }
+
+    listen.addEventListener('click', () => speakCard(false));
+    slow.addEventListener('click', () => speakCard(true));
+    prev.addEventListener('click', () => go(-1));
+    next.addEventListener('click', () => go(1));
+
+    // Swipe left/right on the card
+    let sx = null, sy = null;
+    card.addEventListener('pointerdown', e => { sx = e.clientX; sy = e.clientY; });
+    card.addEventListener('pointerup', e => {
+      if (sx === null) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      sx = null;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+    });
+    const onKey = e => {
+      if (e.target.closest('input, textarea')) return;
+      if (e.key === 'ArrowRight') go(1);
+      else if (e.key === 'ArrowLeft') go(-1);
+      else if (e.key === ' ' && !e.target.closest('button, [role="button"]')) { e.preventDefault(); speakCard(false); }
+    };
+    document.addEventListener('keydown', onKey);
+    cleanup = () => document.removeEventListener('keydown', onKey);
+
+    if (up.status === 'new') outbox.send(learnUrl, { index: 0, seconds: 0 }).catch(() => {});
+    render(true);
   }
 
   /* ================================================================ */
-  /* Game                                                              */
+  /* Step 2 - Building puzzle (also used for "practise your own text") */
   /* ================================================================ */
   /**
-   * @param lesson   { slug|null, title, sentences:[{en}] }
-   * @param indices  which sentences to play (null = all) - used for "practise weak sentences"
-   * @param exitPath where the back button goes
+   * @param o.lesson   { title, units } (or { title, sentences } for practice)
+   * @param o.unit     the unit being played ({ id, title, sentences }), or null for practice
+   * @param o.slug     lesson slug, or null for untracked practice
+   * @param o.items    sentences to play in this round
+   * @param o.mode     'build' | 'review' | 'practice'
    */
-  function playLesson(lesson, indices, exitPath) {
-    document.title = `${lesson.title} · English Goal`;
-    const order = indices || lesson.sentences.map((_, i) => i);
-    const results = {}; // index -> stars this run
-    let pos = 0;
-    let round = null;
-    let sortables = [];
+  function runPuzzle(o) {
+    const { lesson, slug, items, mode, exitPath, unit, unitIndex } = o;
+    const tracked = Boolean(slug);
+    const total = tracked ? unit.sentences.length : items.length;
+    let doneCount = tracked && mode === 'build' ? unit.sentences.filter(s => s.stars).length : 0;
+    document.title = `${mode === 'practice' ? 'Practice' : 'Build'} · ${lesson.title} · ${config.appName}`;
 
-    /* ---------- Static layout ---------- */
-    const progressPill = h('div', { class: 'pill' });
+    const results = []; // stars per item this round
+    let pos = 0, round = null, sortables = [], lastResult = null;
+
+    const pill = h('div', { class: 'pill' });
     const fill = h('div', { class: 'progress-fill' });
     const answer = h('div', { class: 'zone answer-zone', 'data-placeholder': 'Tap or drag the words here', 'aria-label': 'Your sentence' });
-    const pool = h('div', { class: 'zone pool-zone', 'aria-label': 'Available words' });
+    const pool = h('div', { class: 'zone pool-zone', 'aria-label': 'Words to use' });
     const answerBox = h('div', { class: 'answer-box' }, answer);
     const feedback = h('p', { class: 'feedback', role: 'status' });
     const solvedPanel = h('div', { class: 'solved-panel', hidden: true });
@@ -384,58 +702,56 @@
     const resetBtn = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.reset + ' Reset', 'aria-label': 'Put the words back and shuffle' });
     const hintBtn = h('button', { class: 'btn btn-ghost', type: 'button' }, '💡 Hint');
     const listenBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true }, '🔊 Listen');
-    const slowBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true, 'aria-label': 'Listen slowly' }, '🐢 Slow');
     const nextBtn = h('button', { class: 'btn btn-accent', type: 'button', hidden: true, html: 'Next ' + ICON.next });
-    if (!canSpeak) { listenBtn.remove(); slowBtn.remove(); }
+    if (!canSpeak) listenBtn.remove();
 
-    const exit = () => navigate(exitPath);
+    const chip = mode === 'practice' ? 'Practice' : unitChip(lesson, unitIndex, mode === 'review' ? 'Practise again' : 'Build');
     setView(
       h('div', { class: 'game-top' },
-        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Leave lesson', html: ICON.back, onclick: exit }),
-        h('div', { class: 'lesson-name' }, lesson.title),
-        progressPill, soundButton()),
-      h('div', { class: 'progress-track', role: 'progressbar', 'aria-label': 'Lesson progress' }, fill),
+        h('a', { class: 'icon-btn', href: exitPath, 'data-link': true, 'aria-label': 'Leave', html: ICON.back }),
+        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, chip), ' ', tracked && lesson.units.length > 1 ? unit.title : lesson.title),
+        pill, soundButton()),
+      h('div', { class: 'progress-track', role: 'progressbar' }, fill),
       h('p', { class: 'prompt' }, 'Put the words in the correct order'),
       answerBox, pool, feedback, solvedPanel,
-      h('div', { class: 'actions' }, resetBtn, hintBtn, listenBtn, slowBtn, nextBtn)
+      h('div', { class: 'actions' }, resetBtn, hintBtn, listenBtn, nextBtn)
     );
 
-    /* ---------- Round logic ---------- */
     const tilesIn = zone => [...zone.children];
     const words = zone => tilesIn(zone).map(t => t.dataset.word);
+    const makeTile = word => h('button', { class: 'tile', type: 'button', 'data-word': word }, word);
 
-    function makeTile(word) {
-      return h('button', { class: 'tile', type: 'button', 'data-word': word }, word);
+    function updateBar() {
+      if (mode === 'build') {
+        pill.textContent = `${doneCount} / ${total}`;
+        fill.style.width = `${(doneCount / total) * 100}%`;
+      } else {
+        pill.textContent = `${pos + 1} / ${items.length}`;
+        fill.style.width = `${((pos + (round && round.solved ? 1 : 0)) / items.length) * 100}%`;
+      }
     }
 
     function loadRound() {
-      const idx = order[pos];
-      const sentence = lesson.sentences[idx].en;
+      const sentence = items[pos].en;
       const target = hideCapital(tokenize(sentence));
-      round = { idx, sentence, target, mistakes: 0, hints: 0, solved: false, lastWrong: null };
-
+      round = { sentence, target, mistakes: 0, hints: 0, solved: false, lastWrong: null, startedAt: Date.now(), cid: uid() };
       answer.replaceChildren();
       pool.replaceChildren(...shuffle(target).map(makeTile));
       answerBox.classList.remove('solved');
       solvedPanel.hidden = true;
       feedback.textContent = ''; feedback.className = 'feedback';
-      resetBtn.hidden = false; hintBtn.hidden = false;
-      listenBtn.hidden = true; slowBtn.hidden = true; nextBtn.hidden = true;
-      progressPill.textContent = `${pos + 1} / ${order.length}`;
-      fill.style.width = `${(pos / order.length) * 100}%`;
+      resetBtn.hidden = false; hintBtn.hidden = false; listenBtn.hidden = true; nextBtn.hidden = true;
       sortables.forEach(s => s.option('disabled', false));
+      updateBar();
     }
 
-    // Moves the dragged/tapped word and checks the answer.
     function afterChange(fromHint) {
       if (round.solved) return;
       tilesIn(answer).forEach(t => t.classList.remove('wrong', 'right'));
       feedback.textContent = ''; feedback.className = 'feedback';
       if (pool.children.length) return;
-
       const current = words(answer);
       if (current.join(' ') === round.target.join(' ')) return success();
-
       const key = current.join(' ');
       if (!fromHint && key !== round.lastWrong) { round.mistakes++; sfx.wrong(); if (navigator.vibrate) navigator.vibrate(60); }
       round.lastWrong = key;
@@ -447,16 +763,17 @@
     function success() {
       round.solved = true;
       const s = starsFor(round.mistakes + round.hints);
-      results[round.idx] = Math.max(results[round.idx] || 0, s);
-      if (lesson.slug) {
-        const p = (progress[lesson.slug] = progress[lesson.slug] || {});
-        p[round.sentence] = Math.max(p[round.sentence] || 0, s);
-        saveProgress();
+      results[pos] = s;
+      const seconds = Math.min(600, Math.round((Date.now() - round.startedAt) / 1000));
+      if (tracked) {
+        lastResult = outbox.send(`/api/lessons/${slug}/solve`, { sentence: round.sentence, mistakes: round.mistakes, hints: round.hints, seconds, cid: round.cid })
+          .catch(e => { toast(e.message); return null; });
+        if (mode === 'build') doneCount++;
       }
       sortables.forEach(x => x.option('disabled', true));
       tilesIn(answer).forEach(t => { t.classList.remove('wrong', 'right'); t.classList.add('solved'); t.tabIndex = -1; });
       answerBox.classList.add('solved');
-      fill.style.width = `${((pos + 1) / order.length) * 100}%`;
+      updateBar();
       solvedPanel.replaceChildren(
         h('div', { class: 'sentence' }, round.sentence),
         h('div', { class: 'stars', 'aria-label': `${s} of 3 stars` }, starNodes(s)));
@@ -465,19 +782,18 @@
       const praise = s === 3 ? ['Perfect!', 'Excellent!', 'Amazing!'] : s === 2 ? ['Well done!', 'Great job!', 'Nice work!'] : ['You got it!', 'Good job, keep practising!'];
       feedback.textContent = praise[(Math.random() * praise.length) | 0];
       feedback.className = 'feedback good';
-      resetBtn.hidden = true; hintBtn.hidden = true;
-      listenBtn.hidden = false; slowBtn.hidden = false; nextBtn.hidden = false;
-      nextBtn.innerHTML = (pos + 1 < order.length ? 'Next ' : 'Finish ') + ICON.next;
+      resetBtn.hidden = true; hintBtn.hidden = true; listenBtn.hidden = false; nextBtn.hidden = false;
+      nextBtn.innerHTML = (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next;
       nextBtn.focus({ preventScroll: true });
       sfx.win(); confetti(40);
-      if (settings.speak) setTimeout(() => speak(round.sentence), 450);
+      if (settings.sound) setTimeout(() => speak(round.sentence), 450);
     }
 
     function hint() {
       if (round.solved) return;
       const cur = tilesIn(answer);
       let i = cur.findIndex((t, k) => t.dataset.word !== round.target[k]);
-      if (i < 0) i = cur.length; // all placed words are right, add the next one
+      if (i < 0) i = cur.length;
       const want = round.target[i];
       const tile = tilesIn(pool).find(t => t.dataset.word === want) || cur.find((t, k) => k > i && t.dataset.word === want);
       if (!tile) return;
@@ -486,8 +802,7 @@
       tile.classList.remove('flash'); void tile.offsetWidth; tile.classList.add('flash');
       sfx.hint();
       afterChange(true);
-      if (!round.solved && !pool.children.length) return;
-      if (!round.solved) { feedback.textContent = `“${want}” is word ${i + 1}.`; feedback.className = 'feedback'; }
+      if (!round.solved && pool.children.length) { feedback.textContent = `“${want}” is word ${i + 1}.`; feedback.className = 'feedback'; }
     }
 
     function resetRound() {
@@ -497,7 +812,6 @@
       afterChange(true);
     }
 
-    /* ---------- Input: tap ---------- */
     let lastDragEnd = 0;
     function onTap(e) {
       const tile = e.target.closest('.tile');
@@ -505,38 +819,28 @@
       if (tile.parentElement === pool) answer.appendChild(tile); else pool.appendChild(tile);
       sfx.tap();
       afterChange(false);
-      // keep keyboard focus in a sensible place
-      const next = pool.querySelector('.tile') || answer.querySelector('.tile:last-child');
-      if (e.detail === 0 && next) next.focus();
+      const nxt = pool.querySelector('.tile') || answer.querySelector('.tile:last-child');
+      if (e.detail === 0 && nxt) nxt.focus();
     }
     answer.addEventListener('click', onTap);
     pool.addEventListener('click', onTap);
 
-    /* ---------- Input: drag ---------- */
     if (window.Sortable) {
       const opts = {
-        group: 'words',
-        animation: 150,
-        easing: 'cubic-bezier(0.2, 0, 0, 1)',
-        forceFallback: true,
-        fallbackOnBody: true,
-        fallbackTolerance: 6,
-        fallbackClass: 'dragging',
-        ghostClass: 'ghost',
-        swapThreshold: 0.6,
+        group: 'words', animation: 150, easing: 'cubic-bezier(0.2, 0, 0, 1)',
+        forceFallback: true, fallbackOnBody: true, fallbackTolerance: 6,
+        fallbackClass: 'dragging', ghostClass: 'ghost', swapThreshold: 0.6,
         onEnd: () => { lastDragEnd = Date.now(); afterChange(false); },
       };
       sortables = [Sortable.create(answer, opts), Sortable.create(pool, opts)];
     }
 
-    /* ---------- Buttons ---------- */
     resetBtn.addEventListener('click', resetRound);
     hintBtn.addEventListener('click', hint);
     listenBtn.addEventListener('click', () => speak(round.sentence));
-    slowBtn.addEventListener('click', () => speak(round.sentence, true));
     nextBtn.addEventListener('click', () => {
       stopSpeech();
-      if (++pos < order.length) { loadRound(); window.scrollTo(0, 0); } else finish();
+      if (++pos < items.length) { loadRound(); window.scrollTo(0, 0); } else finish();
     });
 
     const onKey = e => {
@@ -545,38 +849,169 @@
     document.addEventListener('keydown', onKey);
     cleanup = () => { document.removeEventListener('keydown', onKey); sortables.forEach(s => s.destroy()); };
 
-    /* ---------- Results ---------- */
-    function finish() {
+    async function finish() {
       cleanup(); cleanup = null;
-      const earned = order.reduce((a, i) => a + (results[i] || 0), 0);
-      const max = order.length * 3;
-      const weak = order.filter(i => (results[i] || 0) < 3);
-      const pct = earned / max;
-      const actions = h('div', { class: 'result-actions' });
-      if (weak.length) actions.append(h('button', { class: 'btn btn-primary', type: 'button', onclick: () => playLesson(lesson, weak, exitPath) }, `Practise ${weak.length} hard sentence${weak.length > 1 ? 's' : ''}`));
-      actions.append(h('button', { class: 'btn ' + (weak.length ? 'btn-ghost' : 'btn-primary'), type: 'button', onclick: () => playLesson(lesson, null, exitPath) }, 'Play again'));
-      if (lesson.slug) actions.append(h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.share + ' Share this lesson', onclick: () => shareLink(lesson.title, `/lesson/${lesson.slug}`) }));
-      actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true }, lesson.slug ? 'All lessons' : 'Back to lessons'));
-      if (!lesson.slug) actions.append(h('a', { class: 'btn btn-ghost', href: '/practice', 'data-link': true }, 'Edit my text'));
+      const res = tracked ? await lastResult : null;
+      const earned = results.reduce((a, b) => a + (b || 0), 0);
+      const max = items.length * 3;
+      const building = tracked && mode === 'build';
+      const unitDone = building; // a build round only ends when every remaining sentence of the unit is built
+      const lessonDone = building && (res ? res.completed : unitIndex === lesson.units.length - 1);
+      const nextUnit = tracked ? lesson.units[unitIndex + 1] : null;
+      const weak = items.filter((_, i) => (results[i] || 0) < 3);
 
+      const actions = h('div', { class: 'result-actions' });
+      if (tracked) {
+        if (building && !lessonDone && nextUnit)
+          actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, nextUnit, 'learn'), 'data-link': true, html: `Next: Unit ${unitIndex + 2} · ` },
+            nextUnit.title, h('span', { html: ICON.next })));
+        actions.append(h('a', { class: 'btn ' + (actions.children.length ? 'btn-ghost' : 'btn-primary'), href: `/lesson/${slug}`, 'data-link': true }, 'Back to lesson'));
+        if (mode === 'review' && weak.length) actions.append(h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => runPuzzle({ ...o, items: weak }) }, `Practise ${plural(weak.length, 'hard sentence')}`));
+        actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true }, 'All lessons'));
+      } else {
+        if (weak.length) actions.append(h('button', { class: 'btn btn-primary', type: 'button', onclick: () => runPuzzle({ ...o, items: weak }) }, `Practise ${plural(weak.length, 'hard sentence')}`));
+        actions.append(h('button', { class: 'btn ' + (weak.length ? 'btn-ghost' : 'btn-primary'), type: 'button', onclick: () => runPuzzle(o) }, 'Play again'));
+        actions.append(h('a', { class: 'btn btn-ghost', href: '/practice', 'data-link': true }, 'Edit my text'));
+        actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true }, 'Back to lessons'));
+      }
+
+      const pct = earned / max;
+      const multi = tracked && lesson.units.length > 1;
+      const title = lessonDone ? 'Lesson complete!' : unitDone && multi ? `Unit ${unitIndex + 1} complete!` : pct === 1 ? 'Perfect!' : pct >= 0.7 ? 'Well done!' : 'Good effort!';
       setView(h('section', { class: 'results' },
-        h('div', { class: 'celebration', 'aria-hidden': 'true' }, pct === 1 ? '🏆' : pct >= 0.7 ? '🎉' : '💪'),
-        h('h1', null, pct === 1 ? 'Perfect!' : pct >= 0.7 ? 'Well done!' : 'Good effort!'),
-        h('p', { class: 'subtitle' }, `You earned ${earned} of ${max} stars in “${lesson.title}”.`),
-        h('ul', { class: 'result-list' }, order.map(i => h('li', null,
-          h('span', null, lesson.sentences[i].en),
+        h('div', { class: 'celebration', 'aria-hidden': 'true' }, lessonDone || pct === 1 ? '🏆' : pct >= 0.7 ? '🎉' : '💪'),
+        h('h1', null, title),
+        h('p', { class: 'subtitle' }, `You earned ${earned} of ${max} stars in this round.`),
+        building && !lessonDone && nextUnit ? h('p', { class: 'muted' }, `Next up: Unit ${unitIndex + 2} is now open. Your progress is saved.`) : null,
+        res === null && tracked ? h('p', { class: 'muted' }, 'You are offline. Your progress will be saved when you reconnect.') : null,
+        h('ul', { class: 'result-list' }, items.map((it, i) => h('li', null,
+          h('span', null, it.en),
           h('span', { class: 's', 'aria-label': `${results[i] || 0} stars` }, starNodes(results[i] || 0))))),
         actions));
-      sfx.finish(); confetti(170);
+      sfx.finish(); confetti(lessonDone ? 200 : 120);
     }
 
     loadRound();
   }
 
   /* ================================================================ */
+  /* Practise your own text (not tracked)                              */
+  /* ================================================================ */
+  function showPractice() {
+    document.title = `Practise your text · ${config.appName}`;
+    const ta = h('textarea', { dir: 'ltr', placeholder: 'Paste English text here. Each sentence becomes a puzzle.', 'aria-label': 'Your English text' });
+    ta.value = storage.get('ws:practice', '');
+    const msg = h('p', { class: 'form-msg', role: 'alert' });
+    ta.addEventListener('input', () => { msg.textContent = ''; storage.set('ws:practice', ta.value); });
+
+    const start = () => {
+      const sentences = splitSentences(ta.value);
+      if (!sentences.length) { msg.textContent = 'Please enter at least one English sentence with two or more words.'; ta.focus(); return; }
+      if (sentences.length > MAX_PRACTICE) toast(`Using the first ${MAX_PRACTICE} of ${sentences.length} sentences.`);
+      const items = sentences.slice(0, MAX_PRACTICE).map(en => ({ en }));
+      runPuzzle({ lesson: { title: 'My text', sentences: items }, slug: null, items, mode: 'practice', exitPath: '/practice' });
+    };
+
+    setView(
+      h('header', { class: 'appbar' },
+        h('a', { class: 'btn btn-ghost btn-sm', href: '/', 'data-link': true, html: ICON.back + ' Lessons' }),
+        h('div', { class: 'tools' }, soundButton())),
+      h('h1', null, 'Practise your own text'),
+      h('p', { class: 'subtitle' }, 'Sentences are split automatically. This practice is not saved to your progress.'),
+      h('div', { class: 'card' }, ta),
+      msg,
+      h('div', { class: 'row-actions' },
+        h('button', { class: 'btn btn-primary', type: 'button', onclick: start }, 'Start'),
+        h('button', {
+          class: 'btn btn-ghost', type: 'button', onclick: () => {
+            ta.value = "The quick brown fox jumps over the lazy dog. My sister reads a book every night. We are going to the beach tomorrow. Can you help me with my homework? Mr. Brown has two cats and a dog.";
+            ta.dispatchEvent(new Event('input'));
+          },
+        }, 'Try an example'))
+    );
+  }
+
+  /* ================================================================ */
+  /* Profile                                                           */
+  /* ================================================================ */
+  async function showProfile() {
+    document.title = `My profile · ${config.appName}`;
+    loading();
+    let data;
+    try { data = await api('GET', '/api/me'); } catch (e) { if (e.status !== 401) errorView(e, showProfile); return; }
+    me = data.user;
+    const s = data.stats;
+
+    const nameInput = h('input', { id: 'p-name', type: 'text', value: me.name, maxlength: '60', autocomplete: 'name' });
+    const nameMsg = h('p', { class: 'form-msg', role: 'alert' });
+    const nameForm = h('form', { class: 'auth-form', novalidate: true },
+      h('div', { class: 'field' }, h('label', { for: 'p-name' }, 'Your name'), nameInput),
+      h('div', { class: 'field' }, h('label', null, 'Email'), h('div', { class: 'readonly' }, me.email)),
+      nameMsg,
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save name'));
+    nameForm.addEventListener('submit', async e => {
+      e.preventDefault(); nameMsg.textContent = '';
+      try { const r = await api('PATCH', '/api/me', { name: nameInput.value }); me = r.user; toast('Name saved'); }
+      catch (err) { nameMsg.textContent = err.message; }
+    });
+
+    const cur = h('input', { id: 'p-cur', type: 'password', autocomplete: 'current-password' });
+    const nw = h('input', { id: 'p-new', type: 'password', autocomplete: 'new-password', minlength: '8' });
+    const pwMsg = h('p', { class: 'form-msg', role: 'alert' });
+    const pwForm = h('form', { class: 'auth-form', novalidate: true },
+      h('div', { class: 'field' }, h('label', { for: 'p-cur' }, 'Current password'), cur),
+      h('div', { class: 'field' }, h('label', { for: 'p-new' }, 'New password ', h('span', { class: 'muted' }, '(at least 8 characters)')), nw),
+      pwMsg,
+      h('button', { class: 'btn btn-ghost', type: 'submit' }, 'Change password'));
+    pwForm.addEventListener('submit', async e => {
+      e.preventDefault(); pwMsg.textContent = '';
+      if (nw.value.length < 8) { pwMsg.textContent = 'New password must be at least 8 characters.'; return; }
+      try { await api('POST', '/api/me/password', { current: cur.value, password: nw.value }); cur.value = ''; nw.value = ''; toast('Password changed'); }
+      catch (err) { pwMsg.textContent = err.message; }
+    });
+
+    const logout = async () => {
+      try { await api('POST', '/api/auth/logout'); } catch (e) { /* ignore */ }
+      me = null;
+      navigate('/login', true);
+    };
+
+    setView(
+      h('header', { class: 'appbar' },
+        h('a', { class: 'btn btn-ghost btn-sm', href: '/', 'data-link': true, html: ICON.back + ' Lessons' }),
+        h('div', { class: 'tools' }, soundButton())),
+      h('div', { class: 'profile-head' }, avatar(me.name, 'avatar-lg'),
+        h('div', null, h('h1', null, me.name), h('p', { class: 'subtitle' }, `Learning since ${new Date(me.createdAt).toLocaleDateString()}`))),
+      h('div', { class: 'stat-row' },
+        statTile('⭐', s.stars, 'stars'),
+        statTile('✅', s.sentencesSolved, 'sentences'),
+        statTile('🏆', s.lessonsCompleted, 'lessons done'),
+        statTile('🔥', s.streak, 'day streak'),
+        statTile('⏱️', formatTime(s.timeSpent), 'learning time')),
+      h('section', { class: 'section' }, h('h2', null, 'My details'), h('div', { class: 'card' }, nameForm)),
+      h('section', { class: 'section' }, h('h2', null, 'Password'), h('div', { class: 'card' }, pwForm)),
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn btn-danger', type: 'button', onclick: logout }, 'Log out'))
+    );
+  }
+
+  /* ================================================================ */
   /* Boot                                                              */
   /* ================================================================ */
-  route();
+  async function loadMe() {
+    try {
+      me = (await api('GET', '/api/me')).user;
+      outbox.flush();
+    } catch (e) {
+      me = null;
+    }
+  }
+
+  (async function boot() {
+    try { config = { ...config, ...(await api('GET', '/api/config')) }; } catch (e) { /* offline: use defaults */ }
+    if (!/^\/(login|signup)$/.test(location.pathname)) await loadMe();
+    route();
+  })();
+
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
   }
