@@ -93,6 +93,8 @@
     if (u.status === 'learning') return h('span', { class: 'st st-learning' }, `🃏 ${u.learnIndex + 1}/${u.total}`);
     return multi && u.locked ? '🔒' : '–';
   }
+  // "⭐ 24/30" plus a small "+3 extra" when the student improved by practising again
+  const starsCell = p => (p.stars ? h('span', null, `⭐ ${p.stars}/${p.maxStars}`, p.extra ? h('small', { class: 'extra', title: 'Stars gained by practising again' }, ` +${p.extra} extra`) : null) : '–');
   const avatar = name => h('span', { class: 'avatar', 'aria-hidden': 'true' }, (name || '?').trim().charAt(0).toUpperCase());
   const loading = () => setView(h('div', { class: 'state' }, h('div', { class: 'spinner' }), 'Loading…'));
   const errorBox = e => setView(h('div', { class: 'state' }, h('div', { class: 'big' }, '⚠️'), h('p', null, e.message),
@@ -111,8 +113,9 @@
       case 'lesson_start': return ['▶️', `started ${L}`];
       case 'cards_done': return ['🃏', e.data.unit ? `learned the cards of “${e.data.unit}” in ${L}` : `learned the cards in ${L}`];
       case 'unit_complete': return ['🎯', `finished unit “${e.data.unit}” in ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
-      case 'sentence_solved': return ['✅', `built a sentence in ${L} ${'★'.repeat(e.data.stars || 0)}`,
+      case 'sentence_solved': return [e.data.replay ? '🔁' : '✅', `${e.data.replay ? 'practised a sentence again' : 'built a sentence'} in ${L} ${'★'.repeat(e.data.stars || 0)}${e.data.extra ? ` (+${e.data.extra} extra)` : ''}`,
         `${e.data.sentence || ''}${e.data.mistakes || e.data.hints ? ` · ${plural(e.data.mistakes || 0, 'mistake')}, ${plural(e.data.hints || 0, 'hint')}` : ''}`];
+      case 'restart': return ['🔄', e.data.unit ? `started unit “${e.data.unit}” over in ${L}` : `started ${L} over`, 'Saved progress was kept'];
       case 'lesson_complete': return ['🏆', `completed ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
       default: return ['•', e.type];
     }
@@ -182,7 +185,11 @@
     const tab = parts[0] || 'overview';
     tabs.querySelectorAll('a').forEach(a => { if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
     window.scrollTo(0, 0);
-    if (tab === 'students') return parts[1] ? showStudent(parts[1]) : showStudents();
+    if (tab === 'students') {
+      if (parts[1] && parts[2] === 'lessons' && parts[3] === 'new') return showEditor(null, { userId: parts[1] });
+      if (parts[1] && parts[2] === 'lessons' && parts[3] && parts[4] === 'edit') return showEditor(parts[3], { userId: parts[1] });
+      return parts[1] ? showStudent(parts[1]) : showStudents();
+    }
     if (tab === 'lessons') {
       if (parts[1] === 'new') return showEditor(null);
       if (parts[1] && parts[2] === 'edit') return showEditor(parts[1]);
@@ -296,25 +303,69 @@
         h('td', null, statusChip(l.progress)),
         h('td', null, unitsCell(l.progress)),
         h('td', null, progressBar(l.progress)),
-        h('td', null, l.progress.stars ? `⭐ ${l.progress.stars}/${l.progress.maxStars}` : '–'),
+        h('td', null, starsCell(l.progress)),
         h('td', null, fmtTime(l.progress.timeSpent)),
         h('td', null, timeAgo(l.progress.lastActivityAt))))))) : h('p', { class: 'muted' }, 'No lessons available.');
 
-    // Private lessons picker
-    const privateLessons = d.lessons.filter(l => l.visibility === 'assigned');
-    const boxes = privateLessons.map(l => h('label', { class: 'pick' },
-      h('input', { type: 'checkbox', value: l.id, checked: l.assignedToUser }),
-      h('span', null, `${l.emoji} ${l.title} `, h('small', null, `${l.level}${l.published ? '' : ' · draft'}`))));
+    // Private lessons: made for this student only, managed right here on the student's card.
+    const first = u.name.split(/\s+/)[0];
+    const mine = d.lessons.filter(l => l.visibility === 'assigned' && l.assignedToUser);
+    const others = d.lessons.filter(l => l.visibility === 'assigned' && !l.assignedToUser);
+    const mineList = mine.length ? h('ul', { class: 'admin-list' }, mine.map(l => h('li', { class: 'admin-item' + (l.published ? '' : ' draft') },
+      h('span', { class: 'emoji' }, l.emoji || '📘'),
+      h('div', { class: 'info' },
+        h('div', { class: 'name' }, l.title,
+          !l.published ? h('span', { class: 'tag tag-draft' }, 'Draft') : null,
+          l.assignedCount > 1 ? h('span', { class: 'tag tag-private' }, `shared with ${l.assignedCount - 1} more`) : null),
+        h('div', { class: 'sub' }, `${l.level} · ${plural(l.unitsCount || 1, 'unit')} · ${plural(l.count, 'sentence')} · `, statusChip(l.progress), ` ${l.progress.solved}/${l.progress.total} built`)),
+      h('div', { class: 'btns' },
+        h('a', { class: 'btn btn-ghost btn-sm', href: `#/students/${id}/lessons/${l.id}/edit` }, 'Edit'),
+        h('a', { class: 'btn btn-ghost btn-sm', href: `#/lessons/${l.id}/progress` }, '📈'),
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', title: `Take this lesson away from ${first}. Their progress is kept.`, onclick: async () => {
+          if (!confirm(`Remove “${l.title}” from ${u.name}? They will no longer see it. Their progress is kept.${l.assignedCount <= 1 ? '\n\nNobody else has this lesson, so it stays in your Lessons list.' : ''}`)) return;
+          try { await api('DELETE', `/api/admin/users/${id}/assignments/${l.id}`); toast('Removed'); showStudent(id); } catch (e) { toast(e.message); }
+        } }, 'Remove'),
+        l.assignedCount <= 1 ? h('button', { class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Delete lesson', title: 'Delete this lesson and its progress', onclick: async () => {
+          if (!confirm(`Delete “${l.title}” completely? ${u.name}'s progress in it will be deleted too.`)) return;
+          try { await api('DELETE', `/api/admin/lessons/${l.id}`); toast('Lesson deleted'); showStudent(id); } catch (e) { toast(e.message); }
+        } }, '🗑️') : null)))) : h('p', { class: 'muted' }, `No private lessons for ${first} yet. Click “New lesson for ${first}” and type or paste the sentences.`);
+
+    const importIn = h('input', { type: 'file', accept: 'application/json,.json', hidden: true });
+    importIn.addEventListener('change', async e => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      try {
+        const json = JSON.parse(await file.text());
+        const items = Array.isArray(json) ? json : json.lessons || (json.title ? [json] : null);
+        if (!items) throw new Error('This file does not contain lessons.');
+        if (!confirm(`Add ${plural(items.length, 'lesson')} for ${u.name} only?`)) return;
+        const r = await api('POST', '/api/admin/import', { lessons: items, assignTo: id });
+        toast(`Added ${plural(r.created, 'lesson')} for ${first}`);
+        showStudent(id);
+      } catch (err) { toast(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message); }
+    });
+
+    const otherBoxes = others.map(l => h('label', { class: 'pick' },
+      h('input', { type: 'checkbox', value: l.id }),
+      h('span', null, `${l.emoji} ${l.title} `, h('small', null, `${l.level}${l.published ? '' : ' · draft'} · ${plural(l.assignedCount, 'student')}`))));
+    const giveExisting = others.length ? h('details', { class: 'give-existing' },
+      h('summary', null, `Give ${first} a private lesson you already made (${others.length})`),
+      h('div', { class: 'pick-list' }, otherBoxes),
+      h('div', { class: 'toolbar section' }, h('span', { class: 'spacer' }),
+        h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: async () => {
+          const add = otherBoxes.map(b => b.querySelector('input')).filter(x => x.checked).map(x => x.value);
+          if (!add.length) return toast('Tick at least one lesson.');
+          try { await api('PUT', `/api/admin/users/${id}/assignments`, { lessonIds: [...mine.map(l => l.id), ...add] }); toast('Saved'); showStudent(id); } catch (e) { toast(e.message); }
+        } }, 'Give to ' + first))) : null;
+
     const assignPanel = h('div', { class: 'panel' },
-      h('h2', null, '🔒 Private lessons for this student'),
-      privateLessons.length ? [
-        h('div', { class: 'pick-list' }, boxes),
-        h('div', { class: 'toolbar section' }, h('span', { class: 'spacer' }),
-          h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: async () => {
-            const ids = boxes.map(b => b.querySelector('input')).filter(x => x.checked).map(x => x.value);
-            try { await api('PUT', `/api/admin/users/${id}/assignments`, { lessonIds: ids }); toast('Saved'); showStudent(id); } catch (e) { toast(e.message); }
-          } }, 'Save private lessons'))]
-        : h('p', { class: 'muted' }, 'You have no private lessons yet. Edit a lesson and choose “Only selected students” to make it private.'));
+      h('div', { class: 'head-row' }, h('h2', null, `🔒 Private lessons for ${first}`),
+        h('div', { class: 'toolbar' },
+          h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => importIn.click() }, 'Import JSON'),
+          h('a', { class: 'btn btn-primary btn-sm', href: `#/students/${id}/lessons/new` }, `+ New lesson for ${first}`), importIn)),
+      h('p', { class: 'muted' }, `Only ${first} can see these lessons. Other students never do, and you don't have to publish anything first.`),
+      mineList, giveExisting);
 
     // Account actions
     const nameIn = h('input', { id: 'e-name', value: u.name, maxlength: '60' });
@@ -361,13 +412,14 @@
       h('div', { class: 'tiles section' },
         tile(s.sentencesSolved, 'Sentences built'),
         tile(`⭐ ${s.stars}`, 'Stars'),
+        tile(`+${s.extraStars || 0}`, 'Extra stars (retries)'),
         tile(s.lessonsCompleted, 'Lessons completed'),
         tile(s.lessonsStarted, 'Lessons started'),
         tile(fmtTime(s.timeSpent), 'Learning time'),
         tile(`🔥 ${s.streak}`, 'Day streak')),
-      h('div', { class: 'panel' }, h('h2', null, 'Sentences built per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences built per day')),
-      h('div', { class: 'panel' }, h('h2', null, 'Lessons'), table),
       assignPanel,
+      h('div', { class: 'panel' }, h('h2', null, 'All lessons this student can see'), table),
+      h('div', { class: 'panel' }, h('h2', null, 'Sentences practised per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences practised per day')),
       h('div', { class: 'panel' }, h('h2', null, 'Activity'), feed(d.events, { showUser: false }))
     );
   }
@@ -390,7 +442,7 @@
         h('div', { class: 'info' },
           h('div', { class: 'name' }, l.title,
             !l.published ? h('span', { class: 'tag tag-draft' }, 'Draft') : null,
-            l.visibility === 'assigned' ? h('span', { class: 'tag tag-private' }, `🔒 ${plural(l.assignedCount, 'student')}`) : null),
+            l.visibility === 'assigned' ? h('span', { class: 'tag tag-private' }, `🔒 ${l.assignedCount ? (l.assignedNames || []).join(', ') + (l.assignedCount > (l.assignedNames || []).length ? ` +${l.assignedCount - l.assignedNames.length}` : '') : 'nobody yet'}`) : null),
           h('div', { class: 'sub' }, `${l.level} · ${plural(l.unitsCount || 1, 'unit')} · ${plural(l.count, 'sentence')} · ▶️ ${l.startedCount} started · 🏆 ${l.completedCount} completed`)),
         h('div', { class: 'btns' },
           h('a', { class: 'btn btn-ghost btn-sm', href: `#/lessons/${l.id}/progress` }, '📈 Progress'),
@@ -433,15 +485,19 @@
     );
   }
 
-  async function showEditor(id) {
+  // ctx = { userId }: editing from a student's card. The lesson stays private to that student.
+  async function showEditor(id, ctx) {
     loading();
-    let lesson = { title: '', emoji: '📘', slug: '', level: 'A1', description: '', sentences: [], published: true, visibility: 'public', assignedUserIds: [] };
+    const home = ctx ? `#/students/${ctx.userId}` : '#/lessons';
+    let lesson = { title: '', emoji: '📘', slug: '', level: 'A1', description: '', sentences: [], published: true, visibility: ctx ? 'assigned' : 'public', assignedUserIds: [] };
     let users = [];
     try {
       const [l, u] = await Promise.all([id ? api('GET', `/api/admin/lessons/${id}`) : null, api('GET', '/api/admin/users')]);
       if (l) lesson = l.lesson;
       users = u.users;
     } catch (e) { return errorBox(e); }
+    const owner = ctx ? users.find(x => x.id === ctx.userId) : null;
+    if (ctx && !owner) return errorBox(new Error('Student not found.'));
     let slugTouched = Boolean(id);
 
     const f = {
@@ -575,7 +631,7 @@
         h('div', { class: 'field grow' }, h('label', { for: 'f-title' }, 'Title'), f.title),
         h('div', { class: 'field emoji-field' }, h('label', { for: 'f-emoji' }, 'Icon'), f.emoji)),
       h('div', { class: 'grid-2' },
-        h('div', { class: 'field grow' }, h('label', { for: 'f-slug' }, 'Link name'), h('div', { class: 'slug-wrap' }, h('span', null, '/lesson/'), f.slug)),
+        ctx ? null : h('div', { class: 'field grow' }, h('label', { for: 'f-slug' }, 'Link name'), h('div', { class: 'slug-wrap' }, h('span', null, '/lesson/'), f.slug)),
         h('div', { class: 'field' }, h('label', { for: 'f-level' }, 'Level'), f.level)),
       h('div', null, h('label', { for: 'f-desc' }, 'Short description ', h('span', { class: 'muted' }, '(optional)')), f.desc),
       h('div', null,
@@ -584,48 +640,53 @@
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
         id ? h('p', { class: 'muted' }, 'Tip: renaming or moving units keeps student progress. Changing a sentence’s text means students build that sentence again.') : null),
-      h('div', null, h('label', null, 'Who can see this lesson?'),
-        h('div', { class: 'radios' },
-          h('label', { class: 'radio' }, f.visPublic, h('span', null, '🌍 All students')),
-          h('label', { class: 'radio' }, f.visAssigned, h('span', null, '🔒 Only selected students'))),
-        picker),
-      h('label', { class: 'switch' }, f.published, h('span', null, 'Published (untick to keep it as a hidden draft)')),
+      ctx
+        ? h('div', { class: 'private-note' }, `🔒 Private lesson: only ${owner.name} will see it.`)
+        : h('div', null, h('label', null, 'Who can see this lesson?'),
+            h('div', { class: 'radios' },
+              h('label', { class: 'radio' }, f.visPublic, h('span', null, '🌍 All students')),
+              h('label', { class: 'radio' }, f.visAssigned, h('span', null, '🔒 Only selected students'))),
+            picker),
+      h('label', { class: 'switch' }, f.published, h('span', null, ctx ? `Visible to ${owner.name} (untick to keep it as a hidden draft)` : 'Published (untick to keep it as a hidden draft)')),
       msg,
       h('div', { class: 'toolbar' },
         id ? h('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: async () => {
           if (!confirm(`Delete “${f.title.value}”? All student progress for this lesson will be deleted too.`)) return;
-          try { await api('DELETE', `/api/admin/lessons/${id}`); dirty = false; toast('Lesson deleted'); location.hash = '#/lessons'; } catch (e) { msg.textContent = e.message; }
+          try { await api('DELETE', `/api/admin/lessons/${id}`); dirty = false; toast('Lesson deleted'); location.hash = home; } catch (e) { msg.textContent = e.message; }
         } }, 'Delete') : null,
         h('span', { class: 'spacer' }),
-        h('a', { class: 'btn btn-ghost', href: '#/lessons' }, 'Cancel'),
+        h('a', { class: 'btn btn-ghost', href: home }, 'Cancel'),
         saveBtn));
 
     form.addEventListener('submit', async e => {
       e.preventDefault(); msg.textContent = '';
       if (!f.title.value.trim()) { msg.textContent = 'Please add a title.'; f.title.focus(); return; }
       if (!checkSentences()) { msg.textContent = 'Please fix the units above.'; if (checkSentences.firstBad) checkSentences.firstBad.ta.focus(); return; }
-      const assigned = f.visAssigned.checked;
-      if (assigned && !selected.size && !confirm('No students are selected, so nobody will see this lesson. Save anyway?')) return;
+      const assigned = ctx ? true : f.visAssigned.checked;
+      if (!ctx && assigned && !selected.size && !confirm('No students are selected, so nobody will see this lesson. Save anyway?')) return;
       const body = {
-        title: f.title.value, emoji: f.emoji.value, slug: slugify(f.slug.value || f.title.value), level: f.level.value,
+        title: f.title.value, emoji: f.emoji.value, slug: ctx && id ? lesson.slug : slugify(f.slug.value || f.title.value), level: f.level.value,
         description: f.desc.value, published: f.published.checked,
         units: units.map((u, i) => ({ ...(u.id ? { id: u.id } : {}), title: u.title.trim() || `Unit ${i + 1}`, sentences: lines(u.text).map(en => ({ en })) })),
         visibility: assigned ? 'assigned' : 'public',
-        ...(assigned ? { assignedUserIds: [...selected] } : {}),
+        // From a student's card: new lessons go to that student; edits keep whoever already has it.
+        ...(ctx ? (id ? {} : { assignedUserIds: [ctx.userId] }) : assigned ? { assignedUserIds: [...selected] } : {}),
       };
       saveBtn.disabled = true;
       try {
         if (id) await api('PUT', `/api/admin/lessons/${id}`, body);
+        else if (ctx) await api('POST', `/api/admin/users/${ctx.userId}/lessons`, body);
         else await api('POST', '/api/admin/lessons', body);
         dirty = false;
-        toast('Lesson saved');
-        location.hash = '#/lessons';
+        toast(ctx ? `Lesson saved for ${owner.name}` : 'Lesson saved');
+        location.hash = home;
       } catch (err) { msg.textContent = err.message; }
       finally { saveBtn.disabled = false; }
     });
 
     dirty = false;
-    setView(backLink('#/lessons', 'All lessons'), h('h1', null, id ? 'Edit lesson' : 'New lesson'), form);
+    setView(backLink(home, ctx ? `Back to ${owner.name}` : 'All lessons'),
+      h('h1', null, ctx ? (id ? `Edit lesson for ${owner.name}` : `New lesson for ${owner.name}`) : (id ? 'Edit lesson' : 'New lesson')), form);
     f.title.focus();
   }
 
@@ -660,7 +721,7 @@
           h('td', null, statusChip(s.progress)),
           ...s.progress.units.map(u => h('td', { title: u.title }, unitCell(u, l.units.length > 1))),
           h('td', null, progressBar(s.progress)),
-          h('td', null, s.progress.stars ? `⭐ ${s.progress.stars}/${s.progress.maxStars}` : '–'),
+          h('td', null, starsCell(s.progress)),
           h('td', null, fmtTime(s.progress.timeSpent)),
           h('td', null, timeAgo(s.progress.lastActivityAt)))))))
         : h('p', { class: 'muted' }, 'No students can see this lesson yet.'))

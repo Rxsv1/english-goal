@@ -1,0 +1,245 @@
+'use strict';
+
+/**
+ * End-to-end API tests. They start the real server against a PostgreSQL database, so they only run
+ * when TEST_DATABASE_URL is set (the database is wiped first - use an empty one!):
+ *
+ *   TEST_DATABASE_URL=postgres://user:pass@localhost:5432/wordstack_test npm test
+ */
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
+const path = require('node:path');
+
+const DB = process.env.TEST_DATABASE_URL;
+const PORT = 3900 + Math.floor(Math.random() * 90);
+const BASE = `http://127.0.0.1:${PORT}`;
+const skip = DB ? false : 'set TEST_DATABASE_URL to run the API tests';
+
+let server;
+let adminToken;
+
+async function call(method, url, body, { token, cookie } = {}) {
+  const res = await fetch(BASE + url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: 'Bearer ' + token } : {}),
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
+    body: method === 'GET' ? undefined : JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
+  return { status: res.status, data, setCookie: res.headers.get('set-cookie') };
+}
+const admin = (method, url, body) => call(method, '/api/admin' + url, body, { token: adminToken });
+
+async function newStudent(name) {
+  const email = `${name.toLowerCase()}-${Date.now()}@example.com`;
+  const created = await admin('POST', '/users', { name, email, password: 'password123' });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const login = await call('POST', '/api/auth/login', { email, password: 'password123' });
+  assert.equal(login.status, 200);
+  const cookie = login.setCookie.split(';')[0];
+  const as = (method, url, body) => call(method, '/api' + url, body, { cookie });
+  return { id: created.data.user.id, name, as };
+}
+
+const lessonBody = (title, extra = {}) => ({
+  title,
+  units: [
+    { title: 'One', sentences: [{ en: 'I like green apples' }, { en: 'She is reading a book' }] },
+    { title: 'Two', sentences: [{ en: 'We are going home now' }] },
+  ],
+  ...extra,
+});
+
+const solve = (s, slug, sentence, mistakes = 0, hints = 0) =>
+  s.as('POST', `/lessons/${slug}/solve`, { sentence, mistakes, hints, cid: Math.random().toString(36) });
+
+before(async () => {
+  if (skip) return;
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: DB });
+  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+  await pool.end();
+  server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    env: { ...process.env, DATABASE_URL: DB, PORT: String(PORT), ADMIN_PASSWORD: 'admin-pass', SESSION_SECRET: 'test-secret', ALLOW_SIGNUP: 'true' },
+    stdio: 'ignore',
+  });
+  for (let i = 0; i < 60; i++) {
+    try { if ((await fetch(BASE + '/healthz')).ok) break; } catch (e) { /* not up yet */ }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  adminToken = (await call('POST', '/api/admin/login', { password: 'admin-pass' })).data.token;
+});
+
+after(() => { if (server) server.kill(); });
+
+test('admin can create a lesson inside a student card, private to that student', { skip }, async () => {
+  const sara = await newStudent('Sara');
+  const omar = await newStudent('Omar');
+
+  const made = await admin('POST', `/users/${sara.id}/lessons`, lessonBody('Sara special'));
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  assert.equal(made.data.lesson.visibility, 'assigned');
+  const slug = made.data.lesson.slug;
+
+  // Same title again: the link name is made unique automatically instead of failing.
+  const again = await admin('POST', `/users/${sara.id}/lessons`, lessonBody('Sara special'));
+  assert.equal(again.status, 201);
+  assert.notEqual(again.data.lesson.slug, slug);
+
+  const saraLessons = (await sara.as('GET', '/lessons')).data.lessons;
+  const mine = saraLessons.find(l => l.slug === slug);
+  assert.ok(mine, 'Sara sees her private lesson');
+  assert.equal(mine.assigned, true);
+  const omarLessons = (await omar.as('GET', '/lessons')).data.lessons;
+  assert.ok(!omarLessons.some(l => l.slug === slug), 'Omar does not see it');
+  assert.equal((await omar.as('GET', `/lessons/${slug}`)).status, 404);
+
+  // Unknown student
+  assert.equal((await admin('POST', '/users/nope/lessons', lessonBody('X'))).status, 404);
+
+  // Student card shows it as assigned, with the count of students who have it
+  const card = (await admin('GET', `/users/${sara.id}`)).data;
+  const row = card.lessons.find(l => l.slug === slug);
+  assert.equal(row.assignedToUser, true);
+  assert.equal(row.assignedCount, 1);
+
+  // Take it away again: Sara loses it, Omar was never affected.
+  assert.equal((await admin('DELETE', `/users/${sara.id}/assignments/${made.data.lesson.id}`)).status, 204);
+  assert.ok(!(await sara.as('GET', '/lessons')).data.lessons.some(l => l.slug === slug));
+});
+
+test('importing JSON from a student card keeps the lessons private and never overwrites others', { skip }, async () => {
+  const kim = await newStudent('Kim');
+  const other = await newStudent('Lee');
+  const pub = await admin('POST', '/lessons', lessonBody('Shared public lesson', { slug: 'shared-public' }));
+  assert.equal(pub.status, 201);
+
+  const r = await admin('POST', '/import', {
+    assignTo: kim.id,
+    lessons: [
+      { title: 'Imported for Kim', slug: 'imported-kim', units: [{ title: 'U', sentences: [{ en: 'Where is the station' }] }] },
+      // same link name as a public lesson: must become a NEW private lesson, not overwrite it
+      { title: 'Shared public lesson', slug: 'shared-public', visibility: 'public', units: [{ title: 'U', sentences: [{ en: 'Totally different words' }] }] },
+    ],
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.created, 2);
+  assert.equal(r.data.updated, 0);
+
+  const kimSlugs = (await kim.as('GET', '/lessons')).data.lessons.map(l => l.slug);
+  assert.ok(kimSlugs.includes('imported-kim'));
+  assert.ok(!(await other.as('GET', '/lessons')).data.lessons.some(l => l.slug === 'imported-kim'));
+  const stillPublic = (await admin('GET', `/lessons/${pub.data.lesson.id}`)).data.lesson;
+  assert.equal(stillPublic.visibility, 'public');
+  assert.equal(stillPublic.units[0].sentences[0].en, 'I like green apples');
+});
+
+test('retrying keeps progress, a better score is counted as extra, a worse one changes nothing', { skip }, async () => {
+  const ana = await newStudent('Ana');
+  const made = await admin('POST', `/users/${ana.id}/lessons`, lessonBody('Retry lesson'));
+  const slug = made.data.lesson.slug;
+  const lesson = (await ana.as('GET', `/lessons/${slug}`)).data.lesson;
+  const [u1, u2] = lesson.units;
+
+  // Unit 2 is locked until unit 1 is finished (enforced on the server, not just hidden).
+  assert.equal((await solve(ana, slug, 'We are going home now')).status, 403);
+
+  // First time: 3 mistakes = 1 star, then 1 mistake = 2 stars
+  const a = await solve(ana, slug, 'I like green apples', 3, 0);
+  assert.equal(a.data.stars, 1);
+  assert.equal(a.data.extra, 0);
+  assert.equal(a.data.replay, false);
+  await solve(ana, slug, 'She is reading a book', 1, 0);
+
+  let p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.units[0].completed, true);
+  assert.equal(p.units[0].stars, 3);
+  assert.equal(p.units[0].extra, 0);
+  assert.equal(p.units[1].locked, false);
+
+  // Practise again, perfectly: 1 -> 3 stars = +2 extra, 2 -> 3 stars = +1 extra
+  const b = await solve(ana, slug, 'I like green apples', 0, 0);
+  assert.equal(b.data.replay, true);
+  assert.equal(b.data.extra, 2);
+  assert.equal(b.data.best, 3);
+  assert.equal((await solve(ana, slug, 'She is reading a book', 0, 0)).data.extra, 1);
+
+  p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.units[0].stars, 6);
+  assert.equal(p.units[0].extra, 3);
+  assert.equal(p.units[0].completed, true, 'progress is still there');
+
+  // A worse retry never lowers anything and gives no extra
+  const worse = await solve(ana, slug, 'I like green apples', 9, 0);
+  assert.equal(worse.data.extra, 0);
+  assert.equal(worse.data.best, 3);
+  // ...and a repeat of an equally good result gives no extra either
+  assert.equal((await solve(ana, slug, 'I like green apples', 0, 0)).data.extra, 0);
+
+  p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.units[0].stars, 6);
+  assert.equal(p.units[0].extra, 3);
+  const sentences = (await ana.as('GET', `/lessons/${slug}`)).data.lesson.units[0].sentences;
+  assert.deepEqual(sentences.map(s => [s.stars, s.extra]), [[3, 2], [3, 1]]);
+
+  // Lesson finishes only once; extra from retries is reported in the profile and to the teacher.
+  const done = await solve(ana, slug, 'We are going home now', 0, 0);
+  assert.equal(done.data.completed, true);
+  assert.equal(done.data.justCompleted, true);
+  assert.equal((await solve(ana, slug, 'We are going home now', 0, 0)).data.justCompleted, false);
+
+  const me = (await ana.as('GET', '/me')).data;
+  assert.equal(me.stats.extraStars, 3);
+  assert.equal(me.stats.stars, 9);
+
+  const card = (await admin('GET', `/users/${ana.id}`)).data;
+  assert.equal(card.stats.extraStars, 3);
+  assert.equal(card.lessons.find(l => l.slug === slug).progress.extra, 3);
+  const csv = await fetch(BASE + '/api/admin/export/progress.csv', { headers: { Authorization: 'Bearer ' + adminToken } });
+  assert.match(await csv.text(), /Of which extra/);
+
+  // Restarting the lesson is recorded for the teacher but resets nothing.
+  assert.equal((await ana.as('POST', `/lessons/${slug}/restart`, {})).status, 204);
+  assert.equal((await ana.as('POST', `/lessons/${slug}/restart`, { unitId: u1.id })).status, 204);
+  assert.equal((await ana.as('POST', `/lessons/${slug}/restart`, { unitId: 'nope' })).status, 404);
+  p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.completed, true);
+  assert.equal(p.stars, 9);
+  const events = (await admin('GET', `/activity?user=${ana.id}`)).data.events;
+  assert.ok(events.some(e => e.type === 'restart'));
+  assert.ok(events.some(e => e.type === 'sentence_solved' && e.data.replay && e.data.extra === 2));
+  assert.ok(u2.id);
+});
+
+test('a unit the student already finished is never locked, even if a new unit is added before it', { skip }, async () => {
+  const bo = await newStudent('Bo');
+  const made = await admin('POST', `/users/${bo.id}/lessons`, lessonBody('Reorder lesson'));
+  const slug = made.data.lesson.slug;
+  const lesson = (await bo.as('GET', `/lessons/${slug}`)).data.lesson;
+  await solve(bo, slug, 'I like green apples');
+  await solve(bo, slug, 'She is reading a book');
+  await solve(bo, slug, 'We are going home now');
+
+  // Teacher puts a brand-new unit first (existing units keep their ids, so progress is kept).
+  const full = (await admin('GET', `/lessons/${made.data.lesson.id}`)).data.lesson;
+  const units = [{ title: 'New first unit', sentences: [{ en: 'Brand new sentence here' }] }, ...full.units];
+  const upd = await admin('PUT', `/lessons/${full.id}`, { ...full, units, assignedUserIds: undefined });
+  assert.equal(upd.status, 200, JSON.stringify(upd.data));
+
+  const p = (await bo.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.units[0].locked, false);
+  assert.equal(p.units[1].locked, false, 'finished unit stays open');
+  assert.equal(p.units[2].locked, false, 'finished unit stays open');
+  assert.ok(lesson.units.length === 2);
+});
+
+test('compressed responses are served', { skip }, async () => {
+  const res = await fetch(BASE + '/app.js', { headers: { 'Accept-Encoding': 'gzip' } });
+  assert.equal(res.headers.get('content-encoding'), 'gzip');
+});

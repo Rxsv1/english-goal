@@ -15,24 +15,28 @@ const unitsOf = lesson => (Array.isArray(lesson.units) && lesson.units.length
  * Combines a lesson with one student's progress.
  * @param lesson   row with .units / .sentences
  * @param lp       lesson_progress row (or undefined)
- * @param solved   Map(sentenceText -> stars) for this lesson
+ * @param solved   Map(sentenceText -> best stars) for this lesson
  * @param unitRows Map(unitId -> unit_progress row) for this lesson
+ * @param extra    Map(sentenceText -> extra stars earned by practising again) for this lesson
  */
-function summarize(lesson, lp, solved, unitRows) {
+function summarize(lesson, lp, solved, unitRows, extra) {
   solved = solved || new Map();
   unitRows = unitRows || new Map();
+  extra = extra || new Map();
   let prevDone = true;
   const units = unitsOf(lesson).map(u => {
     const total = u.sentences.length;
-    let done = 0, stars = 0;
+    let done = 0, stars = 0, bonus = 0;
     for (const s of u.sentences) {
       const st = solved.get(s.en);
-      if (st) { done++; stars += st; }
+      if (st) { done++; stars += st; bonus += extra.get(s.en) || 0; }
     }
     const row = unitRows.get(u.id);
     const learned = Boolean(row && row.learned_at);
     const completed = total > 0 && done === total;
-    const locked = !prevDone;
+    // A unit is only locked while it is brand new. Anything the student already started or finished
+    // stays open (e.g. when a teacher adds a unit before it), so they can always go back.
+    const locked = !prevDone && !completed && !row && done === 0;
     prevDone = completed;
     return {
       id: u.id,
@@ -40,6 +44,7 @@ function summarize(lesson, lp, solved, unitRows) {
       total,
       solved: done,
       stars,
+      extra: bonus,
       maxStars: total * 3,
       learned,
       learnIndex: row ? Math.min(row.learn_index, Math.max(0, total - 1)) : 0,
@@ -52,6 +57,7 @@ function summarize(lesson, lp, solved, unitRows) {
   const total = units.reduce((a, u) => a + u.total, 0);
   const done = units.reduce((a, u) => a + u.solved, 0);
   const stars = units.reduce((a, u) => a + u.stars, 0);
+  const bonus = units.reduce((a, u) => a + u.extra, 0);
   const completed = total > 0 && done === total;
   const anyLearned = units.some(u => u.learned);
   const current = units.findIndex(u => !u.completed);
@@ -60,6 +66,7 @@ function summarize(lesson, lp, solved, unitRows) {
     total,
     solved: done,
     stars,
+    extra: bonus,
     maxStars: total * 3,
     learned: units.every(u => u.learned),
     completed,
@@ -85,15 +92,22 @@ function groupUnits(rows, key = 'lesson_id') {
   return out;
 }
 
-/** Groups sentence_progress rows into Map(lessonId -> Map(sentence -> stars)). */
-function groupSolved(rows) {
+/**
+ * Groups sentence_progress rows (needs sentence, stars, extra; plus lesson_id or user_id) into
+ * Map(key -> Map(sentence -> value)). `field` is 'stars' (best result) or 'extra' (earned by retrying).
+ */
+function groupSolved(rows, field = 'stars', key = 'lesson_id') {
   const out = new Map();
   for (const r of rows) {
-    if (!out.has(r.lesson_id)) out.set(r.lesson_id, new Map());
-    out.get(r.lesson_id).set(r.sentence, r.stars);
+    if (field === 'extra' && !r.extra) continue;
+    if (!out.has(r[key])) out.set(r[key], new Map());
+    out.get(r[key]).set(r.sentence, r[field]);
   }
   return out;
 }
+
+/** SQL expression for the extra stars of a sentence_progress row. */
+const EXTRA_SQL = 'GREATEST(stars - COALESCE(base_stars, stars), 0)';
 
 /** Consecutive days (UTC) with activity, ending today or yesterday. `days` = sorted list of 'YYYY-MM-DD' desc. */
 function streak(days) {
@@ -114,4 +128,4 @@ function streak(days) {
 const VISIBLE_SQL = `l.published AND (l.visibility = 'public' OR EXISTS (
   SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = l.id AND a.user_id = $1))`;
 
-module.exports = { starsFor, summarize, unitsOf, groupSolved, groupUnits, streak, VISIBLE_SQL };
+module.exports = { starsFor, summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL };

@@ -105,6 +105,14 @@ async function migrate(pool) {
         started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (user_id, lesson_id, unit_id)
       );
+
+      -- Retries: "stars" is always the best result ever; "base_stars" is what the student got the first
+      -- time. The difference is the "extra" earned by practising again. Neither can ever go down.
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS base_stars INTEGER;
+      UPDATE sentence_progress SET base_stars = stars WHERE base_stars IS NULL;
+
+      -- Speeds up the "already finished this unit/lesson?" checks as the activity log grows.
+      CREATE INDEX IF NOT EXISTS events_user_lesson_type ON events(user_id, lesson_id, type);
     `);
 
     // Upgrade: lessons made before units existed become a single unit, keeping students' card progress.

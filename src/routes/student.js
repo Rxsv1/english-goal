@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateUser } = require('../validate');
-const { starsFor, summarize, unitsOf, groupSolved, groupUnits, streak, VISIBLE_SQL } = require('../progress');
+const { starsFor, summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const clampInt = (v, min, max) => Math.min(max, Math.max(min, Number.isFinite(+v) ? Math.round(+v) : 0));
@@ -70,7 +70,7 @@ module.exports = function studentRoutes(pool) {
   r.get('/me', wrap(async (req, res) => {
     const uid = req.user.id;
     const [sp, lp, days] = await Promise.all([
-      pool.query('SELECT COUNT(*)::int AS solved, COALESCE(SUM(stars),0)::int AS stars FROM sentence_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT COUNT(*)::int AS solved, COALESCE(SUM(stars),0)::int AS stars, COALESCE(SUM(${EXTRA_SQL}),0)::int AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT COUNT(*) FILTER (WHERE completed_at IS NOT NULL)::int AS completed, COALESCE(SUM(time_spent_sec),0)::int AS time FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
                   WHERE user_id = $1 AND type IN ('sentence_solved','cards_done','lesson_start') ORDER BY d DESC LIMIT 400`, [uid]),
@@ -80,6 +80,7 @@ module.exports = function studentRoutes(pool) {
       stats: {
         sentencesSolved: sp.rows[0].solved,
         stars: sp.rows[0].stars,
+        extraStars: sp.rows[0].extra,
         lessonsCompleted: lp.rows[0].completed,
         timeSpent: lp.rows[0].time,
         streak: streak(days.rows.map(x => x.d)),
@@ -111,11 +112,12 @@ module.exports = function studentRoutes(pool) {
     const [lessons, lp, sp, up] = await Promise.all([
       pool.query(`SELECT l.* FROM lessons l WHERE ${VISIBLE_SQL} ORDER BY l.position, l.title`, [uid]),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
-      pool.query('SELECT lesson_id, sentence, stars FROM sentence_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
     ]);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
+    const extras = groupSolved(sp.rows, 'extra');
     const unitMap = groupUnits(up.rows);
     res.set('Cache-Control', 'no-store');
     res.json({
@@ -127,7 +129,7 @@ module.exports = function studentRoutes(pool) {
         emoji: l.emoji,
         assigned: l.visibility === 'assigned',
         count: l.sentences.length,
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id)),
       })),
     });
   }));
@@ -143,10 +145,11 @@ module.exports = function studentRoutes(pool) {
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
     const [lp, sp, up] = await Promise.all([
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
-      pool.query('SELECT sentence, stars FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
+      pool.query(`SELECT sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2`, [uid, lesson.id]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
     ]);
     const solved = new Map(sp.rows.map(x => [x.sentence, x.stars]));
+    const extras = new Map(sp.rows.filter(x => x.extra).map(x => [x.sentence, x.extra]));
     const unitRows = new Map(up.rows.map(x => [x.unit_id, x]));
     res.set('Cache-Control', 'no-store');
     res.json({
@@ -160,12 +163,23 @@ module.exports = function studentRoutes(pool) {
         units: unitsOf(lesson).map(u => ({
           id: u.id,
           title: u.title,
-          sentences: u.sentences.map(s => ({ en: s.en, stars: solved.get(s.en) || 0 })),
+          sentences: u.sentences.map(s => ({ en: s.en, stars: solved.get(s.en) || 0, extra: extras.get(s.en) || 0 })),
         })),
       },
-      progress: summarize(lesson, lp.rows[0], solved, unitRows),
+      progress: summarize(lesson, lp.rows[0], solved, unitRows, extras),
     });
   }));
+
+  // True when this unit is still locked for the student (a brand-new unit behind an unfinished one).
+  async function isUnitLocked(db, uid, lesson, unitId) {
+    const [sp, up] = await Promise.all([
+      db.query('SELECT sentence, stars FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
+      db.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
+    ]);
+    const p = summarize(lesson, null, new Map(sp.rows.map(x => [x.sentence, x.stars])), new Map(up.rows.map(x => [x.unit_id, x])));
+    const u = p.units.find(x => x.id === unitId);
+    return Boolean(u && u.locked);
+  }
 
   // Creates the lesson_progress row on first activity; returns true when it was new.
   async function touchLesson(client, uid, lessonId, seconds) {
@@ -186,6 +200,7 @@ module.exports = function studentRoutes(pool) {
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
     const unit = unitsOf(lesson).find(u => u.id === req.params.unitId);
     if (!unit) return res.status(404).json({ error: 'This unit no longer exists.' });
+    if (await isUnitLocked(pool, uid, lesson, unit.id)) return res.status(403).json({ error: 'Finish the previous unit first.' });
     const index = clampInt(req.body && req.body.index, 0, unit.sentences.length - 1);
     const seconds = clampInt(req.body && req.body.seconds, 0, 600);
     const done = Boolean(req.body && req.body.done);
@@ -244,11 +259,20 @@ module.exports = function studentRoutes(pool) {
           "SELECT 1 FROM events WHERE user_id = $1 AND type = 'sentence_solved' AND data ? 'cid' AND data->>'cid' = $2", [uid, cid]);
         if (dup.rowCount) { await client.query('ROLLBACK'); return res.json({ duplicate: true }); }
       }
+      if (await isUnitLocked(client, uid, lesson, unit.id)) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Finish the previous unit first.' }); }
       if (await touchLesson(client, uid, lesson.id, seconds)) await client.query(
         "INSERT INTO events (user_id, lesson_id, type) VALUES ($1,$2,'lesson_start')", [uid, lesson.id]);
+
+      // Practising again never lowers anything. A better result raises the best score, and the
+      // improvement is counted as "extra" on top of what the student first achieved.
+      const prevRow = await client.query(
+        'SELECT stars FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3', [uid, lesson.id, sentence]);
+      const replay = prevRow.rowCount > 0;
+      const before = replay ? prevRow.rows[0].stars : 0;
+      const extra = replay ? Math.max(0, stars - before) : 0;
       const { rows: sp } = await client.query(
-        `INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, best_mistakes, best_hints, total_mistakes, total_hints)
-         VALUES ($1,$2,$3,$4,$5,$6,$5,$6)
+        `INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars, best_mistakes, best_hints, total_mistakes, total_hints)
+         VALUES ($1,$2,$3,$4,$4,$5,$6,$5,$6)
          ON CONFLICT (user_id, lesson_id, sentence) DO UPDATE SET
            stars = GREATEST(sentence_progress.stars, EXCLUDED.stars),
            best_mistakes = LEAST(sentence_progress.best_mistakes, EXCLUDED.best_mistakes),
@@ -262,13 +286,15 @@ module.exports = function studentRoutes(pool) {
       );
       await client.query(
         "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'sentence_solved',$3::jsonb)",
-        [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, stars, mistakes, hints, seconds, ...(cid ? { cid } : {}) })]);
+        [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, stars, mistakes, hints, seconds,
+          ...(replay ? { replay: true, extra } : {}), ...(cid ? { cid } : {}) })]);
 
       // Lesson complete when every current sentence is solved.
       const { rows: solvedRows } = await client.query(
         'SELECT sentence, stars FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
       const solved = new Map(solvedRows.map(x => [x.sentence, x.stars]));
-      const allDone = lesson.sentences.every(s => solved.has(s.en));
+      const allSentences = unitsOf(lesson).flatMap(u => u.sentences);
+      const allDone = allSentences.every(s => solved.has(s.en));
       const unitDone = unit.sentences.every(s => solved.has(s.en));
       let justCompleted = false, unitJustCompleted = false;
       if (unitDone) {
@@ -290,17 +316,30 @@ module.exports = function studentRoutes(pool) {
           const total = [...solved.values()].reduce((a, x) => a + x, 0);
           await client.query(
             "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'lesson_complete',$3::jsonb)",
-            [uid, lesson.id, JSON.stringify({ stars: total, maxStars: lesson.sentences.length * 3 })]);
+            [uid, lesson.id, JSON.stringify({ stars: total, maxStars: allSentences.length * 3 })]);
         }
       }
       await client.query('COMMIT');
-      res.json({ stars, best: sp[0].stars, completed: allDone, justCompleted, unitCompleted: unitDone, unitJustCompleted });
+      res.json({ stars, best: sp[0].stars, extra, replay, completed: allDone, justCompleted, unitCompleted: unitDone, unitJustCompleted });
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
     } finally {
       client.release();
     }
+  }));
+
+  // "Start over": the student replays a unit (or the whole lesson) from the first sentence. Nothing is
+  // reset - saved progress, stars and unlocked units stay. This only leaves a note for the teacher.
+  r.post('/lessons/:slug/restart', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const lesson = await loadVisibleLesson(uid, req.params.slug);
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
+    const unitId = req.body && typeof req.body.unitId === 'string' ? req.body.unitId : null;
+    const unit = unitId ? unitsOf(lesson).find(u => u.id === unitId) : null;
+    if (unitId && !unit) return res.status(404).json({ error: 'This unit no longer exists.' });
+    await logEvent(uid, lesson.id, 'restart', unit ? { unit: unit.title, unitId: unit.id } : {});
+    res.status(204).end();
   }));
 
   return r;

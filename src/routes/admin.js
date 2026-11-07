@@ -4,7 +4,8 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateLesson, validateUser, LEVELS } = require('../validate');
-const { summarize, unitsOf, groupSolved, groupUnits, streak } = require('../progress');
+const { summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL } = require('../progress');
+const { slugify } = require('../validate');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -105,16 +106,16 @@ module.exports = function adminRoutes(pool) {
 
   /* ================= Students ================= */
   const USER_STATS_SQL = `
-    SELECT u.*, COALESCE(sp.solved,0)::int AS solved, COALESCE(sp.stars,0)::int AS stars,
+    SELECT u.*, COALESCE(sp.solved,0)::int AS solved, COALESCE(sp.stars,0)::int AS stars, COALESCE(sp.extra,0)::int AS extra,
            COALESCE(lp.completed,0)::int AS lessons_completed, COALESCE(lp.started,0)::int AS lessons_started,
            COALESCE(lp.time,0)::int AS time_spent
     FROM users u
-    LEFT JOIN (SELECT user_id, COUNT(*) AS solved, SUM(stars) AS stars FROM sentence_progress GROUP BY user_id) sp ON sp.user_id = u.id
+    LEFT JOIN (SELECT user_id, COUNT(*) AS solved, SUM(stars) AS stars, SUM(${EXTRA_SQL}) AS extra FROM sentence_progress GROUP BY user_id) sp ON sp.user_id = u.id
     LEFT JOIN (SELECT user_id, COUNT(*) FILTER (WHERE completed_at IS NOT NULL) AS completed, COUNT(*) AS started,
                       SUM(time_spent_sec) AS time FROM lesson_progress GROUP BY user_id) lp ON lp.user_id = u.id`;
 
   const statsOut = u => ({
-    sentencesSolved: u.solved, stars: u.stars, lessonsCompleted: u.lessons_completed,
+    sentencesSolved: u.solved, stars: u.stars, extraStars: u.extra, lessonsCompleted: u.lessons_completed,
     lessonsStarted: u.lessons_started, timeSpent: u.time_spent,
   });
 
@@ -144,9 +145,10 @@ module.exports = function adminRoutes(pool) {
     if (!u) return res.status(404).json({ error: 'Student not found.' });
 
     const [lessons, lp, sp, up, assigned, days, events, daily] = await Promise.all([
-      pool.query('SELECT * FROM lessons ORDER BY position, title'),
+      pool.query(`SELECT l.*, (SELECT COUNT(*) FROM lesson_assignments a WHERE a.lesson_id = l.id)::int AS assigned_count
+                  FROM lessons l ORDER BY l.position, l.title`),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
-      pool.query('SELECT lesson_id, sentence, stars FROM sentence_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
       pool.query('SELECT lesson_id FROM lesson_assignments WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
@@ -159,6 +161,7 @@ module.exports = function adminRoutes(pool) {
     ]);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
+    const extras = groupSolved(sp.rows, 'extra');
     const unitMap = groupUnits(up.rows);
     const assignedIds = new Set(assigned.rows.map(x => x.lesson_id));
 
@@ -166,10 +169,10 @@ module.exports = function adminRoutes(pool) {
       user: userOut(u),
       stats: { ...statsOut(u), streak: streak(days.rows.map(x => x.d)) },
       lessons: lessons.rows.map(l => ({
-        ...lessonOut(l),
+        ...lessonOut(l, { assignedCount: l.assigned_count }),
         assignedToUser: assignedIds.has(l.id),
         visibleToUser: l.published && (l.visibility === 'public' || assignedIds.has(l.id)),
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id)),
       })),
       daily: daily.rows,
       events,
@@ -222,16 +225,27 @@ module.exports = function adminRoutes(pool) {
     res.status(204).end();
   }));
 
+  // Take one private lesson away from one student (their saved progress is kept).
+  r.delete('/users/:id/assignments/:lessonId', wrap(async (req, res) => {
+    await pool.query('DELETE FROM lesson_assignments WHERE user_id = $1 AND lesson_id = $2', [req.params.id, req.params.lessonId]);
+    res.status(204).end();
+  }));
+
+  // Create a lesson that belongs to this student only (no need to make it public first).
+  r.post('/users/:id/lessons', wrap((req, res) => saveLesson(req, res, null, { forUser: req.params.id })));
+
   /* ================= Lessons ================= */
   r.get('/lessons', wrap(async (req, res) => {
     const { rows } = await pool.query(`
       SELECT l.*,
         (SELECT COUNT(*) FROM lesson_assignments a WHERE a.lesson_id = l.id)::int AS assigned_count,
+        (SELECT COALESCE(array_agg(u.name ORDER BY u.name), '{}') FROM (
+           SELECT u.name FROM lesson_assignments a JOIN users u ON u.id = a.user_id WHERE a.lesson_id = l.id ORDER BY u.name LIMIT 3) u) AS assigned_names,
         (SELECT COUNT(*) FROM lesson_progress p WHERE p.lesson_id = l.id)::int AS started_count,
         (SELECT COUNT(*) FROM lesson_progress p WHERE p.lesson_id = l.id AND p.completed_at IS NOT NULL)::int AS completed_count
       FROM lessons l ORDER BY l.position, l.title`);
     res.json({
-      lessons: rows.map(l => lessonOut(l, { assignedCount: l.assigned_count, startedCount: l.started_count, completedCount: l.completed_count })),
+      lessons: rows.map(l => lessonOut(l, { assignedCount: l.assigned_count, assignedNames: l.assigned_names, startedCount: l.started_count, completedCount: l.completed_count })),
       levels: LEVELS,
     });
   }));
@@ -252,19 +266,16 @@ module.exports = function adminRoutes(pool) {
                     OR EXISTS (SELECT 1 FROM lesson_progress p WHERE p.lesson_id = $1 AND p.user_id = u.id)
                   ORDER BY u.name`, [l.id, l.visibility]),
       pool.query('SELECT * FROM lesson_progress WHERE lesson_id = $1', [l.id]),
-      pool.query('SELECT user_id, sentence, stars FROM sentence_progress WHERE lesson_id = $1', [l.id]),
+      pool.query(`SELECT user_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE lesson_id = $1`, [l.id]),
     ]);
     const up = await pool.query('SELECT * FROM unit_progress WHERE lesson_id = $1', [l.id]);
     const unitsByUser = groupUnits(up.rows, 'user_id');
     const lpMap = new Map(lp.rows.map(x => [x.user_id, x]));
-    const byUser = new Map();
-    for (const row of sp.rows) {
-      if (!byUser.has(row.user_id)) byUser.set(row.user_id, new Map());
-      byUser.get(row.user_id).set(row.sentence, row.stars);
-    }
+    const byUser = groupSolved(sp.rows, 'stars', 'user_id');
+    const extraByUser = groupSolved(sp.rows, 'extra', 'user_id');
     res.json({
       lesson: lessonOut(l, { units: unitsOf(l).map(u => ({ id: u.id, title: u.title, count: u.sentences.length })) }),
-      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id)) })),
+      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id)) })),
     });
   }));
 
@@ -275,12 +286,34 @@ module.exports = function adminRoutes(pool) {
       'INSERT INTO lesson_assignments (lesson_id, user_id) SELECT $1, id FROM users WHERE id = ANY($2::text[])', [lessonId, userIds]);
   }
 
-  async function saveLesson(req, res, id) {
-    const { lesson: d, assignedUserIds, errors } = validateLesson(req.body);
+  // Finds a link name that is not used yet (adds -2, -3... when needed).
+  async function freeSlug(client, base) {
+    const root = (slugify(base) || 'lesson').slice(0, 52).replace(/-+$/, '');
+    let slug = root;
+    for (let n = 2; n < 200; n++) {
+      const { rowCount } = await client.query('SELECT 1 FROM lessons WHERE slug = $1', [slug]);
+      if (!rowCount) return slug;
+      slug = `${root}-${n}`;
+    }
+    return `${root}-${crypto.randomBytes(3).toString('hex')}`;
+  }
+
+  /**
+   * Creates or updates a lesson. With { forUser } the lesson is created as private to that one
+   * student (link name made unique automatically).
+   */
+  async function saveLesson(req, res, id, { forUser = null } = {}) {
+    const input = forUser && req.body && typeof req.body === 'object' ? { ...req.body, visibility: 'assigned', assignedUserIds: [forUser] } : req.body;
+    const { lesson: d, assignedUserIds, errors } = validateLesson(input);
     if (errors) return res.status(400).json({ error: errors[0], errors });
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      if (forUser) {
+        const u = await client.query('SELECT 1 FROM users WHERE id = $1', [forUser]);
+        if (!u.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Student not found.' }); }
+        d.slug = await freeSlug(client, d.slug);
+      }
       let row;
       if (id) {
         ({ rows: [row] } = await client.query(
@@ -338,9 +371,15 @@ module.exports = function adminRoutes(pool) {
     const list = Array.isArray(req.body) ? req.body : req.body && req.body.lessons;
     if (!Array.isArray(list) || list.length === 0) return res.status(400).json({ error: 'The file has no lessons.' });
     if (list.length > 200) return res.status(400).json({ error: 'Import at most 200 lessons at once.' });
+    // assignTo: a student id. Every imported lesson is created as private to that student.
+    const assignTo = !Array.isArray(req.body) && req.body && typeof req.body.assignTo === 'string' ? req.body.assignTo : null;
+    if (assignTo) {
+      const u = await pool.query('SELECT 1 FROM users WHERE id = $1', [assignTo]);
+      if (!u.rowCount) return res.status(404).json({ error: 'Student not found.' });
+    }
     const checked = [];
     for (const [i, item] of list.entries()) {
-      const { lesson, errors } = validateLesson({ ...item, assignedUserIds: undefined });
+      const { lesson, errors } = validateLesson({ ...item, assignedUserIds: undefined, ...(assignTo ? { visibility: 'assigned' } : {}) });
       if (errors) return res.status(400).json({ error: `Lesson ${i + 1} (${(item && item.title) || 'untitled'}): ${errors[0]}` });
       checked.push(lesson);
     }
@@ -349,6 +388,7 @@ module.exports = function adminRoutes(pool) {
     try {
       await client.query('BEGIN');
       for (const d of checked) {
+        if (assignTo) d.slug = await freeSlug(client, d.slug); // never overwrite someone else's lesson
         const { rows: [existing] } = await client.query('SELECT id, units FROM lessons WHERE slug = $1', [d.slug]);
         if (existing) {
           // Keep unit ids when a unit with the same title already exists, so card progress is kept.
@@ -365,10 +405,12 @@ module.exports = function adminRoutes(pool) {
           updated++;
           continue;
         }
+        const id = crypto.randomUUID();
         await client.query(
           `INSERT INTO lessons (id, slug, title, level, description, emoji, published, visibility, position, sentences, units)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT COALESCE(MAX(position) + 1, 0) FROM lessons),$9::jsonb,$10::jsonb)`,
-          [crypto.randomUUID(), d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
+          [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
+        if (assignTo) await client.query('INSERT INTO lesson_assignments (lesson_id, user_id) VALUES ($1,$2)', [id, assignTo]);
         created++;
       }
       await client.query('COMMIT');
@@ -387,7 +429,7 @@ module.exports = function adminRoutes(pool) {
       pool.query('SELECT * FROM users ORDER BY name'),
       pool.query('SELECT * FROM lessons ORDER BY position, title'),
       pool.query('SELECT * FROM lesson_progress'),
-      pool.query('SELECT user_id, lesson_id, sentence, stars FROM sentence_progress'),
+      pool.query(`SELECT user_id, lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress`),
     ]);
     const assigned = await pool.query('SELECT lesson_id, user_id FROM lesson_assignments');
     const up = await pool.query('SELECT * FROM unit_progress');
@@ -399,25 +441,29 @@ module.exports = function adminRoutes(pool) {
     }
     const assignedSet = new Set(assigned.rows.map(a => a.lesson_id + '|' + a.user_id));
     const lpMap = new Map(lp.rows.map(x => [x.user_id + '|' + x.lesson_id, x]));
-    const spMap = new Map();
+    const spMap = new Map(), exMap = new Map();
     for (const row of sp.rows) {
       const k = row.user_id + '|' + row.lesson_id;
       if (!spMap.has(k)) spMap.set(k, new Map());
       spMap.get(k).set(row.sentence, row.stars);
+      if (row.extra) {
+        if (!exMap.has(k)) exMap.set(k, new Map());
+        exMap.get(k).set(row.sentence, row.extra);
+      }
     }
     const esc = v => {
       const s = v === null || v === undefined ? '' : String(v);
       const safe = /^[=+\-@]/.test(s) ? "'" + s : s; // avoid spreadsheet formula injection
       return /[",\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
     };
-    const lines = [['Student', 'Email', 'Lesson', 'Level', 'Status', 'Units done', 'Total units', 'Cards learned', 'Sentences solved', 'Total sentences', 'Stars', 'Max stars', 'Minutes spent', 'Completed at', 'Last activity'].join(',')];
+    const lines = [['Student', 'Email', 'Lesson', 'Level', 'Status', 'Units done', 'Total units', 'Cards learned', 'Sentences solved', 'Total sentences', 'Stars', 'Of which extra (from retries)', 'Max stars', 'Minutes spent', 'Completed at', 'Last activity'].join(',')];
     for (const u of users.rows) {
       for (const l of lessons.rows) {
         const k = u.id + '|' + l.id;
         const visible = l.visibility === 'public' || assignedSet.has(l.id + '|' + u.id);
         if (!visible && !lpMap.has(k)) continue;
-        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k));
-        lines.push([u.name, u.email, l.title, l.level, p.status, p.unitsCompleted, p.unitsTotal, p.units.filter(u => u.learned).length + '/' + p.unitsTotal, p.solved, p.total, p.stars, p.maxStars,
+        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k));
+        lines.push([u.name, u.email, l.title, l.level, p.status, p.unitsCompleted, p.unitsTotal, p.units.filter(u => u.learned).length + '/' + p.unitsTotal, p.solved, p.total, p.stars, p.extra, p.maxStars,
           Math.round(p.timeSpent / 60), p.completedAt ? new Date(p.completedAt).toISOString() : '',
           p.lastActivityAt ? new Date(p.lastActivityAt).toISOString() : ''].map(esc).join(','));
       }
