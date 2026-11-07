@@ -667,3 +667,139 @@ details.start-over { margin: 12px 0 0; text-align: center; }
 .card-done { margin-top: 16px; }
 .card-done .emoji { background: var(--success); color: var(--success-text); }
 .card-done .emoji svg { width: 24px; height: 24px; }
+
+/* ---------- The method: say it out loud, then choose the missing word ---------- */
+.say-row { margin-top: 12px; }
+.btn-say { width: 100%; }
+.btn-say.done, .btn-say.done:not(:disabled):hover { background: var(--success); color: var(--success-text); border-color: transparent; }
+
+.gap-blank {
+  display: inline-block; min-width: 2.6em; height: .95em; margin: 0 .12em; vertical-align: -.08em;
+  border-bottom: 4px solid var(--accent); text-align: center; transition: border-color .2s, color .2s;
+}
+.gap-blank.filled { min-width: 0; height: auto; line-height: 1.15; padding: 0 .12em; vertical-align: baseline; border-bottom-color: var(--success-dark); color: var(--success-text); }
+.gap-card.right { border-color: var(--success-dark); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success-dark) 18%, transparent); }
+.gap-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.gap-opt {
+  position: relative; min-height: 68px; padding: 0 8px; border-radius: var(--r-md);
+  border: 2px solid var(--line-strong); background: var(--surface); color: var(--text);
+  font: inherit; font-weight: 700; font-size: clamp(1.0625rem, 4.8vw, 1.375rem); cursor: pointer;
+  box-shadow: 0 3px 0 var(--line-strong); transition: transform .1s, box-shadow .1s, background-color .2s, border-color .2s, color .2s;
+  -webkit-user-select: none; user-select: none;
+}
+.gap-opt:active:not(:disabled) { transform: translateY(2px); box-shadow: 0 1px 0 var(--line-strong); }
+.gap-opt.wrong { background: var(--hint); border-color: #F59F00; color: #B35C00; box-shadow: none; animation: shake .35s; }
+.gap-opt.right { background: var(--success); border-color: var(--success-dark); color: var(--success-text); box-shadow: none; }
+.gap-opt:disabled:not(.right):not(.wrong) { opacity: .45; cursor: default; }
+.gap-key { display: none; }
+.result-list .gram { color: var(--success-text); letter-spacing: 0; font-weight: 700; }
+
+/* ================================================================================================
+   Computers and large screens
+   Nothing in this section applies to windows narrower than 900 px, so phones (and narrow windows) keep exactly
+   the layout they had. On a computer the screens are re-composed for a wide, short window with a mouse and keyboard
+   instead of simply being stretched. Sizes are in rem, so everything also grows on bigger monitors.
+   The page says which kind of screen it shows with data-layout:  wide = lists and lessons,  game = cards and puzzle,
+   narrow = forms.
+   ================================================================================================ */
+
+/* Shown only on computers (see below): a reminder of the keyboard shortcuts */
+.kbd-hint { display: none; }
+
+@media (min-width: 900px) {
+  :root { --tile-h: 4.25rem; }
+
+  .page[data-layout] { max-width: 87.5rem; padding-left: 2.5rem; padding-right: 2.5rem; }
+  .page[data-layout="game"] { max-width: 62rem; }
+  .page[data-layout="narrow"] { max-width: 46rem; }
+  .page[data-layout] h1 { font-size: 2.25rem; }
+  .page[data-layout] .subtitle { font-size: 1.0625rem; }
+
+  /* ---- Home / Completed lessons: a dashboard band on top, the lessons in a grid below ---- */
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 2.5rem;
+    grid-auto-flow: row dense; align-content: start;
+  }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > * { grid-column: 1 / -1; }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > :is(h1, .sk-title) { grid-column: 1; grid-row: 2; align-self: end; }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > :is(.subtitle, .sk-sub) { grid-column: 1; grid-row: 3; }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > .stat-row { grid-column: 2; grid-row: 2 / span 2; align-self: center; }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > :is(.continue-card, .sk-continue) { grid-column: 1; }
+  :is(.page[data-layout="wide"], .page[data-layout="wide"] > .sk-layer) > .card-done { grid-column: 2; }
+  .lesson-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(22rem, 1fr)); gap: 1rem; }
+  .page[data-layout] .section { margin-top: 2.5rem; }
+
+  /* ---- A lesson: its summary on the left, the units on the right ---- */
+  .hub {
+    display: grid; grid-template-columns: minmax(19rem, 25rem) minmax(0, 1fr); column-gap: 4rem;
+    grid-template-rows: repeat(10, auto) 1fr; row-gap: 0; align-items: start;
+  }
+  .hub > * { grid-column: 1; }
+  .hub > .units { grid-column: 2; grid-row: 1 / -1; margin-top: 1rem; }
+  .hub > details.start-over { margin-left: 0; text-align: left; }
+
+  /* ---- Cards and puzzle: a larger stage, with the controls gathered around the words ---- */
+  .learn-card { min-height: 22rem; border-radius: 28px; }
+  .card-sentence { font-size: clamp(2.25rem, 3.4vw, 3.5rem); }
+  .tile { font-size: 1.75rem; padding: 0 1.4rem; border-radius: 14px; }
+  .answer-box { padding: 1.5rem 2rem; border-radius: 28px; }
+  .answer-zone { min-height: calc(var(--tile-h) * 2 + 2rem); }
+  .btn-big { min-height: 4rem; font-size: 1.25rem; }
+  .prompt { font-size: 1.375rem; margin: 2rem 0 1.25rem; }
+  .feedback.good, .feedback.bad { font-size: 1.5rem; }
+  .solved-panel .sentence { font-size: 1.5rem; }
+  .page[data-layout="game"] .listen-row { max-width: 32rem; margin-left: auto; margin-right: auto; }
+  .page[data-layout="game"] .listen-peek { margin-bottom: 1.25rem; }
+  .page[data-layout="game"] .actions {
+    position: static; max-width: 42rem; margin: 2rem auto 0; padding-top: 0; /* next to the words, not stuck to the bottom of the screen */
+  }
+  .actions .btn { min-height: 3.75rem; font-size: 1.125rem; }
+  .results { margin: 0 auto; max-width: 40rem; }
+  .result-actions { max-width: 24rem; }
+  .jump-n { min-width: 3rem; height: 3rem; }
+  .page[data-layout="game"] .jump-grid, .page[data-layout="game"] .skip-row { max-width: 42rem; margin-left: auto; margin-right: auto; }
+  .page[data-layout="game"] .say-row { width: 100%; max-width: 32rem; margin-left: auto; margin-right: auto; }
+  .gap-options { width: 100%; max-width: 44rem; margin-left: auto; margin-right: auto; gap: 1rem; }
+  .gap-opt { min-height: 5rem; font-size: 1.75rem; border-radius: 18px; }
+  .gap-blank { border-bottom-width: 5px; }
+}
+
+/* ---- Mouse and keyboard (a computer, or a tablet with a trackpad): hover feedback and shortcuts ---- */
+@media (min-width: 900px) and (hover: hover) {
+  .lesson-card, .continue-card, .tile, .btn { transition: transform .12s ease, box-shadow .15s, border-color .15s, background-color .15s; }
+  .lesson-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: var(--line-strong); }
+  .continue-card:hover { transform: translateY(-2px); }
+  .tile:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .btn-ghost:not(:disabled):hover { background: var(--surface-2); }
+  .jump-n:not(:disabled):hover { border-color: var(--accent); }
+  .gap-opt:not(:disabled):hover { border-color: var(--accent); transform: translateY(-2px); }
+  .gap-key { display: block; position: absolute; top: .4rem; left: .65rem; font-size: .6875rem; font-weight: 700; line-height: 1; color: var(--faint); }
+
+  /* the first nine loose words are numbered, so they can be picked with the number keys */
+  .pool-zone { counter-reset: tile; }
+  .pool-zone .tile { counter-increment: tile; position: relative; }
+  .pool-zone .tile:nth-child(-n+9)::before {
+    content: counter(tile); position: absolute; top: .3rem; left: .55rem;
+    font-size: .6875rem; font-weight: 700; line-height: 1; color: var(--faint);
+  }
+  .kbd-hint { display: block; text-align: center; margin: 1.25rem 0 0; color: var(--faint); font-size: .875rem; }
+}
+
+/* Bigger monitors: the whole interface (every size in rem) grows with the screen */
+@media (min-width: 1280px) { html.student-app { font-size: 17px; } }
+@media (min-width: 1700px) { html.student-app { font-size: 18.5px; } }
+@media (min-width: 2200px) { html.student-app { font-size: 21px; } }
+
+/* Short laptop screens: keep the puzzle on one screen without scrolling */
+@media (min-width: 900px) and (max-height: 820px) {
+  :root { --tile-h: 3.5rem; }
+  .prompt { margin: 1rem 0 .75rem; }
+  .page[data-layout="game"] .listen-peek { margin-bottom: .75rem; }
+  .btn-big { min-height: 3.25rem; }
+  .tile { font-size: 1.5rem; }
+  .learn-card { min-height: 17rem; }
+  .answer-box { padding: 1rem 1.5rem; }
+  .gap-opt { min-height: 4rem; }
+  .page[data-layout="game"] .actions { margin-top: 1.25rem; }
+  .actions .btn { min-height: 3.25rem; }
+}

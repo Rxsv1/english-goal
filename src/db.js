@@ -118,6 +118,10 @@ async function migrate(pool) {
       ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS base_stars INTEGER;
       UPDATE sentence_progress SET base_stars = stars WHERE base_stars IS NULL;
 
+      -- Grammar step: a sentence with a gap is answered once (the right word chosen); mistakes are kept for the teacher.
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS grammar_done BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS grammar_mistakes INTEGER NOT NULL DEFAULT 0;
+
       -- Speeds up the "already finished this unit/lesson?" checks as the activity log grows.
       CREATE INDEX IF NOT EXISTS events_user_lesson_type ON events(user_id, lesson_id, type);
     `);

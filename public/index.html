@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="student-app">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -21,7 +21,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main id="app" class="page" aria-busy="true">{{SKELETON}}</main>
+  <main id="app" class="page" data-layout="{{LAYOUT}}" aria-busy="true">{{SKELETON}}</main>
 
   <!-- Skeleton screens. The server copies the right one into #app so it is painted before any JavaScript runs;
        app.js clones the same markup while data loads. Every block uses the real layout classes, so nothing jumps. -->

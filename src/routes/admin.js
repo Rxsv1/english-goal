@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateLesson, validateUser, LEVELS } = require('../validate');
-const { summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL } = require('../progress');
+const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, streak, EXTRA_SQL } = require('../progress');
 const { slugify } = require('../validate');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -91,7 +91,7 @@ module.exports = function adminRoutes(pool) {
       `SELECT e.id, e.type, e.data, e.created_at, u.id AS user_id, u.name AS user_name, l.title AS lesson_title, l.emoji AS lesson_emoji
        FROM events e JOIN users u ON u.id = e.user_id LEFT JOIN lessons l ON l.id = e.lesson_id
        WHERE ($1::text IS NULL OR e.user_id = $1) AND ($2::text IS NULL OR e.lesson_id = $2)
-       ORDER BY e.created_at DESC LIMIT $3`,
+       ORDER BY e.created_at DESC, e.id DESC LIMIT $3`, // events saved together share a timestamp; the id keeps their order stable
       [userId, lessonId, limit]
     );
     return rows.map(e => {
@@ -150,7 +150,7 @@ module.exports = function adminRoutes(pool) {
       pool.query(`SELECT l.*, (SELECT COUNT(*) FROM lesson_assignments a WHERE a.lesson_id = l.id)::int AS assigned_count
                   FROM lessons l ORDER BY l.position, l.title`),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
-      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
+      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
       pool.query('SELECT lesson_id FROM lesson_assignments WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
@@ -164,6 +164,7 @@ module.exports = function adminRoutes(pool) {
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
     const extras = groupSolved(sp.rows, 'extra');
+    const grammars = groupGrammar(sp.rows);
     const unitMap = groupUnits(up.rows);
     const assignedIds = new Set(assigned.rows.map(x => x.lesson_id));
 
@@ -174,7 +175,7 @@ module.exports = function adminRoutes(pool) {
         ...lessonOut(l, { assignedCount: l.assigned_count }),
         assignedToUser: assignedIds.has(l.id),
         visibleToUser: l.published && (l.visibility === 'public' || assignedIds.has(l.id)),
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id)),
       })),
       daily: daily.rows,
       events,
@@ -268,16 +269,17 @@ module.exports = function adminRoutes(pool) {
                     OR EXISTS (SELECT 1 FROM lesson_progress p WHERE p.lesson_id = $1 AND p.user_id = u.id)
                   ORDER BY u.name`, [l.id, l.visibility]),
       pool.query('SELECT * FROM lesson_progress WHERE lesson_id = $1', [l.id]),
-      pool.query(`SELECT user_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE lesson_id = $1`, [l.id]),
+      pool.query(`SELECT user_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE lesson_id = $1`, [l.id]),
     ]);
     const up = await pool.query('SELECT * FROM unit_progress WHERE lesson_id = $1', [l.id]);
     const unitsByUser = groupUnits(up.rows, 'user_id');
     const lpMap = new Map(lp.rows.map(x => [x.user_id, x]));
     const byUser = groupSolved(sp.rows, 'stars', 'user_id');
     const extraByUser = groupSolved(sp.rows, 'extra', 'user_id');
+    const grammarByUser = groupGrammar(sp.rows, 'user_id');
     res.json({
       lesson: lessonOut(l, { units: unitsOf(l).map(u => ({ id: u.id, title: u.title, count: u.sentences.length })) }),
-      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id)) })),
+      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id), grammarByUser.get(u.id)) })),
     });
   }));
 
@@ -431,7 +433,7 @@ module.exports = function adminRoutes(pool) {
       pool.query('SELECT * FROM users ORDER BY name'),
       pool.query('SELECT * FROM lessons ORDER BY position, title'),
       pool.query('SELECT * FROM lesson_progress'),
-      pool.query(`SELECT user_id, lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress`),
+      pool.query(`SELECT user_id, lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress`),
     ]);
     const assigned = await pool.query('SELECT lesson_id, user_id FROM lesson_assignments');
     const up = await pool.query('SELECT * FROM unit_progress');
@@ -443,7 +445,7 @@ module.exports = function adminRoutes(pool) {
     }
     const assignedSet = new Set(assigned.rows.map(a => a.lesson_id + '|' + a.user_id));
     const lpMap = new Map(lp.rows.map(x => [x.user_id + '|' + x.lesson_id, x]));
-    const spMap = new Map(), exMap = new Map();
+    const spMap = new Map(), exMap = new Map(), grMap = new Map();
     for (const row of sp.rows) {
       const k = row.user_id + '|' + row.lesson_id;
       if (!spMap.has(k)) spMap.set(k, new Map());
@@ -451,6 +453,10 @@ module.exports = function adminRoutes(pool) {
       if (row.extra) {
         if (!exMap.has(k)) exMap.set(k, new Map());
         exMap.get(k).set(row.sentence, row.extra);
+      }
+      if (row.gdone) {
+        if (!grMap.has(k)) grMap.set(k, new Set());
+        grMap.get(k).add(row.sentence);
       }
     }
     const esc = v => {
@@ -464,7 +470,7 @@ module.exports = function adminRoutes(pool) {
         const k = u.id + '|' + l.id;
         const visible = l.visibility === 'public' || assignedSet.has(l.id + '|' + u.id);
         if (!visible && !lpMap.has(k)) continue;
-        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k));
+        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k), grMap.get(k));
         lines.push([u.name, u.email, l.title, l.level, p.status, p.unitsCompleted, p.unitsTotal, p.units.filter(u => u.learned).length + '/' + p.unitsTotal, p.solved, p.total, p.stars, p.extra, p.maxStars,
           Math.round(p.timeSpent / 60), p.completedAt ? new Date(p.completedAt).toISOString() : '',
           p.lastActivityAt ? new Date(p.lastActivityAt).toISOString() : ''].map(esc).join(','));

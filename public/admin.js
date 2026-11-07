@@ -164,6 +164,7 @@
   const unitsCell = p => (p.unitsTotal > 1 ? `${p.unitsCompleted}/${p.unitsTotal}` : p.units[0] && p.units[0].learned ? 'cards ✓' : '–');
   function unitCell(u, multi) {
     if (u.completed) return h('span', { class: 'st st-completed' }, '✓');
+    if (u.grammarReady) return h('span', { class: 'st st-building', title: 'Built everything, grammar still to do' }, `✏️ ${u.grammarDone}/${u.grammarTotal}`);
     if (u.learned) return h('span', { class: 'st st-building' }, `${u.solved}/${u.total}`);
     if (u.status === 'learning') return h('span', { class: 'st st-learning' }, `🃏 ${u.learnIndex + 1}/${u.total}`);
     return multi && u.locked ? '🔒' : '–';
@@ -209,6 +210,7 @@
       case 'unit_complete': return ['🎯', `finished unit “${e.data.unit}” in ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
       case 'sentence_solved': return [e.data.replay ? '🔁' : '✅', `${e.data.replay ? 'practised a sentence again' : 'built a sentence'} in ${L} ${'★'.repeat(e.data.stars || 0)}${e.data.extra ? ` (+${e.data.extra} extra)` : ''}`,
         `${e.data.sentence || ''}${e.data.mistakes || e.data.hints ? ` · ${plural(e.data.mistakes || 0, 'mistake')}, ${plural(e.data.hints || 0, 'hint')}` : ''}`];
+      case 'grammar_solved': return [e.data.replay ? '🔁' : '✏️', `${e.data.replay ? 'practised the grammar again' : 'chose the missing word'} in ${L}${e.data.mistakes ? ` (${plural(e.data.mistakes, 'wrong choice')})` : ''}`, e.data.sentence || ''];
       case 'restart': return ['🔄', e.data.unit ? `started unit “${e.data.unit}” over in ${L}` : `started ${L} over`, 'Saved progress was kept'];
       case 'lesson_complete': return ['🏆', `completed ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
       default: return ['•', e.type];
@@ -659,7 +661,7 @@
     // ---- Units editor ----
     const lines = text => text.split('\n').map(x => x.trim().replace(/\s+/g, ' ')).filter(Boolean);
     const units = (lesson.units && lesson.units.length ? lesson.units : [{ id: null, title: 'Unit 1', sentences: [] }])
-      .map(u => ({ id: u.id || null, title: u.title, text: (u.sentences || []).map(x => x.en).join('\n') }));
+      .map(u => ({ id: u.id || null, title: u.title, text: (u.sentences || []).map(x => GrammarCore.toLine(x)).join('\n') }));
     const unitsBox = h('div', { class: 'units-editor' });
     const scheduleCheck = oncePerFrame(() => checkSentences()); // re-checking every line on every key press would be wasteful
 
@@ -706,7 +708,10 @@
         const ls = lines(u.text);
         const problems = [];
         if (!ls.length) problems.push('Add at least one sentence.');
-        ls.forEach((x, i) => {
+        ls.forEach((line, i) => {
+          const parsed = GrammarCore.parseLine(line); // a line may carry a grammar gap: She [is|are|am] reading
+          if (parsed.error) { problems.push(`Line ${i + 1}: ${parsed.error}`); return; }
+          const x = parsed.en;
           const n = countWords(x);
           if (!/\p{Script=Latin}/u.test(x)) problems.push(`Line ${i + 1}: needs English words.`);
           else if (n < 2) problems.push(`Line ${i + 1}: needs at least 2 words.`);
@@ -739,6 +744,34 @@
     } }, '+ Add unit');
     drawUnits();
 
+    // Grammar step: put a gap into every sentence that has a safe word (be / have / do), or take all gaps away again.
+    const mapLines = fn => {
+      units.forEach(u => {
+        u.text = u.text.split('\n').map(line => (line.trim() ? fn(line.trim()) : line)).join('\n');
+        if (u.ta) u.ta.value = u.text;
+      });
+      dirty = true;
+      msg.textContent = '';
+      checkSentences();
+    };
+    const suggestBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => {
+      let added = 0, total = 0;
+      mapLines(line => {
+        total++;
+        const parsed = GrammarCore.parseLine(line);
+        if (parsed.error || parsed.gap) return line; // leave lines that already have a gap (or a mistake) alone
+        const suggestion = GrammarCore.suggestLine(parsed.en);
+        if (!suggestion) return line;
+        added++;
+        return suggestion;
+      });
+      toast(added ? `Added a gap to ${added} of ${total} sentences. Check them, then save the lesson.` : 'No safe gaps found. Write your own, like [is|are|am].');
+    } }, '✨ Suggest grammar gaps');
+    const clearGapsBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => {
+      mapLines(line => { const parsed = GrammarCore.parseLine(line); return parsed.error ? line : parsed.en; });
+      toast('All grammar gaps removed.');
+    } }, 'Remove all gaps');
+
     f.title.addEventListener('input', () => { dirty = true; if (!slugTouched) f.slug.value = slugify(f.title.value); });
     f.slug.addEventListener('input', () => { dirty = true; slugTouched = true; });
     f.slug.addEventListener('blur', () => { f.slug.value = slugify(f.slug.value); });
@@ -756,6 +789,8 @@
       h('div', null,
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
+        h('p', { class: 'muted help' }, 'Grammar step (optional): write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. After building, students choose the missing word, and then the unit ends.'),
+        h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
         id ? h('p', { class: 'muted' }, 'Tip: renaming or moving units keeps student progress. Changing a sentence’s text means students build that sentence again.') : null),

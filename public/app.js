@@ -189,6 +189,14 @@
 
   // Checks and cleans a copy of the student's data (from the server or from the device). Anything that is not
   // exactly the shape the screens expect is dropped, so damaged data can never break a screen.
+  // A grammar gap is kept only when it is exactly right: 3 different choices that include the answer.
+  function cleanGap(x) {
+    const g = x.gap;
+    if (!isObj(g) || typeof g.answer !== 'string' || !Number.isInteger(g.index) || g.index < 0
+      || !Array.isArray(g.options) || g.options.length !== 3 || !g.options.every(o => typeof o === 'string') || !g.options.includes(g.answer)) return {};
+    return { gap: { index: g.index, answer: g.answer, options: [...g.options] }, gdone: Boolean(x.gdone) };
+  }
+
   function sanitizeApp(d) {
     try {
       if (!isObj(d) || !isObj(d.user) || typeof d.user.id !== 'string' || !Array.isArray(d.lessons)) return null;
@@ -204,7 +212,7 @@
             id: u.id,
             title: text(u.title),
             sentences: u.sentences.filter(x => isObj(x) && typeof x.en === 'string' && x.en.trim())
-              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3) })),
+              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3), ...cleanGap(x) })),
           });
         }
         if (!units.length) continue;
@@ -283,6 +291,14 @@
     if (!raw) return;
     Progress.applyLearn(raw, unitId, index, done, seconds, new Date().toISOString());
     models.delete(raw); rev++; saveData();
+  }
+  // A grammar gap was answered right: saved on the device at once, like everything else.
+  function noteGrammar(slug, sentence, seconds) {
+    const raw = rawLesson(slug);
+    const r = raw && Progress.applyGrammar(raw, S.stats, sentence, seconds, new Date().toISOString());
+    if (!r) return { completed: false };
+    models.delete(raw); rev++; saveData();
+    return r;
   }
   function noteSolve(slug, sentence, stars, seconds) {
     const raw = rawLesson(slug);
@@ -489,6 +505,13 @@
   }, { passive: true });
   const isListScreen = p => p === '/' || p === '/completed' || /^\/lesson\/[a-z0-9-]+$/.test(p);
 
+  // The kind of screen decides how wide the page may be on a computer (see the "large screens" part of style.css).
+  function layoutFor(path) {
+    if (/^\/lesson\/[^/]+\/u\//.test(path) || path === '/practice') return 'game';
+    if (path === '/profile' || path === '/login' || path === '/signup') return 'narrow';
+    return 'wide';
+  }
+
   function route() {
     viewId++;
     rerender = null;
@@ -497,6 +520,7 @@
     stopSpeech();
     const path = location.pathname.replace(/\/+$/, '') || '/';
     const key = location.pathname + location.search;
+    app.dataset.layout = layoutFor(path);
     const back = isListScreen(path) ? scrollPos.get(key) || 0 : 0;
     shownKey = null; // ignore the scroll jumps caused by swapping the screen
     const id = viewId;
@@ -518,8 +542,8 @@
     if (!me) return goLogin();
     let m;
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)$/))) return showLessonHub(m[1]);
-    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|review)$/i))) return showLessonStep(m[1], m[2], m[3]);
-    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/(learn|build|review)$/))) return navigate(`/lesson/${m[1]}`, true);
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|review|grammar)$/i))) return showLessonStep(m[1], m[2], m[3]);
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/(learn|build|review|grammar)$/))) return navigate(`/lesson/${m[1]}`, true);
     if (path === '/practice') return showPractice();
     if (path === '/profile') return showProfile();
     if (path === '/completed') return showCompleted();
@@ -658,14 +682,14 @@
     if (p.status === 'new' || p.currentUnit === null) return 'New';
     const u = p.units[p.currentUnit];
     const where = p.unitsTotal > 1 ? `Unit ${p.currentUnit + 1}/${p.unitsTotal} · ` : '';
-    return where + (u.learned ? `${u.solved}/${u.total} built` : 'learning');
+    return where + (u.learned ? (u.grammarReady ? 'grammar next' : `${u.solved}/${u.total} built`) : 'learning');
   }
 
   function unitStepText(p) {
     if (p.currentUnit === null) return 'Completed';
     const u = p.units[p.currentUnit];
     const where = p.unitsTotal > 1 ? `Unit ${p.currentUnit + 1} · ${u.title} · ` : '';
-    return where + (u.learned ? `Step 2 · ${u.solved} of ${u.total} built` : 'Step 1 · learning the sentences');
+    return where + (u.grammarReady ? `Step 3 · grammar ${u.grammarDone} of ${u.grammarTotal}` : u.learned ? `Step 2 · ${u.solved} of ${u.total} built` : 'Step 1 · learning the sentences');
   }
 
   function showHome() {
@@ -842,14 +866,16 @@
       const current = i === p.currentUnit;
       let action = null;
       if (current) {
-        action = up.learned
-          ? h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, 'build'), 'data-link': true }, '▶ ', up.solved ? 'Continue' : 'Play')
-          : h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, 'learn'), 'data-link': true }, '▶ ', up.status === 'learning' ? 'Continue' : 'Start');
+        // The unit's three steps in order: read and say it, build it, then the grammar gap (if the unit has one).
+        const step = !up.learned ? 'learn' : up.solved < up.total ? 'build' : 'grammar';
+        const label = step === 'learn' ? (up.status === 'learning' ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : 'Continue';
+        action = h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, step), 'data-link': true }, '▶ ', label);
       }
       // Any unit the student can open can be revisited: read the cards again, practise, or start it over.
       const again = !up.locked && up.status !== 'new' ? h('div', { class: 'unit-actions' },
         h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'learn'), 'data-link': true, html: ICON.cards + ' Cards' }),
         up.learned ? h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'review'), 'data-link': true, html: ICON.puzzle + ' Practise' }) : null,
+        up.learned && up.grammarTotal && up.solved === up.total ? h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'grammar') + '?replay=1', 'data-link': true }, '✏️ Grammar') : null,
         up.learned ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', html: ICON.reset + ' Restart', title: 'Play this unit again from the first sentence. Your saved progress is kept.',
           onclick: () => restartUnit(i) }) : null) : null;
 
@@ -874,7 +900,8 @@
               ? h('div', { class: 'muted' }, `Finish Unit ${i} to open this unit`)
               : h('div', { class: 'unit-steps' },
                   h('span', { class: up.learned ? 'ok' : '', html: ICON.cards }, learnTxt),
-                  h('span', { class: up.completed ? 'ok' : '', html: ICON.puzzle }, `Build ${up.solved}/${up.total}`),
+                  h('span', { class: up.solved === up.total ? 'ok' : '', html: ICON.puzzle }, `Build ${up.solved}/${up.total}`),
+                  up.grammarTotal ? h('span', { class: up.grammarDone === up.grammarTotal ? 'ok' : '' }, `✏️ Grammar ${up.grammarDone}/${up.grammarTotal}`) : null,
                   up.stars ? h('span', { class: 'star', html: ICON.star }, String(up.stars)) : null,
                   up.extra ? h('span', { class: 'extra', title: 'Stars gained by practising again' }, `+${up.extra} extra`) : null))),
         action,
@@ -941,6 +968,14 @@
       if (!items.length) return navigate(`/lesson/${slug}`, true);
       return runPuzzle({ ...ctx, items, mode: 'build', exitPath: `/lesson/${slug}` });
     }
+    if (step === 'grammar') {
+      // Normally only the gaps still to answer, once everything is built; a replay (or a restart) plays them all again.
+      const replay = q.get('replay') === '1' || flags.restart;
+      if (!replay && up.solved < up.total) { toast('Build the sentences first 🧩'); return navigate(unitPath(slug, unit, 'build'), true); }
+      const items = unit.sentences.filter(sn => sn.gap && sn.stars && (replay || !sn.gdone));
+      if (!items.length) return navigate(`/lesson/${slug}`, true);
+      return runGrammar({ ...ctx, items, replay, exitPath: `/lesson/${slug}` });
+    }
     // Practise: the whole unit, or a single sentence picked from the list (?only=3).
     const only = q.has('only') ? parseInt(q.get('only'), 10) : null;
     const items = only !== null && unit.sentences[only] ? [unit.sentences[only]] : unit.sentences;
@@ -980,6 +1015,10 @@
     const slow = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: '🐢 Slowly' });
     const prev = h('button', { class: 'btn btn-ghost', type: 'button', 'aria-label': 'Previous sentence', html: ICON.back });
     const next = h('button', { class: 'btn btn-primary', type: 'button' });
+    // The first time through (and when starting over) every sentence must be said out loud before moving on.
+    const needSay = !up.learned || restart;
+    const saidOut = new Set();
+    const say = h('button', { class: 'btn btn-accent btn-big btn-say', type: 'button', hidden: !needSay });
     if (!canSpeak) { listen.disabled = true; slow.disabled = true; listen.title = 'Speech is not supported on this device'; }
 
     setView(
@@ -989,11 +1028,13 @@
         pill, soundButton()),
       h('div', { class: 'progress-track', role: 'progressbar' }, fill),
       jump,
-      h('p', { class: 'prompt' }, restart ? '👀 Look and listen again' : '👀 Look and listen'),
+      h('p', { class: 'prompt' }, needSay ? '👀 Read it  ·  🔊 Listen  ·  🗣️ Say it out loud' : '👀 Look and listen'),
       card,
       h('div', { class: 'listen-row' }, listen, slow),
+      needSay ? h('div', { class: 'say-row' }, say) : null,
       h('div', { class: 'actions' }, prev, next),
-      restart ? h('p', { class: 'skip-row' }, h('a', { href: reviewPath, 'data-link': true }, 'Already know them? Skip to building ›')) : null
+      restart ? h('p', { class: 'skip-row' }, h('a', { href: reviewPath, 'data-link': true }, 'Already know them? Skip to building ›')) : null,
+      h('p', { class: 'kbd-hint' }, needSay ? '←  →  next / previous  ·  Space listen  ·  S I said it' : '←  →  next / previous  ·  Space listen') // shown on computers only
     );
 
     function drawJump() {
@@ -1026,6 +1067,10 @@
       ]));
       restartAnimation(card, 'flip-in');
       prev.disabled = i === 0;
+      const said = !needSay || saidOut.has(i);
+      say.classList.toggle('done', said);
+      say.textContent = said ? '✓ You said it' : '🗣️ I said it out loud';
+      next.disabled = !said;
       next.innerHTML = i === total - 1 ? (restart || !up.learned ? 'Start building ' : 'Done ') + ICON.next : 'Next ' + ICON.next;
       next.className = 'btn ' + (i === total - 1 ? 'btn-accent' : 'btn-primary');
       prev.className = 'btn btn-ghost';
@@ -1036,6 +1081,7 @@
     const secondsOnCard = () => Math.min(120, Math.round((Date.now() - shownAt) / 1000));
 
     async function go(delta) {
+      if (delta > 0 && needSay && !saidOut.has(i)) { toast('Say the sentence out loud first 🗣️'); return; }
       const secs = secondsOnCard();
       if (delta > 0 && i === total - 1) {
         sendLearn(i, true, secs).catch(e => toast(e.message));
@@ -1053,6 +1099,7 @@
       render(true);
     }
 
+    say.addEventListener('click', () => { if (saidOut.has(i)) return; saidOut.add(i); sfx.win(); render(false); next.focus({ preventScroll: true }); });
     listen.addEventListener('click', () => speakCard(false));
     slow.addEventListener('click', () => speakCard(true));
     prev.addEventListener('click', () => go(-1));
@@ -1072,6 +1119,7 @@
       if (e.key === 'ArrowRight') go(1);
       else if (e.key === 'ArrowLeft') go(-1);
       else if (e.key === ' ' && !e.target.closest('button, [role="button"]')) { e.preventDefault(); speakCard(false); }
+      else if ((e.key === 's' || e.key === 'S') && needSay && !e.ctrlKey && !e.metaKey && !e.altKey) say.click();
     };
     document.addEventListener('keydown', onKey);
     cleanup = () => document.removeEventListener('keydown', onKey);
@@ -1091,7 +1139,7 @@
    * @param o.mode     'build' | 'review' | 'practice'
    */
   function runPuzzle(o) {
-    const { lesson, slug, items, mode, exitPath, unit, unitIndex, chain } = o;
+    const { lesson, slug, items, mode, exitPath, unit, unitIndex, chain, restart } = o;
     if (!Array.isArray(items) || !items.length) return navigate(exitPath || '/', true); // nothing to play
     const tracked = Boolean(slug);
     const total = tracked ? unit.sentences.length : items.length;
@@ -1129,7 +1177,8 @@
       h('p', { class: 'prompt' }, '👆 Tap the words in the right order'),
       h('div', { class: 'listen-row listen-peek' }, canSpeak ? listenBtn : null, peekBtn),
       answerBox, pool, feedback, solvedPanel,
-      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, nextBtn)
+      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, nextBtn),
+      h('p', { class: 'kbd-hint' }, '1–9 pick a word  ·  Backspace undo  ·  H hint  ·  P peek  ·  L listen  ·  Enter next') // shown on computers only
     );
 
     const tilesIn = zone => [...zone.children];
@@ -1287,8 +1336,20 @@
       if (++pos < items.length) { loadRound(); window.scrollTo(0, 0); } else finish();
     });
 
+    // Play with the keyboard on a computer: number keys pick loose words, Backspace takes the last one back.
     const onKey = e => {
-      if (e.key === 'Enter' && round && round.solved && document.activeElement !== nextBtn && !nextBtn.hidden) nextBtn.click();
+      if (!round || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (e.target.closest && e.target.closest('input, textarea, select')) return;
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (key === 'l' && !listenBtn.hidden) { listenBtn.click(); return; }
+      if (round.solved) {
+        if (key === 'Enter' && document.activeElement !== nextBtn && !nextBtn.hidden) nextBtn.click();
+        return;
+      }
+      if (/^[1-9]$/.test(key)) { const tile = pool.children[Number(key) - 1]; if (tile) tile.click(); }
+      else if (key === 'Backspace') { e.preventDefault(); const last = answer.lastElementChild; if (last) last.click(); }
+      else if (key === 'h') hintBtn.click();
+      else if (key === 'p') peekBtn.click();
     };
     document.addEventListener('keydown', onKey);
     cleanup = () => { document.removeEventListener('keydown', onKey); sortables.forEach(s => s.destroy()); };
@@ -1300,8 +1361,11 @@
       const earned = results.reduce((a, b) => a + (b || 0), 0);
       const max = items.length * 3;
       const building = tracked && mode === 'build';
-      const unitDone = building; // a build round only ends when every remaining sentence of the unit is built
       const now = tracked ? lessonView(slug) : null; // the up-to-date state, worked out on the device
+      const unitNow = now && now.progress.units[unitIndex];
+      // Built everything: if the unit has grammar gaps they come next, and the unit is not finished until they are answered.
+      const grammarNext = Boolean(building && unitNow && unitNow.grammarReady);
+      const unitDone = building && !grammarNext;
       const lessonDone = building && Boolean(now && now.progress.completed);
       const nextUnit = tracked ? lesson.units[unitIndex + 1] : null;
       const nextOpen = nextUnit && now && now.progress.units[unitIndex + 1] && !now.progress.units[unitIndex + 1].locked;
@@ -1310,7 +1374,11 @@
 
       const actions = h('div', { class: 'result-actions' });
       if (tracked) {
-        if (building && !lessonDone && nextUnit)
+        if (grammarNext)
+          actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'grammar'), 'data-link': true }, 'Next: Grammar ✏️'));
+        else if (replayed && restart && unitNow && unitNow.grammarTotal)
+          actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'grammar') + `?restart=1${chain ? '&chain=1' : ''}`, 'data-link': true }, 'Next: Grammar ✏️'));
+        else if (building && !lessonDone && nextUnit)
           actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, nextUnit, 'learn'), 'data-link': true, html: `Next: Unit ${unitIndex + 2} · ` },
             nextUnit.title, h('span', { html: ICON.next })));
         else if (replayed && chain && nextOpen)
@@ -1328,7 +1396,7 @@
 
       const pct = earned / max;
       const multi = tracked && lesson.units.length > 1;
-      const title = lessonDone ? 'Lesson complete!' : unitDone && multi ? `Unit ${unitIndex + 1} complete!` : pct === 1 ? 'Perfect!' : pct >= 0.7 ? 'Well done!' : 'Good effort!';
+      const title = grammarNext ? 'Great memory! 🧠' : lessonDone ? 'Lesson complete!' : unitDone && multi ? `Unit ${unitIndex + 1} complete!` : pct === 1 ? 'Perfect!' : pct >= 0.7 ? 'Well done!' : 'Good effort!';
       setView(h('section', { class: 'results' },
         h('div', { class: 'celebration', 'aria-hidden': 'true' }, lessonDone || pct === 1 ? '🏆' : pct >= 0.7 ? '🎉' : '💪'),
         h('div', { class: 'stars', 'aria-hidden': 'true' }, starNodes(Math.round(pct * 3))),
@@ -1336,7 +1404,8 @@
         h('p', { class: 'subtitle' }, `You earned ${earned} of ${max} stars in this round.`),
         extraGained > 0 ? h('p', { class: 'extra-banner' }, `+${extraGained} extra ${extraGained === 1 ? 'star' : 'stars'} added to your score!`) : null,
         replayed && extraGained === 0 && !offline ? h('p', { class: 'muted' }, 'Your saved progress is safe. Only better results than before are added.') : null,
-        building && !lessonDone && nextUnit ? h('p', { class: 'muted' }, `Next up: Unit ${unitIndex + 2} is now open. Your progress is saved.`) : null,
+        grammarNext ? h('p', { class: 'muted' }, 'Now a quick grammar check: choose the missing word. ✏️') : null,
+        building && !grammarNext && !lessonDone && nextUnit ? h('p', { class: 'muted' }, `Next up: Unit ${unitIndex + 2} is now open. Your progress is saved.`) : null,
         offline ? h('p', { class: 'muted' }, 'You are offline. Your progress will be saved when you reconnect.') : null,
         h('ul', { class: 'result-list' }, items.map((it, i) => h('li', null,
           h('span', null, it.en),
@@ -1344,6 +1413,160 @@
         actions));
       sfx.finish(); confetti(lessonDone ? 200 : 120);
       if (tracked) scheduleSync(1500); // check with the server in the background
+    }
+
+    loadRound();
+  }
+
+  /* ================================================================ */
+  /* Step 3 - Grammar: a word is missing, choose the right one of three */
+  /* ================================================================ */
+  // Random order for the three choices. (The shared shuffle() never returns the order it was given, and the right word
+  // is stored first, so it would never show up first. This one is a plain random order.)
+  function randomOrder(list) {
+    const a = [...list];
+    for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+    return a;
+  }
+
+  /** The sentence as pieces for the screen: words before, the gap (with any punctuation next to it), words after. */
+  function splitAtGap(sentence, gap) {
+    const words = sentence.split(' ');
+    const word = words[gap.index] || '';
+    const at = Math.max(0, word.toLowerCase().indexOf(gap.answer.toLowerCase()));
+    return {
+      before: words.slice(0, gap.index).join(' ') + (gap.index ? ' ' : '') + word.slice(0, at),
+      after: word.slice(at + gap.answer.length) + (gap.index < words.length - 1 ? ' ' : '') + words.slice(gap.index + 1).join(' '),
+    };
+  }
+
+  function runGrammar(o) {
+    const { lesson, slug, items, exitPath, unit, unitIndex, replay, chain, restart } = o;
+    document.title = `Grammar · ${lesson.title} · ${config.appName}`;
+    if (!items.length) return navigate(exitPath, true);
+    let pos = 0, round = null;
+    const firstTry = [];       // for each sentence: answered right at the first choice?
+    const triesLeftBehind = []; // wrong choices before the right one
+
+    const pill = h('div', { class: 'pill' });
+    const fill = h('div', { class: 'progress-fill' });
+    const num = h('div', { class: 'card-num' }, 'Fill the gap');
+    const sentenceEl = h('p', { class: 'card-sentence', lang: 'en' });
+    const card = h('div', { class: 'learn-card gap-card' }, num, sentenceEl);
+    const choices = h('div', { class: 'gap-options', role: 'group', 'aria-label': 'Choose the missing word' });
+    const feedback = h('p', { class: 'feedback', role: 'status' });
+    const listenBtn = h('button', { class: 'btn btn-ghost btn-big', type: 'button', hidden: true, html: ICON.sound + ' Listen' });
+    const nextBtn = h('button', { class: 'btn btn-accent', type: 'button', hidden: true });
+
+    setView(
+      h('div', { class: 'game-top' },
+        h('a', { class: 'icon-btn', href: exitPath, 'data-link': true, 'aria-label': 'Leave', html: ICON.back }),
+        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, unitChip(lesson, unitIndex, 'Grammar')), ' ', lesson.units.length > 1 ? unit.title : lesson.title),
+        pill, soundButton()),
+      h('div', { class: 'progress-track', role: 'progressbar' }, fill),
+      h('p', { class: 'prompt' }, '✏️ Choose the missing word'),
+      card,
+      choices,
+      feedback,
+      h('div', { class: 'listen-row' }, listenBtn),
+      h('div', { class: 'actions' }, nextBtn),
+      h('p', { class: 'kbd-hint' }, '1 2 3 choose  ·  L listen  ·  Enter next') // shown on computers only
+    );
+
+    function loadRound() {
+      const it = items[pos];
+      const { before, after } = splitAtGap(it.en, it.gap);
+      const blank = h('span', { class: 'gap-blank', 'aria-label': 'missing word' });
+      round = { it, blank, mistakes: 0, done: false, startedAt: Date.now(), cid: uid() };
+      sentenceEl.replaceChildren(before, blank, after);
+      choices.replaceChildren(...randomOrder(it.gap.options).map((word, k) => h('button', {
+        class: 'gap-opt', type: 'button', 'data-word': word, onclick: e => choose(e.currentTarget),
+      }, h('span', { class: 'gap-key', 'aria-hidden': 'true' }, String(k + 1)), word)));
+      feedback.textContent = ''; feedback.className = 'feedback';
+      card.classList.remove('right');
+      listenBtn.hidden = true; nextBtn.hidden = true;
+      pill.textContent = `${pos + 1} / ${items.length}`;
+      fill.style.width = `${(pos / items.length) * 100}%`;
+    }
+
+    function choose(btn) {
+      if (!round || round.done || btn.disabled) return;
+      const word = btn.dataset.word;
+      if (word !== round.it.gap.answer) {
+        round.mistakes++;
+        btn.disabled = true; btn.classList.add('wrong');
+        feedback.textContent = 'Not that one. Try again 💪'; feedback.className = 'feedback bad';
+        sfx.wrong(); if (navigator.vibrate) navigator.vibrate(60);
+        return;
+      }
+      // Right: show the word in the sentence, save it on the device, tell the server in the background.
+      round.done = true;
+      firstTry[pos] = round.mistakes === 0;
+      triesLeftBehind[pos] = round.mistakes;
+      round.blank.textContent = word; round.blank.classList.add('filled');
+      choices.querySelectorAll('.gap-opt').forEach(b => { b.disabled = true; if (b === btn) b.classList.add('right'); });
+      card.classList.add('right');
+      const seconds = Math.min(600, Math.round((Date.now() - round.startedAt) / 1000));
+      noteGrammar(slug, round.it.en, seconds);
+      outbox.send(`/api/lessons/${slug}/grammar`, { sentence: round.it.en, mistakes: round.mistakes, seconds, cid: round.cid }).catch(e => { toast(e.message); return null; });
+      fill.style.width = `${((pos + 1) / items.length) * 100}%`;
+      const praise = round.mistakes === 0 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : ['You got it! 💪', 'Good job! 👏'];
+      feedback.textContent = praise[(Math.random() * praise.length) | 0] + '  Now say it out loud 🗣️'; feedback.className = 'feedback good';
+      nextBtn.innerHTML = (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next;
+      nextBtn.hidden = false; listenBtn.hidden = !canSpeak;
+      nextBtn.focus({ preventScroll: true });
+      sfx.win(); confetti(30);
+      if (settings.sound) later(() => speak(round.it.en), 450);
+    }
+
+    nextBtn.addEventListener('click', () => {
+      clearScreenTimers(); stopSpeech();
+      if (++pos < items.length) { loadRound(); window.scrollTo(0, 0); } else finish();
+    });
+    listenBtn.addEventListener('click', () => speak(round.it.en));
+
+    const onKey = e => {
+      if (!round || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (e.target.closest && e.target.closest('input, textarea, select')) return;
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (key === 'l' && !listenBtn.hidden) listenBtn.click();
+      else if (round.done) { if (key === 'Enter' && document.activeElement !== nextBtn && !nextBtn.hidden) nextBtn.click(); }
+      else if (/^[1-3]$/.test(key)) { const b = choices.children[Number(key) - 1]; if (b) b.click(); }
+    };
+    document.addEventListener('keydown', onKey);
+    cleanup = () => document.removeEventListener('keydown', onKey);
+
+    function finish() {
+      cleanup(); cleanup = null;
+      const now = lessonView(slug);
+      const unitNow = now && now.progress.units[unitIndex];
+      const lessonDone = Boolean(now && now.progress.completed);
+      const multi = lesson.units.length > 1;
+      const nextUnit = lesson.units[unitIndex + 1];
+      const nextOpen = nextUnit && now && now.progress.units[unitIndex + 1] && !now.progress.units[unitIndex + 1].locked;
+      const right = firstTry.filter(Boolean).length;
+      const offline = !navigator.onLine || outbox.items().length > 0;
+
+      const actions = h('div', { class: 'result-actions' });
+      if (nextOpen && (replay ? chain : unitNow && unitNow.completed)) {
+        actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, nextUnit, 'learn') + (restart && chain ? '?restart=1&chain=1' : ''), 'data-link': true, html: `Next: Unit ${unitIndex + 2} · ` },
+          nextUnit.title, h('span', { html: ICON.next })));
+      }
+      actions.append(h('a', { class: 'btn ' + (actions.children.length ? 'btn-ghost' : 'btn-primary'), href: `/lesson/${slug}`, 'data-link': true }, 'Back to lesson'));
+      actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true, 'data-top': true }, 'All lessons'));
+
+      const title = lessonDone && !replay ? 'Lesson complete! 🏆' : unitNow && unitNow.completed && multi && !replay ? `Unit ${unitIndex + 1} complete!` : 'Grammar done! ✏️';
+      setView(h('section', { class: 'results' },
+        h('div', { class: 'celebration', 'aria-hidden': 'true' }, lessonDone ? '🏆' : right === items.length ? '🎉' : '💪'),
+        h('h1', null, title),
+        h('p', { class: 'subtitle' }, `Right at the first choice: ${right} of ${items.length}.`),
+        offline ? h('p', { class: 'muted' }, 'You are offline. Your progress will be saved when you reconnect.') : null,
+        h('ul', { class: 'result-list' }, items.map((it, i) => h('li', null,
+          h('span', null, it.en),
+          h('span', { class: 's gram', 'aria-label': firstTry[i] ? 'right first time' : `${triesLeftBehind[i] || 0} wrong choices` }, firstTry[i] ? '✓' : `${triesLeftBehind[i] || 0}✗`)))),
+        actions));
+      sfx.finish(); confetti(lessonDone ? 200 : 90);
+      scheduleSync(1500);
     }
 
     loadRound();

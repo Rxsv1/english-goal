@@ -81,12 +81,15 @@ const studentSkeleton = p =>
           : p === '/practice' ? 'practice'
             : 'home';
 
+// Which kind of screen each skeleton belongs to; the style sheet uses it to size the page on large screens.
+const LAYOUT_OF = { home: 'wide', hub: 'wide', step: 'game', practice: 'game', profile: 'narrow', auth: 'narrow' };
+
 const rendered = new Map(); // "page:kind" -> final HTML, built once
 function renderPage(name, kind) {
   const key = name + ':' + kind;
   if (!rendered.has(key)) {
     const layer = `<div class="sk-layer" data-kind="${kind}" role="status" aria-label="Loading">${skeletons[kind] || ''}</div>`;
-    rendered.set(key, rawPages[name].replace('{{SKELETON}}', layer));
+    rendered.set(key, rawPages[name].replace('{{SKELETON}}', layer).replace('{{LAYOUT}}', LAYOUT_OF[kind] || 'wide'));
   }
   return rendered.get(key);
 }

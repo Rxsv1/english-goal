@@ -6,6 +6,7 @@ const MAX_SENTENCES = 200;
 const MAX_UNITS = 30;
 const UNIT_ID_RE = /^[a-z0-9]{4,24}$/i;
 const crypto = require('crypto');
+const Grammar = require('../public/grammar-core'); // understands [is|are|am] gaps (shared with the editor and the app)
 const newUnitId = () => crypto.randomBytes(5).toString('hex');
 
 function slugify(text) {
@@ -91,8 +92,17 @@ function validateLesson(input) {
       if (!list.length) errors.push(`Unit ${un} (${utitle}): add at least one sentence.`);
       const out = [];
       list.forEach((sn, i) => {
-        const en = str(typeof sn === 'string' ? sn : sn && sn.en);
         const where = rawUnits.length > 1 ? `Unit ${un}, sentence ${i + 1}` : `Sentence ${i + 1}`;
+        // A line may carry one grammar gap, written like: She [is|are|am] reading a book.
+        const parsed = Grammar.parseLine(typeof sn === 'string' ? sn : sn && typeof sn.en === 'string' ? sn.en : '');
+        if (parsed.error) return errors.push(`${where}: ${parsed.error}`);
+        const en = str(parsed.en);
+        let gap = parsed.gap;
+        if (!gap && sn && typeof sn === 'object' && sn.gap !== undefined && sn.gap !== null) {
+          const checked = Grammar.checkGap(sn.gap, en);
+          if (checked.error) return errors.push(`${where}: ${checked.error}`);
+          gap = checked.gap;
+        }
         if (!en) return errors.push(`${where}: English text is required.`);
         if (en.length > 200) return errors.push(`${where}: must be 200 characters or fewer.`);
         if (!/\p{Script=Latin}/u.test(en)) return errors.push(`${where}: must contain English words.`);
@@ -100,7 +110,7 @@ function validateLesson(input) {
         if (countWords(en) > 20) return errors.push(`${where}: has more than 20 words - split it up.`);
         if (seenText.has(en)) return errors.push(`${where}: this sentence is already used (${seenText.get(en)}).`);
         seenText.set(en, where);
-        out.push({ en });
+        out.push(gap ? { en, gap } : { en });
       });
       total += out.length;
       units.push({ id, title: utitle, sentences: out });

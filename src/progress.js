@@ -28,6 +28,17 @@ function groupSolved(rows, field = 'stars', key = 'lesson_id') {
   return out;
 }
 
+/** Groups rows (needs sentence, gdone and lesson_id or user_id) into Map(key -> Set(sentences with the grammar answered)). */
+function groupGrammar(rows, key = 'lesson_id') {
+  const out = new Map();
+  for (const r of rows) {
+    if (!r.gdone) continue;
+    if (!out.has(r[key])) out.set(r[key], new Set());
+    out.get(r[key]).add(r.sentence);
+  }
+  return out;
+}
+
 /** SQL expression for the extra stars of a sentence_progress row. */
 const EXTRA_SQL = 'GREATEST(stars - COALESCE(base_stars, stars), 0)';
 
@@ -50,4 +61,4 @@ function streak(days) {
 const VISIBLE_SQL = `l.published AND (l.visibility = 'public' OR EXISTS (
   SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = l.id AND a.user_id = $1))`;
 
-module.exports = { starsFor, summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL };
+module.exports = { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL };

@@ -213,6 +213,11 @@ test('retrying keeps progress, a better score is counted as extra, a worse one c
   assert.equal(p.stars, 9);
   const events = (await admin('GET', `/activity?user=${ana.id}`)).data.events;
   assert.ok(events.some(e => e.type === 'restart'));
+  // newest first, and events written at the same instant keep a stable order (higher id first)
+  for (let i = 1; i < events.length; i++) {
+    const a = events[i - 1], b = events[i];
+    assert.ok(new Date(a.at) > new Date(b.at) || (+new Date(a.at) === +new Date(b.at) && a.id > b.id), 'activity feed order is stable');
+  }
   assert.ok(events.some(e => e.type === 'sentence_solved' && e.data.replay && e.data.extra === 2));
   assert.ok(u2.id);
 });
@@ -342,6 +347,126 @@ test('starter lessons do not come back after a teacher deleted them', { skip }, 
   } finally {
     await pool.end();
   }
+});
+
+test('grammar gaps: a unit is finished only after reading, building AND choosing the right word', { skip }, async () => {
+  const Core = require('../public/progress-core.js');
+  const zoe = await newStudent('Zoe');
+
+  // the teacher writes gaps as [right|wrong|wrong]; the bad ones are explained, not accepted
+  const bad = await admin('POST', `/users/${zoe.id}/lessons`, { title: 'Bad gap', units: [{ title: 'U', sentences: [{ en: 'She [is|are] happy today' }] }] });
+  assert.equal(bad.status, 400);
+  assert.match(bad.data.error, /exactly 3 choices/);
+
+  const made = await admin('POST', `/users/${zoe.id}/lessons`, { title: 'Grammar lesson', units: [
+    { title: 'One', sentences: [{ en: 'She [is|are|am] happy today' }, { en: 'We like green tea' }, { en: 'I [have] one small bag' }] },
+    { title: 'Two', sentences: [{ en: 'They [were] very late' }] },
+  ] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const slug = made.data.lesson.slug;
+
+  // stored as a sentence with a gap; the "[have]" shorthand got its two wrong choices
+  const raw = (await zoe.as('GET', '/app')).data.lessons.find(l => l.slug === slug);
+  const [u1, u2] = raw.units;
+  assert.deepEqual(u1.sentences[0], { en: 'She is happy today', stars: 0, extra: 0, gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'] }, gdone: false });
+  assert.deepEqual(u1.sentences[1], { en: 'We like green tea', stars: 0, extra: 0 });
+  assert.deepEqual(u1.sentences[2].gap.options, ['have', 'has', 'having']);
+
+  const grammar = (sentence, mistakes = 0) => zoe.as('POST', `/lessons/${slug}/grammar`, { sentence, mistakes, cid: Math.random().toString(36) });
+  await zoe.as('POST', `/lessons/${slug}/units/${u1.id}/learn`, { index: 2, done: true });
+
+  // the grammar step comes after building; it cannot be skipped to
+  assert.equal((await grammar('She is happy today')).status, 409, 'not built yet');
+  assert.equal((await grammar('We like green tea')).status, 400, 'that sentence has no gap');
+  assert.equal((await grammar('They were very late')).status, 403, 'unit two is still locked');
+
+  // build every sentence of unit one: NOT finished yet, the grammar is still to do
+  for (const sn of u1.sentences) {
+    const r = await solve(zoe, slug, sn.en);
+    assert.equal(r.data.unitCompleted, false, 'built everything but the grammar is still open');
+    assert.equal(r.data.completed, false);
+  }
+  let model = Core.modelOf((await zoe.as('GET', '/app')).data.lessons.find(l => l.slug === slug));
+  assert.equal(model.units[0].grammarReady, true);
+  assert.equal(model.units[0].completed, false);
+  assert.equal(model.units[1].locked, true, 'the next unit stays closed');
+
+  // answer the two gaps: the second answer finishes the unit and opens the next one
+  const g1 = await grammar('She is happy today', 1);
+  assert.equal(g1.status, 200);
+  assert.equal(g1.data.unitCompleted, false);
+  const g2 = await grammar('I have one small bag', 0);
+  assert.equal(g2.data.unitCompleted, true);
+  assert.equal(g2.data.unitJustCompleted, true);
+  assert.equal(g2.data.completed, false);
+  model = Core.modelOf((await zoe.as('GET', '/app')).data.lessons.find(l => l.slug === slug));
+  assert.equal(model.units[0].completed, true);
+  assert.equal(model.units[1].locked, false);
+  assert.equal(model.units[0].grammarDone, 2);
+
+  // answering again later is allowed and changes nothing (progress never goes back)
+  assert.equal((await grammar('She is happy today', 3)).data.unitJustCompleted, false);
+
+  // unit two finishes the lesson, once
+  await zoe.as('POST', `/lessons/${slug}/units/${u2.id}/learn`, { index: 0, done: true });
+  assert.equal((await solve(zoe, slug, 'They were very late')).data.completed, false, 'the last gap is still open');
+  const last = await grammar('They were very late');
+  assert.equal(last.data.completed, true);
+  assert.equal(last.data.justCompleted, true);
+  assert.equal((await grammar('They were very late')).data.justCompleted, false);
+
+  // the teacher sees it
+  const events = (await admin('GET', `/activity?user=${zoe.id}`)).data.events;
+  assert.equal(events.filter(e => e.type === 'grammar_solved').length >= 3, true);
+  assert.equal(events.filter(e => e.type === 'lesson_complete').length, 1);
+  const card = (await admin('GET', `/users/${zoe.id}`)).data.lessons.find(l => l.slug === slug);
+  assert.equal(card.progress.completed, true);
+  assert.equal(card.progress.grammarDone, 3);
+});
+
+test('grammar on the device follows the same rules as the server', { skip }, async () => {
+  const Core = require('../public/progress-core.js');
+  const lia = await newStudent('Lia');
+  const made = await admin('POST', `/users/${lia.id}/lessons`, { title: 'Parity grammar', units: [{ title: 'U', sentences: [{ en: 'He [is|are|am] here' }, { en: 'Tea is hot' }] }] });
+  const slug = made.data.lesson.slug;
+  const local = (await lia.as('GET', '/app')).data;
+  const raw = local.lessons.find(l => l.slug === slug);
+  const unit = raw.units[0].id;
+  const now = new Date().toISOString();
+
+  Core.applyLearn(raw, unit, 1, true, 0, now);
+  await lia.as('POST', `/lessons/${slug}/units/${unit}/learn`, { index: 1, done: true });
+  assert.equal(Core.applyGrammar(raw, local.stats, 'He is here', 0, now), null, 'cannot answer before building (device)');
+  for (const en of ['He is here', 'Tea is hot']) { Core.applySolve(raw, local.stats, en, 3, 0, now); await solve(lia, slug, en); }
+  assert.equal(Core.modelOf(raw).completed, false, 'device: grammar still open');
+  const device = Core.applyGrammar(raw, local.stats, 'He is here', 0, now);
+  const server = await lia.as('POST', `/lessons/${slug}/grammar`, { sentence: 'He is here', mistakes: 0, cid: 'p1' });
+  assert.equal(device.completed, true);
+  assert.equal(device.completed, server.data.completed);
+
+  const remote = (await lia.as('GET', '/app')).data;
+  const plain = m => { const o = JSON.parse(JSON.stringify(m)); for (const k of ['startedAt', 'lastActivityAt', 'completedAt']) o[k] = o[k] ? 'set' : null; return o; };
+  assert.deepEqual(plain(Core.modelOf(raw)), plain(Core.modelOf(remote.lessons.find(l => l.slug === slug))));
+  assert.equal(local.stats.lessonsCompleted, remote.stats.lessonsCompleted);
+});
+
+test('lessons imported with grammar gaps (bracket lines or data) keep them', { skip }, async () => {
+  const r = await admin('POST', '/import', { lessons: [
+    { title: 'Imported gaps', slug: 'imported-gaps', units: [{ title: 'U', sentences: [
+      'Where [is|are|am] the desk?',
+      { en: 'I live in Cairo', gap: { index: 2, answer: 'in', options: ['in', 'on', 'at'] } },
+      { en: 'No gap here' },
+    ] }] },
+  ] });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  const lessons = (await admin('GET', '/lessons')).data.lessons;
+  const full = (await admin('GET', `/lessons/${lessons.find(l => l.slug === 'imported-gaps').id}`)).data.lesson;
+  const [a, b, c] = full.units[0].sentences;
+  assert.deepEqual(a, { en: 'Where is the desk?', gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'] } });
+  assert.deepEqual(b.gap, { index: 2, answer: 'in', options: ['in', 'on', 'at'] });
+  assert.equal(c.gap, undefined);
+  const wrong = await admin('POST', '/import', { lessons: [{ title: 'X', slug: 'x-bad', units: [{ title: 'U', sentences: [{ en: 'I live in Cairo', gap: { index: 0, answer: 'in', options: ['in', 'on', 'at'] } }] }] }] });
+  assert.equal(wrong.status, 400);
 });
 
 test('compressed responses are served', { skip }, async () => {

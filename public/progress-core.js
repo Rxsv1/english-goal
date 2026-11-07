@@ -30,11 +30,13 @@
    * @param solved   Map(sentenceText -> best stars) for this lesson
    * @param unitRows Map(unitId -> unit_progress row) for this lesson
    * @param extra    Map(sentenceText -> extra stars earned by practising again) for this lesson
+   * @param grammar  Set(sentenceText) of sentences whose grammar gap the student has answered
    */
-  function summarize(lesson, lp, solved, unitRows, extra) {
+  function summarize(lesson, lp, solved, unitRows, extra, grammar) {
     solved = solved || new Map();
     unitRows = unitRows || new Map();
     extra = extra || new Map();
+    grammar = grammar || new Set();
     let prevDone = true;
     const units = unitsOf(lesson).map(u => {
       const list = Array.isArray(u.sentences) ? u.sentences : [];
@@ -46,7 +48,10 @@
       }
       const row = unitRows.get(u.id);
       const learned = Boolean(row && row.learned_at);
-      const completed = total > 0 && done === total;
+      // A unit is finished when every sentence is built AND every grammar gap (if the teacher added any) is answered.
+      const grammarTotal = list.filter(x => x.gap).length;
+      const grammarDone = list.filter(x => x.gap && grammar.has(x.en)).length;
+      const completed = total > 0 && done === total && grammarDone === grammarTotal;
       // A unit is only locked while it is brand new. Anything the student already started or finished
       // stays open (e.g. when a teacher adds a unit before it), so they can always go back.
       const locked = !prevDone && !completed && !row && done === 0;
@@ -60,6 +65,9 @@
         extra: bonus,
         maxStars: total * 3,
         learned,
+        grammarTotal,
+        grammarDone,
+        grammarReady: total > 0 && done === total && grammarDone < grammarTotal, // everything built, the grammar step is next
         learnIndex: row ? Math.max(0, Math.min(num(row.learn_index), total - 1)) : 0,
         completed,
         locked,
@@ -71,7 +79,7 @@
     const done = units.reduce((a, u) => a + u.solved, 0);
     const stars = units.reduce((a, u) => a + u.stars, 0);
     const bonus = units.reduce((a, u) => a + u.extra, 0);
-    const completed = total > 0 && done === total;
+    const completed = total > 0 && units.every(u => u.completed);
     const anyLearned = units.some(u => u.learned);
     const current = units.findIndex(u => !u.completed);
     const status = completed ? 'completed' : done > 0 || anyLearned ? 'building' : lp || unitRows.size ? 'learning' : 'new';
@@ -83,6 +91,8 @@
       maxStars: total * 3,
       learned: units.every(u => u.learned),
       completed,
+      grammarTotal: units.reduce((a, u) => a + u.grammarTotal, 0),
+      grammarDone: units.reduce((a, u) => a + u.grammarDone, 0),
       unitsTotal: units.length,
       unitsCompleted: units.filter(u => u.completed).length,
       currentUnit: current < 0 ? null : current,
@@ -104,13 +114,14 @@
 
   /** Progress summary for one lesson copy. */
   function modelOf(raw) {
-    const solved = new Map(), extra = new Map();
+    const solved = new Map(), extra = new Map(), grammar = new Set();
     for (const u of raw.units || []) for (const s of u.sentences || []) {
       if (s.stars) solved.set(s.en, s.stars);
       if (s.extra) extra.set(s.en, s.extra);
+      if (s.gdone) grammar.add(s.en);
     }
     const rows = new Map((raw.unitRows || []).map(r => [r.unit_id, r]));
-    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra);
+    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra, grammar);
   }
 
   function touchLesson(raw, seconds, now) {
@@ -156,5 +167,24 @@
     return { stars, best: found.stars, extra, replay, completed: m.completed };
   }
 
-  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve };
+  /**
+   * A grammar gap was answered correctly. Only possible once the sentence has been built (same rule as the server).
+   * Returns null when it does not apply, otherwise { completed } for the whole lesson.
+   */
+  function applyGrammar(raw, stats, sentence, seconds, now) {
+    let found = null;
+    for (const u of raw.units || []) for (const s of u.sentences || []) if (s.en === sentence && s.gap) found = s;
+    if (!found || !num(found.stars)) return null;
+    const lessonWasDone = modelOf(raw).completed;
+    found.gdone = true;
+    touchLesson(raw, seconds, now);
+    const m = modelOf(raw);
+    if (stats) {
+      stats.timeSpent = num(stats.timeSpent) + num(seconds);
+      if (m.completed && !lessonWasDone && !raw.lp.completed_at) { raw.lp.completed_at = now; stats.lessonsCompleted = num(stats.lessonsCompleted) + 1; }
+    }
+    return { completed: m.completed };
+  }
+
+  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar };
 });

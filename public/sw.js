@@ -1,7 +1,7 @@
 /* Offline support. Everything is fetched from the network first, so updates show up
    immediately; the saved copy is only used when there is no internet.
    API calls are never cached (progress is queued by the app itself when offline). */
-const VERSION = 'v10';
+const VERSION = 'v11';
 const SHELL = `shell-${VERSION}`;
 const SHELL_FILES = ['/', '/app.js', '/progress-core.js', '/style.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
 

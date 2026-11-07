@@ -7,6 +7,36 @@ and the teacher dashboard shows exactly what each student has done.
 - **Students:** `https://your-app.cranl.net/`
 - **Teacher:** `https://your-app.cranl.net/admin`
 
+## The learning method
+
+Every unit follows the same three steps, built around memorising whole sentences so students can speak:
+
+1. **Read and say it.** The student reads the sentence, listens to it (normal or slow), then says it out loud and taps
+   **"I said it out loud"**. The next sentence stays locked until they do. (Going back to a unit they already learned is free.)
+2. **Re-order to prove it.** The sentence is hidden and its words are shuffled; the student puts them back in order.
+3. **Grammar gap.** One word is missing from the sentence and the student chooses the right one of **three**. When the
+   last gap is answered, the unit (and, after the last unit, the lesson) ends.
+
+Step 3 is optional per sentence: a lesson with no gaps simply ends after step 2, exactly as before.
+
+### Writing grammar gaps (teacher)
+
+In the lesson editor, put one word of a sentence between brackets. The **first** word is the right answer, the other two are the
+wrong choices the student sees (they are shown in a random order):
+
+```
+She [is|are|am] reading a book.
+I live [in|on|at] Cairo.
+```
+
+- Writing only the answer, `They [were] late.`, fills in the two wrong choices for **am/is/are, was/were, have/has and do/does**.
+  Other words (articles, prepositions...) need the teacher's own wrong choices, because things like *a/the* or *in/at* can both be right.
+- **✨ Suggest grammar gaps** adds a gap to every sentence that has one of those safe words; check them, then save.
+  **Remove all gaps** takes them away again.
+- In a JSON file a gap can be written the same way (`"She [is|are|am] reading"`) or as data:
+  `{ "en": "She is reading", "gap": { "index": 1, "answer": "is", "options": ["is", "are", "am"] } }`
+  (`index` is the position of the word, counting from 0).
+
 ## Features
 
 **Students**
@@ -17,6 +47,10 @@ and the teacher dashboard shows exactly what each student has done.
 - Progress is saved after every card and every sentence. It never goes backwards, and the best stars are kept.
   Students can stop at any time and continue on any device ("Continue where you stopped").
 - **Home keeps your place, finished lessons move away:** going back from a lesson (the arrow or the phone's back button) returns to the same spot in the list. A lesson the student finishes leaves the home list and appears on the **Completed lessons** page (a 🏆 row on the home screen), where it can still be opened and played again.
+- **On a computer** the app uses the whole window instead of a phone-sized strip: a dashboard on the home screen, lessons in a
+  grid, a lesson's summary beside its units, and a larger stage for the cards and puzzle (everything also grows on big monitors).
+  Phones and narrow windows are unchanged. With a keyboard: **1-9** pick a word, **Backspace** takes the last one back,
+  **H** hint, **P** peek, **L** listen, **S** "I said it", **1-2-3** choose a grammar word, **Enter** next, **← →** move between cards.
 - **Go back to anything:** every unit a student has opened can be revisited: read its cards again (jump to any card
   with the `1 / 5` button), practise the whole unit, or open **All sentences** to listen to or practise one single sentence.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
@@ -149,8 +183,10 @@ src/routes/student.js   Sign-up/login, lessons, saving progress
 src/routes/admin.js     Teacher API: overview, students, lessons, assignments, CSV
 src/validate.js         Input rules
 test/api.test.js        End-to-end API tests (run with TEST_DATABASE_URL set to an empty test database)
+test/grammar.test.js    Grammar-gap parsing tests (no database needed)
 src/seed.js             6 starter lessons (only added to an empty database)
 public/progress-core.js Scoring rules shared by the server and the browser
+public/grammar-core.js  Reads/writes grammar gaps like [is|are|am] (server, teacher editor)
 public/app.js           Student app
 public/admin.js         Teacher dashboard
 ```
