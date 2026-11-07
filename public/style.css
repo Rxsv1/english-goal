@@ -691,7 +691,6 @@ details.start-over { margin: 12px 0 0; text-align: center; }
 .gap-opt.wrong { background: var(--hint); border-color: #F59F00; color: #B35C00; box-shadow: none; animation: shake .35s; }
 .gap-opt.right { background: var(--success); border-color: var(--success-dark); color: var(--success-text); box-shadow: none; }
 .gap-opt:disabled:not(.right):not(.wrong) { opacity: .45; cursor: default; }
-.gap-key { display: none; }
 .result-list .gram { color: var(--success-text); letter-spacing: 0; font-weight: 700; }
 
 /* ================================================================================================
@@ -773,15 +772,7 @@ details.start-over { margin: 12px 0 0; text-align: center; }
   .btn-ghost:not(:disabled):hover { background: var(--surface-2); }
   .jump-n:not(:disabled):hover { border-color: var(--accent); }
   .gap-opt:not(:disabled):hover { border-color: var(--accent); transform: translateY(-2px); }
-  .gap-key { display: block; position: absolute; top: .4rem; left: .65rem; font-size: .6875rem; font-weight: 700; line-height: 1; color: var(--faint); }
 
-  /* the first nine loose words are numbered, so they can be picked with the number keys */
-  .pool-zone { counter-reset: tile; }
-  .pool-zone .tile { counter-increment: tile; position: relative; }
-  .pool-zone .tile:nth-child(-n+9)::before {
-    content: counter(tile); position: absolute; top: .3rem; left: .55rem;
-    font-size: .6875rem; font-weight: 700; line-height: 1; color: var(--faint);
-  }
   .kbd-hint { display: block; text-align: center; margin: 1.25rem 0 0; color: var(--faint); font-size: .875rem; }
 }
 

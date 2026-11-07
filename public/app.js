@@ -365,24 +365,55 @@
   };
 
   const canSpeak = 'speechSynthesis' in window;
-  let voice = null;
+  let voice = null;       // the most natural English voice this device has
+  let localVoice = null;  // the best one that works without internet (used when the best one cannot be reached)
+
+  // Every phone, tablet and computer has its own voices, so the app looks through them and picks the most natural English one.
+  function voiceScore(v) {
+    const name = v.name || '', lang = v.lang || '';
+    let score = 0;
+    if (/^en[-_]US$/i.test(lang)) score += 30;
+    else if (/^en[-_](GB|AU|CA|IE|NZ|ZA|IN)$/i.test(lang)) score += 18;
+    else score += 8;
+    if (/natural|neural|online/i.test(name)) score += 50;                 // Microsoft's neural voices (Windows, Edge)
+    if (/premium|enhanced/i.test(name)) score += 40;                       // high-quality voices downloaded on iPhone / Mac
+    if (/siri/i.test(name)) score += 35;
+    if (/google/i.test(name)) score += 25;                                 // Google's voices (Chrome, Android)
+    if (/samantha|ava|allison|zoe|evan|nicky|aaron|aria|jenny|guy/i.test(name)) score += 10;
+    if (v.localService === false) score += 15;                             // voices that run on a server usually sound better
+    if (/compact|espeak|festival|mbrola/i.test(name)) score -= 40;         // the small, robotic ones
+    return score;
+  }
   function pickVoice() {
     if (!canSpeak) return;
-    const vs = speechSynthesis.getVoices().filter(v => /^en[-_]/i.test(v.lang));
-    voice = vs.find(v => /en[-_]US/i.test(v.lang) && /google|natural|samantha/i.test(v.name))
-      || vs.find(v => /en[-_](US|GB)/i.test(v.lang)) || vs[0] || null;
+    let english;
+    try { english = speechSynthesis.getVoices().filter(v => /^en([-_]|$)/i.test(v.lang || '')); } catch (e) { return; }
+    const best = list => list.reduce((top, v) => (!top || voiceScore(v) > voiceScore(top) ? v : top), null);
+    voice = best(english);
+    localVoice = best(english.filter(v => v.localService !== false));
   }
   if (canSpeak) { pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
+
   function speak(text, slow, onEnd) {
     if (!canSpeak || !text) { if (onEnd) onEnd(); return; }
     try {
+      if (!voice) pickVoice(); // phones often load their voices late and never announce it
       speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(String(text));
-      u.lang = voice ? voice.lang : 'en-US';
-      if (voice) u.voice = voice;
-      u.rate = slow ? 0.6 : 0.9;
-      if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
-      speechSynthesis.speak(u);
+      const say = v => {
+        const u = new SpeechSynthesisUtterance(String(text));
+        u.lang = v ? v.lang : 'en-US';
+        if (v) u.voice = v;
+        u.rate = slow ? 0.7 : 0.95; // very low rates make many phone voices sound broken
+        u.onend = () => { if (onEnd) onEnd(); };
+        u.onerror = e => {
+          // An online voice that cannot be reached: say it with the best voice that works offline instead of staying silent.
+          const cut = e && (e.error === 'canceled' || e.error === 'interrupted');
+          if (!cut && v && v.localService === false && localVoice && localVoice !== v) { say(localVoice); return; }
+          if (onEnd) onEnd();
+        };
+        speechSynthesis.speak(u);
+      };
+      say(voice);
     } catch (e) {
       if (onEnd) onEnd(); // speech is a bonus; the lesson goes on without it
     }
@@ -677,9 +708,13 @@
   /* ================================================================ */
   let levelFilter = storage.get('ws:level', 'All');
 
+  // "Progress" means the student really did something: went past the first card, finished the cards, built or answered a sentence.
+  // Just opening a lesson (which shows its first card) does not count, so it still says Start, not Continue.
+  const didAnything = p => p.solved > 0 || p.units.some(u => u.learned || u.learnIndex > 0 || u.grammarDone > 0);
+
   function statusText(p) {
     if (p.completed) return '✓ Completed';
-    if (p.status === 'new' || p.currentUnit === null) return 'New';
+    if (p.status === 'new' || p.currentUnit === null || !didAnything(p)) return 'New';
     const u = p.units[p.currentUnit];
     const where = p.unitsTotal > 1 ? `Unit ${p.currentUnit + 1}/${p.unitsTotal} · ` : '';
     return where + (u.learned ? (u.grammarReady ? 'grammar next' : `${u.solved}/${u.total} built`) : 'learning');
@@ -705,7 +740,7 @@
     const lessons = all.filter(l => !l.progress.completed);
     const finished = all.filter(l => l.progress.completed);
     const cont = lessons
-      .filter(l => l.progress.lastActivityAt)
+      .filter(l => l.progress.lastActivityAt && didAnything(l.progress))
       .sort((a, b) => new Date(b.progress.lastActivityAt) - new Date(a.progress.lastActivityAt))[0];
     const assigned = lessons.filter(l => l.assigned);
 
@@ -814,7 +849,7 @@
     const pct = p.total ? Math.round((p.solved / p.total) * 100) : 0;
     const fill = h('div', { class: 'mini-fill' });
     fill.style.width = pct + '%';
-    const started = p.status !== 'new';
+    const started = didAnything(p);
     return h('a', { class: 'lesson-card' + (p.completed ? ' done' : ''), href: `/lesson/${l.slug}`, 'data-link': true },
       h('span', { class: 'emoji', 'aria-hidden': 'true' }, l.emoji || '📘'),
       h('div', { class: 'body' },
@@ -858,7 +893,7 @@
     const fill = h('div', { class: 'progress-fill' });
     fill.style.width = pct + '%';
 
-    const hasProgress = p.units.some(u => u.status !== 'new');
+    const canRestart = didAnything(p);
     const stars = n => '★'.repeat(n) + '☆'.repeat(3 - n);
 
     const unitCards = lesson.units.map((unit, i) => {
@@ -868,7 +903,7 @@
       if (current) {
         // The unit's three steps in order: read and say it, build it, then the grammar gap (if the unit has one).
         const step = !up.learned ? 'learn' : up.solved < up.total ? 'build' : 'grammar';
-        const label = step === 'learn' ? (up.status === 'learning' ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : 'Continue';
+        const label = step === 'learn' ? (up.learnIndex > 0 ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : (up.grammarDone ? 'Continue' : 'Start');
         action = h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, step), 'data-link': true }, '▶ ', label);
       }
       // Any unit the student can open can be revisited: read the cards again, practise, or start it over.
@@ -889,7 +924,7 @@
             canSpeak ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Listen', html: ICON.sound, onclick: () => speak(sn.en) }) : null,
             h('a', { class: 'icon-btn', href: `${unitPath(slug, unit, 'review')}?only=${k}`, 'data-link': true, 'aria-label': 'Practise this sentence', html: ICON.puzzle })))))) : null;
 
-      const learnTxt = up.learned ? 'Learned' : up.status === 'learning' ? `Learn ${up.learnIndex + 1}/${up.total}` : 'Learn';
+      const learnTxt = up.learned ? 'Learned' : up.learnIndex > 0 ? `Learn ${up.learnIndex + 1}/${up.total}` : 'Learn';
       return h('li', { class: 'unit' + (up.completed ? ' done' : current ? ' current' : up.locked ? ' locked' : '') },
         h('div', { class: 'unit-head' },
           h('span', { class: 'step-num', html: up.completed ? ICON.check : up.locked ? ICON.lock : null }, up.completed || up.locked ? null : String(i + 1)),
@@ -940,9 +975,9 @@
           h('div', { class: 'progress-track', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' }, fill),
           h('p', { class: 'muted' },
             multi ? `${p.unitsCompleted} of ${p.unitsTotal} units · ` : '', `${p.solved} of ${p.total} sentences built`)),
-        !p.completed && p.status === 'new' ? h('p', { class: 'how' }, '👀 Look and listen', h('span', { class: 'arrow' }, ' → '), '🧩 Build the sentence') : null,
+        !p.completed && !didAnything(p) ? h('p', { class: 'how' }, '👀 Look and listen', h('span', { class: 'arrow' }, ' → '), '🧩 Build the sentence') : null,
         h('ol', { class: 'units' }, unitCards),
-        hasProgress ? h('details', { class: 'start-over' },
+        canRestart ? h('details', { class: 'start-over' },
           h('summary', null, 'More options'),
           h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' Start lesson over', onclick: restartLesson }),
           h('p', { class: 'muted' }, 'Replay everything from Unit 1. Your saved progress is never lost, and better results count as extra stars.')) : null,
@@ -1178,7 +1213,7 @@
       h('div', { class: 'listen-row listen-peek' }, canSpeak ? listenBtn : null, peekBtn),
       answerBox, pool, feedback, solvedPanel,
       h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, nextBtn),
-      h('p', { class: 'kbd-hint' }, '1–9 pick a word  ·  Backspace undo  ·  H hint  ·  P peek  ·  L listen  ·  Enter next') // shown on computers only
+      h('p', { class: 'kbd-hint' }, 'Backspace undo  ·  H hint  ·  P peek  ·  L listen  ·  Enter next') // shown on computers only
     );
 
     const tilesIn = zone => [...zone.children];
@@ -1336,7 +1371,7 @@
       if (++pos < items.length) { loadRound(); window.scrollTo(0, 0); } else finish();
     });
 
-    // Play with the keyboard on a computer: number keys pick loose words, Backspace takes the last one back.
+    // Play with the keyboard on a computer: Backspace takes the last word back, H / P / L give a hint, a peek or the sound.
     const onKey = e => {
       if (!round || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
       if (e.target.closest && e.target.closest('input, textarea, select')) return;
@@ -1346,8 +1381,7 @@
         if (key === 'Enter' && document.activeElement !== nextBtn && !nextBtn.hidden) nextBtn.click();
         return;
       }
-      if (/^[1-9]$/.test(key)) { const tile = pool.children[Number(key) - 1]; if (tile) tile.click(); }
-      else if (key === 'Backspace') { e.preventDefault(); const last = answer.lastElementChild; if (last) last.click(); }
+      if (key === 'Backspace') { e.preventDefault(); const last = answer.lastElementChild; if (last) last.click(); }
       else if (key === 'h') hintBtn.click();
       else if (key === 'p') peekBtn.click();
     };
@@ -1470,7 +1504,7 @@
       feedback,
       h('div', { class: 'listen-row' }, listenBtn),
       h('div', { class: 'actions' }, nextBtn),
-      h('p', { class: 'kbd-hint' }, '1 2 3 choose  ·  L listen  ·  Enter next') // shown on computers only
+      h('p', { class: 'kbd-hint' }, 'Keys 1 2 3 choose the first, second or third word  ·  L listen  ·  Enter next') // shown on computers only
     );
 
     function loadRound() {
@@ -1479,9 +1513,9 @@
       const blank = h('span', { class: 'gap-blank', 'aria-label': 'missing word' });
       round = { it, blank, mistakes: 0, done: false, startedAt: Date.now(), cid: uid() };
       sentenceEl.replaceChildren(before, blank, after);
-      choices.replaceChildren(...randomOrder(it.gap.options).map((word, k) => h('button', {
+      choices.replaceChildren(...randomOrder(it.gap.options).map(word => h('button', {
         class: 'gap-opt', type: 'button', 'data-word': word, onclick: e => choose(e.currentTarget),
-      }, h('span', { class: 'gap-key', 'aria-hidden': 'true' }, String(k + 1)), word)));
+      }, word)));
       feedback.textContent = ''; feedback.className = 'feedback';
       card.classList.remove('right');
       listenBtn.hidden = true; nextBtn.hidden = true;

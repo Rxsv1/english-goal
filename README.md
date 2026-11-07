@@ -49,8 +49,8 @@ I live [in|on|at] Cairo.
 - **Home keeps your place, finished lessons move away:** going back from a lesson (the arrow or the phone's back button) returns to the same spot in the list. A lesson the student finishes leaves the home list and appears on the **Completed lessons** page (a 🏆 row on the home screen), where it can still be opened and played again.
 - **On a computer** the app uses the whole window instead of a phone-sized strip: a dashboard on the home screen, lessons in a
   grid, a lesson's summary beside its units, and a larger stage for the cards and puzzle (everything also grows on big monitors).
-  Phones and narrow windows are unchanged. With a keyboard: **1-9** pick a word, **Backspace** takes the last one back,
-  **H** hint, **P** peek, **L** listen, **S** "I said it", **1-2-3** choose a grammar word, **Enter** next, **← →** move between cards.
+  Phones and narrow windows are unchanged. With a keyboard: **Backspace** takes the last word back,
+  **H** hint, **P** peek, **L** listen, **S** "I said it", **1-2-3** choose the first/second/third grammar word, **Enter** next, **← →** move between cards.
 - **Go back to anything:** every unit a student has opened can be revisited: read its cards again (jump to any card
   with the `1 / 5` button), practise the whole unit, or open **All sentences** to listen to or practise one single sentence.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
