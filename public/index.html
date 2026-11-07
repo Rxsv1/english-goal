@@ -21,7 +21,81 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main id="app" class="page"></main>
+  <main id="app" class="page" aria-busy="true">{{SKELETON}}</main>
+
+  <!-- Skeleton screens. The server copies the right one into #app so it is painted before any JavaScript runs;
+       app.js clones the same markup while data loads. Every block uses the real layout classes, so nothing jumps. -->
+  <template id="sk-home">
+    <header class="appbar"><span class="brand"><i class="sk sk-logo"></i><i class="sk sk-line w-96"></i></span><div class="tools"><i class="sk sk-icon"></i><i class="sk sk-avatar"></i></div></header>
+    <div class="sk sk-title"></div>
+    <div class="sk sk-sub"></div>
+    <div class="stat-row">
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+    </div>
+    <div class="sk sk-continue"></div>
+    <section class="section"><i class="sk sk-line w-30 sk-h2"></i>
+      <div class="lesson-grid">
+        <div class="lesson-card sk-card"><i class="sk sk-emoji"></i><div class="body"><i class="sk sk-line w-60"></i><i class="sk sk-line w-90 sm"></i><i class="sk sk-line w-40 sm"></i></div></div>
+        <div class="lesson-card sk-card"><i class="sk sk-emoji"></i><div class="body"><i class="sk sk-line w-60"></i><i class="sk sk-line w-90 sm"></i><i class="sk sk-line w-40 sm"></i></div></div>
+        <div class="lesson-card sk-card"><i class="sk sk-emoji"></i><div class="body"><i class="sk sk-line w-60"></i><i class="sk sk-line w-90 sm"></i><i class="sk sk-line w-40 sm"></i></div></div>
+      </div>
+    </section>
+  </template>
+
+  <template id="sk-hub">
+    <div class="game-top"><i class="sk sk-icon"></i><div class="lesson-name"></div><i class="sk sk-icon"></i></div>
+    <section class="hub">
+      <div class="sk sk-hub-emoji"></div>
+      <div class="sk sk-title sk-hub-title"></div>
+      <div class="sk sk-sub"></div>
+      <div class="hub-progress"><i class="sk sk-big-num"></i><div class="progress-track"><i class="sk sk-fill"></i></div><i class="sk sk-line w-60 sk-hub-line"></i></div>
+      <ol class="units">
+        <li class="unit"><div class="unit-head"><i class="sk sk-circle36"></i><div class="step-body"><i class="sk sk-line w-30 sm"></i><i class="sk sk-line w-60 lg"></i><i class="sk sk-line w-50 sm"></i></div></div><i class="sk sk-play"></i></li>
+        <li class="unit"><div class="unit-head"><i class="sk sk-circle36"></i><div class="step-body"><i class="sk sk-line w-30 sm"></i><i class="sk sk-line w-60 lg"></i><i class="sk sk-line w-50 sm"></i></div></div></li>
+      </ol>
+    </section>
+  </template>
+
+  <template id="sk-step">
+    <div class="game-top"><i class="sk sk-icon"></i><i class="sk sk-line w-50"></i><i class="sk sk-pill"></i><i class="sk sk-icon"></i></div>
+    <div class="progress-track"><i class="sk sk-fill"></i></div>
+    <div class="sk sk-line w-60 sk-prompt"></div>
+    <div class="sk sk-stage"></div>
+    <div class="actions"><i class="sk sk-btn-sm"></i><i class="sk sk-btn-main"></i></div>
+  </template>
+
+  <template id="sk-profile">
+    <header class="appbar"><i class="sk sk-icon"></i><div class="tools"><i class="sk sk-icon"></i></div></header>
+    <div class="profile-head"><i class="sk sk-avatar-lg"></i><div class="sk-grow"><i class="sk sk-line w-50 lg"></i><i class="sk sk-line w-70 sm"></i></div></div>
+    <div class="stat-row">
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+    </div>
+    <section class="section"><i class="sk sk-line w-30 sk-h2"></i><div class="sk sk-form"></div></section>
+    <section class="section"><i class="sk sk-line w-30 sk-h2"></i><div class="sk sk-form"></div></section>
+  </template>
+
+  <template id="sk-practice">
+    <header class="appbar"><i class="sk sk-icon"></i><div class="tools"><i class="sk sk-icon"></i></div></header>
+    <div class="sk sk-title"></div>
+    <div class="sk sk-sub"></div>
+    <div class="sk sk-textarea"></div>
+    <div class="row-actions"><i class="sk sk-btn-main"></i><i class="sk sk-btn-main"></i></div>
+  </template>
+
+  <template id="sk-auth">
+    <section class="auth">
+      <div class="auth-brand"><i class="sk sk-logo"></i><i class="sk sk-line w-30"></i></div>
+      <div class="sk sk-title sk-auth-title"></div>
+      <div class="sk sk-sub"></div>
+      <div class="card"><div class="auth-form"><i class="sk sk-input"></i><i class="sk sk-input"></i><i class="sk sk-btn-block"></i></div></div>
+    </section>
+  </template>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <canvas id="confetti" aria-hidden="true"></canvas>
   <script src="/vendor/Sortable.min.js"></script>

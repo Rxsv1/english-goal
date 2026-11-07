@@ -62,13 +62,37 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
 /* ---------- Pages (app name filled in) ---------- */
 const escapeHtml = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const pages = {};
+const rawPages = {};
 for (const name of ['index.html', 'admin.html']) {
-  pages[name] = fs.readFileSync(path.join(PUBLIC_DIR, name), 'utf8').replace(/\{\{APP_NAME\}\}/g, escapeHtml(APP_NAME));
+  rawPages[name] = fs.readFileSync(path.join(PUBLIC_DIR, name), 'utf8').replace(/\{\{APP_NAME\}\}/g, escapeHtml(APP_NAME));
 }
-const sendPage = name => (req, res) => {
+
+// Skeleton screens live as <template id="sk-NAME"> in the HTML files. The server copies the one that fits the
+// requested URL into the page, so the placeholder is painted straight from the first byte, before any JavaScript runs.
+const skeletons = {};
+for (const html of Object.values(rawPages))
+  for (const m of html.matchAll(/<template id="sk-([a-z-]+)">([\s\S]*?)<\/template>/g)) skeletons[m[1]] = m[2];
+
+const studentSkeleton = p =>
+  /^\/(login|signup)\/?$/.test(p) ? 'auth'
+    : /^\/lesson\/[^/]+\/u\//.test(p) ? 'step'
+      : /^\/lesson\//.test(p) ? 'hub'
+        : p === '/profile' ? 'profile'
+          : p === '/practice' ? 'practice'
+            : 'home';
+
+const rendered = new Map(); // "page:kind" -> final HTML, built once
+function renderPage(name, kind) {
+  const key = name + ':' + kind;
+  if (!rendered.has(key)) {
+    const layer = `<div class="sk-layer" data-kind="${kind}" role="status" aria-label="Loading">${skeletons[kind] || ''}</div>`;
+    rendered.set(key, rawPages[name].replace('{{SKELETON}}', layer));
+  }
+  return rendered.get(key);
+}
+const sendPage = (name, kindFor) => (req, res) => {
   res.set('Cache-Control', 'no-cache');
-  res.type('html').send(pages[name]);
+  res.type('html').send(renderPage(name, kindFor(req.path)));
 };
 
 app.get('/manifest.webmanifest', (req, res) => {
@@ -91,8 +115,8 @@ app.get('/manifest.webmanifest', (req, res) => {
   }));
 });
 
-app.get('/admin', sendPage('admin.html'));
-app.get(['/', '/login', '/signup', '/profile', '/practice', '/lesson/:slug', '/lesson/:slug/:step', '/lesson/:slug/u/:unit/:step'], sendPage('index.html'));
+app.get('/admin', sendPage('admin.html', () => 'tiles'));
+app.get(['/', '/login', '/signup', '/profile', '/practice', '/lesson/:slug', '/lesson/:slug/:step', '/lesson/:slug/u/:unit/:step'], sendPage('index.html', studentSkeleton));
 
 app.use(express.static(PUBLIC_DIR, {
   index: false,
@@ -101,7 +125,7 @@ app.use(express.static(PUBLIC_DIR, {
     else res.set('Cache-Control', 'public, max-age=300');
   },
 }));
-app.use((req, res) => res.status(404).type('html').send(pages['index.html']));
+app.use((req, res) => res.status(404).type('html').send(renderPage('index.html', studentSkeleton(req.path))));
 
 app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });

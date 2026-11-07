@@ -143,3 +143,15 @@ table.data a { color: inherit; }
 .give-existing { margin-top: 14px; }
 .give-existing > summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
 .admin-item .btns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* ---------- Skeleton screens (shimmer + base styles live in style.css) ---------- */
+#view { position: relative; }
+.sk-admin-title { width: 180px; height: 34px; margin: 0; }
+.sk-admin-btn { width: 130px; height: 40px; }
+.sk-tile-v { height: 32px; width: 50%; margin-bottom: 8px; }
+.sk-chart { height: 120px; margin-top: 14px; border-radius: 10px; }
+.sk-rows { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.sk-row { height: 22px; border-radius: 6px; }
+.sk-search { height: 44px; border-radius: 12px; margin-bottom: 14px; }
+.sk-item { min-height: 72px; pointer-events: none; }
+.sk-item .info { display: flex; flex-direction: column; }

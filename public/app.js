@@ -84,7 +84,7 @@
     if (!res.ok) {
       const e = new Error(data.error || `Something went wrong (${res.status}).`);
       e.status = res.status;
-      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; goLogin(); }
+      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; saveHome(null); goLogin(); }
       if (res.status === 403 && /disabled/i.test(e.message)) { me = null; toast(e.message); goLogin(); }
       throw e;
     }
@@ -244,6 +244,7 @@
   /* Router                                                            */
   /* ================================================================ */
   let cleanup = null;
+  let viewId = 0; // changes on every navigation, so a slow response can't draw over a newer screen
   function navigate(path, replace) {
     if (replace) history.replaceState(null, '', path); else history.pushState(null, '', path);
     route();
@@ -255,6 +256,7 @@
   }
 
   function route() {
+    viewId++;
     if (cleanup) { cleanup(); cleanup = null; }
     stopSpeech();
     window.scrollTo(0, 0);
@@ -280,8 +282,28 @@
   });
   app.addEventListener('contextmenu', e => { if (e.target.closest('.tile')) e.preventDefault(); });
 
-  const setView = (...nodes) => app.replaceChildren(...nodes.flat().filter(n => n !== null && n !== undefined && n !== false));
-  const loading = text => setView(h('div', { class: 'state' }, h('div', { class: 'spinner' }), text || 'Loading…'));
+  // Shows a screen. If a skeleton is on screen, the new content fades in over it while the skeleton fades out
+  // (pure CSS opacity), so the swap is smooth and nothing shifts.
+  function setView(...nodes) {
+    const kids = nodes.flat().filter(n => n !== null && n !== undefined && n !== false);
+    const layer = app.querySelector(':scope > .sk-layer');
+    app.removeAttribute('aria-busy');
+    if (!layer) return app.replaceChildren(...kids);
+    app.replaceChildren(layer, ...kids);
+    kids.forEach(k => k.classList && k.classList.add('reveal'));
+    layer.classList.add('out');
+    if (getComputedStyle(layer).animationName === 'none') layer.remove(); // reduced motion: no fade
+    else layer.addEventListener('animationend', () => layer.remove(), { once: true });
+  }
+  // Placeholder that mirrors the real screen. Same markup the server already put in the HTML (see index.html).
+  function showSkeleton(kind) {
+    const old = app.querySelector(':scope > .sk-layer');
+    if (old && old.dataset.kind === kind && app.children.length === 1) return; // already showing it
+    const layer = h('div', { class: 'sk-layer', 'data-kind': kind, role: 'status', 'aria-label': 'Loading' });
+    layer.append(document.getElementById('sk-' + kind).content.cloneNode(true));
+    app.replaceChildren(layer);
+    app.setAttribute('aria-busy', 'true');
+  }
   function errorView(e, retry) {
     setView(appBar(), h('div', { class: 'state' },
       h('div', { class: 'big', 'aria-hidden': 'true' }, e.status === 404 ? '🔍' : '📡'),
@@ -343,6 +365,7 @@
         const body = { email: email.value, password: password.value };
         if (isSignup) body.name = name.value;
         await api('POST', isSignup ? '/api/auth/signup' : '/api/auth/login', body);
+        meRequest = null; // never reuse an answer that belongs to someone else
         await loadMe();
         navigate(safeNext, true);
         if (isSignup) toast(`Welcome, ${me.name}`);
@@ -394,18 +417,32 @@
     return where + (u.learned ? `Step 2 · ${u.solved} of ${u.total} built` : 'Step 1 · learning the sentences');
   }
 
+  // The last home screen is kept on this device. It is read once, synchronously, when the script starts, so
+  // the lesson list can be drawn at once while fresh data loads. Fresh data then replaces it only if it differs.
+  let homeCache = storage.get('ws:home', null);
+  const saveHome = data => { homeCache = data; storage.set('ws:home', data); };
+
   async function showHome() {
     document.title = config.appName;
-    loading('Loading your lessons…');
+    const my = viewId;
+    const cached = homeCache && me && homeCache.uid === me.id ? homeCache : null;
+    if (cached) renderHome(cached.lessons, cached.stats); else showSkeleton('home');
     let lessons, stats;
     try {
-      const [l, m] = await Promise.all([api('GET', '/api/lessons'), api('GET', '/api/me')]);
+      const [l, m] = await Promise.all([api('GET', '/api/lessons'), freshMe()]);
       lessons = l.lessons; stats = m.stats; me = m.user;
     } catch (e) {
-      if (e.status !== 401) errorView(e, showHome);
+      if (my === viewId && !cached && e.status !== 401) errorView(e, showHome);
       return;
     }
+    const fresh = { uid: me.id, user: me, lessons, stats };
+    const changed = !cached || JSON.stringify([cached.lessons, cached.stats]) !== JSON.stringify([lessons, stats]);
+    saveHome(fresh);
+    if (my === viewId && changed) renderHome(lessons, stats);
+    outbox.flush();
+  }
 
+  function renderHome(lessons, stats) {
     const cont = lessons
       .filter(l => !l.progress.completed && l.progress.lastActivityAt)
       .sort((a, b) => new Date(b.progress.lastActivityAt) - new Date(a.progress.lastActivityAt))[0];
@@ -438,7 +475,7 @@
     setView(
       appBar(),
       h('h1', null, `${greet}, ${firstName}`),
-      h('p', { class: 'subtitle' }, stats.sentencesSolved ? 'Keep going — one sentence at a time.' : 'Pick a lesson to start. First learn the sentences, then build them.'),
+      h('p', { class: 'subtitle' }, stats.sentencesSolved ? 'Keep going, you are doing great! ⭐' : 'Tap a lesson to play! 🎈'),
       h('div', { class: 'stat-row' },
         statTile('star', stats.stars, 'Stars', stats.extraStars ? `+${stats.extraStars} extra` : null),
         statTile('check', stats.sentencesSolved, 'Sentences'),
@@ -453,7 +490,6 @@
         lessons.length ? chips : h('p', { class: 'empty' }, 'No lessons yet. Your teacher will add some soon.'),
         grid)
     );
-    outbox.flush();
   }
 
   function statTile(iconName, value, label, sub) {
@@ -515,9 +551,11 @@
   const unitPath = (slug, unit, step) => `/lesson/${slug}/u/${unit.id}/${step}`;
 
   async function showLessonHub(slug) {
-    loading('Loading lesson…');
+    const my = viewId;
+    showSkeleton('hub');
     let data;
-    try { data = await loadLesson(slug); } catch (e) { if (e.status !== 401) errorView(e, () => showLessonHub(slug)); return; }
+    try { data = await loadLesson(slug); } catch (e) { if (my === viewId && e.status !== 401) errorView(e, () => showLessonHub(slug)); return; }
+    if (my !== viewId) return;
     lessonCache = null;
     const { lesson, progress: p } = data;
     document.title = `${lesson.title} · ${config.appName}`;
@@ -536,8 +574,8 @@
       let action = null;
       if (current) {
         action = up.learned
-          ? h('a', { class: 'btn btn-primary btn-block', href: unitPath(slug, unit, 'build'), 'data-link': true }, up.solved ? 'Continue building' : 'Start building')
-          : h('a', { class: 'btn btn-primary btn-block', href: unitPath(slug, unit, 'learn'), 'data-link': true }, up.status === 'learning' ? 'Continue learning' : 'Start learning');
+          ? h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, 'build'), 'data-link': true }, '▶ ', up.solved ? 'Continue' : 'Play')
+          : h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, 'learn'), 'data-link': true }, '▶ ', up.status === 'learning' ? 'Continue' : 'Start');
       }
       // Any unit the student can open can be revisited: read the cards again, practise, or start it over.
       const again = !up.locked && up.status !== 'new' ? h('div', { class: 'unit-actions' },
@@ -570,7 +608,9 @@
                   h('span', { class: up.completed ? 'ok' : '', html: ICON.puzzle }, `Build ${up.solved}/${up.total}`),
                   up.stars ? h('span', { class: 'star', html: ICON.star }, String(up.stars)) : null,
                   up.extra ? h('span', { class: 'extra', title: 'Stars gained by practising again' }, `+${up.extra} extra`) : null))),
-        action, again, sentences);
+        action,
+        // Everything else is tucked away so a child only sees one big button.
+        again || sentences ? h('details', { class: 'unit-more' }, h('summary', null, 'More'), again, sentences) : null);
     });
 
     // Start the lesson over from Unit 1. Nothing is deleted: saved progress and stars stay, and any
@@ -604,9 +644,10 @@
           h('div', { class: 'progress-track', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' }, fill),
           h('p', { class: 'muted' },
             multi ? `${p.unitsCompleted} of ${p.unitsTotal} units · ` : '', `${p.solved} of ${p.total} sentences built`)),
-        !p.completed && p.status === 'new' ? h('p', { class: 'how' }, 'Each unit has two steps: ', h('b', null, 'learn'), ' the sentences with cards, then ', h('b', null, 'build'), ' them word by word.') : null,
+        !p.completed && p.status === 'new' ? h('p', { class: 'how' }, '👀 Look and listen', h('span', { class: 'arrow' }, ' → '), '🧩 Build the sentence') : null,
         h('ol', { class: 'units' }, unitCards),
-        hasProgress ? h('div', { class: 'start-over' },
+        hasProgress ? h('details', { class: 'start-over' },
+          h('summary', null, 'More options'),
           h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' Start lesson over', onclick: restartLesson }),
           h('p', { class: 'muted' }, 'Replay everything from Unit 1. Your saved progress is never lost, and better results count as extra stars.')) : null,
         p.completed ? h('div', { class: 'hub-actions' }, h('a', { class: 'btn btn-primary btn-block', href: '/', 'data-link': true }, 'Choose another lesson')) : null)
@@ -614,11 +655,14 @@
   }
 
   async function showLessonStep(slug, unitId, step) {
-    loading();
-    let data;
-    try {
-      data = lessonCache && lessonCache.slug === slug ? lessonCache : await loadLesson(slug);
-    } catch (e) { if (e.status !== 401) errorView(e, () => showLessonStep(slug, unitId, step)); return; }
+    const my = viewId;
+    let data = lessonCache && lessonCache.slug === slug ? lessonCache : null;
+    if (!data) {
+      showSkeleton('step');
+      try { data = await loadLesson(slug); }
+      catch (e) { if (my === viewId && e.status !== 401) errorView(e, () => showLessonStep(slug, unitId, step)); return; }
+      if (my !== viewId) return;
+    }
     lessonCache = null; // refetch next time so progress is fresh
     const ui = data.lesson.units.findIndex(u => u.id === unitId);
     if (ui < 0) { toast('This unit was changed by your teacher.'); return navigate(`/lesson/${slug}`, true); }
@@ -664,8 +708,8 @@
     const num = h('div', { class: 'card-num' });
     const text = h('p', { class: 'card-sentence', lang: 'en' });
     const card = h('div', { class: 'learn-card', tabindex: '-1' }, num, text, h('p', { class: 'card-tip' }, 'Tap any word to hear it'));
-    const listen = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.sound + ' Listen' });
-    const slow = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.slow + ' Slowly' });
+    const listen = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: ICON.sound + ' Listen' });
+    const slow = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: '🐢 Slowly' });
     const prev = h('button', { class: 'btn btn-ghost', type: 'button', 'aria-label': 'Previous sentence', html: ICON.back });
     const next = h('button', { class: 'btn btn-primary', type: 'button' });
     if (!canSpeak) { listen.disabled = true; slow.disabled = true; listen.title = 'Speech is not supported on this device'; }
@@ -677,7 +721,7 @@
         pill, soundButton()),
       h('div', { class: 'progress-track', role: 'progressbar' }, fill),
       jump,
-      h('p', { class: 'prompt' }, restart ? 'Read and listen again — then build them all once more.' : 'Read and listen — you’ll build these next.'),
+      h('p', { class: 'prompt' }, restart ? '👀 Look and listen again' : '👀 Look and listen'),
       card,
       h('div', { class: 'listen-row' }, listen, slow),
       h('div', { class: 'actions' }, prev, next),
@@ -801,11 +845,11 @@
 
     const resetBtn = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.reset + '<span class="lbl">Reset</span>', 'aria-label': 'Put the words back and shuffle' });
     const hintBtn = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.hint + '<span class="lbl">Hint</span>', 'aria-label': 'Hint' });
-    const listenBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true, html: ICON.sound + '<span class="lbl">Listen</span>', 'aria-label': 'Listen' });
+    const listenBtn = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: ICON.sound + ' Listen', 'aria-label': 'Listen to the sentence' });
     const checkHint = h('button', { class: 'btn btn-status', type: 'button', disabled: true, 'aria-hidden': 'true', tabindex: '-1' }, '');
     const prevBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true, 'aria-label': 'Previous sentence', title: 'Previous sentence', html: ICON.back });
+    const peekBtn = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: '👀 Peek', 'aria-label': 'Peek at the sentence for 3 seconds (counts as a hint)' });
     const nextBtn = h('button', { class: 'btn btn-accent', type: 'button', hidden: true, html: 'Next ' + ICON.next });
-    if (!canSpeak) listenBtn.remove();
 
     const chip = mode === 'practice' ? 'Practice' : unitChip(lesson, unitIndex, mode === 'review' ? 'Practise again' : 'Build');
     setView(
@@ -814,9 +858,10 @@
         h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, chip), ' ', tracked && lesson.units.length > 1 ? unit.title : lesson.title),
         pill, soundButton()),
       h('div', { class: 'progress-track', role: 'progressbar' }, fill),
-      h('p', { class: 'prompt' }, 'Put the words in the correct order'),
+      h('p', { class: 'prompt' }, '👆 Tap the words in the right order'),
+      h('div', { class: 'listen-row listen-peek' }, canSpeak ? listenBtn : null, peekBtn),
       answerBox, pool, feedback, solvedPanel,
-      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, listenBtn, checkHint, nextBtn)
+      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, nextBtn)
     );
 
     const tilesIn = zone => [...zone.children];
@@ -842,16 +887,18 @@
       answerBox.classList.remove('solved');
       solvedPanel.hidden = true;
       feedback.textContent = ''; feedback.className = 'feedback';
-      resetBtn.hidden = false; hintBtn.hidden = false; listenBtn.hidden = true; nextBtn.hidden = true; checkHint.hidden = false;
+      resetBtn.hidden = false; hintBtn.hidden = false; peekBtn.hidden = false; nextBtn.hidden = true; checkHint.hidden = false;
       prevBtn.hidden = !(canGoBack && pos > 0);
       updateLeft();
       sortables.forEach(s => s.option('disabled', false));
       updateBar();
+      // The sentence is read aloud first, so the child can listen and then build it.
+      if (settings.sound && canSpeak) { const r = round; setTimeout(() => { if (round === r && !r.solved) speak(r.sentence); }, 350); }
     }
 
     function updateLeft() {
       const n = pool.children.length;
-      checkHint.textContent = n ? `${plural(n, 'word')} left` : 'Rearrange the red words';
+      checkHint.textContent = n ? `${n} left` : 'Almost! Move the orange words';
     }
 
     function afterChange(fromHint) {
@@ -866,7 +913,7 @@
       if (!fromHint && key !== round.lastWrong) { round.mistakes++; sfx.wrong(); if (navigator.vibrate) navigator.vibrate(60); }
       round.lastWrong = key;
       tilesIn(answer).forEach((t, k) => t.classList.add(t.dataset.word === round.target[k] ? 'right' : 'wrong'));
-      feedback.textContent = 'Not quite — move the red words.';
+      feedback.textContent = 'Almost! Try again 💪';
       feedback.className = 'feedback bad';
     }
 
@@ -899,10 +946,10 @@
             solvedPanel.append(h('div', { class: 'extra-tag' }, `+${r.extra} extra ${r.extra === 1 ? 'star' : 'stars'} added to your score!`));
         });
       }
-      const praise = s === 3 ? ['Perfect!', 'Excellent!', 'Amazing!'] : s === 2 ? ['Well done!', 'Great job!', 'Nice work!'] : ['You got it!', 'Good job, keep practising!'];
+      const praise = s === 3 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : s === 2 ? ['Well done! 👏', 'Great job! 😊', 'Nice work! 👍'] : ['You got it! 💪', 'Good job, keep going! 🌈'];
       feedback.textContent = praise[(Math.random() * praise.length) | 0];
       feedback.className = 'feedback good';
-      resetBtn.hidden = true; hintBtn.hidden = true; listenBtn.hidden = false; nextBtn.hidden = false; checkHint.hidden = true;
+      resetBtn.hidden = true; hintBtn.hidden = true; peekBtn.hidden = true; nextBtn.hidden = false; checkHint.hidden = true;
       nextBtn.innerHTML = (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next;
       nextBtn.focus({ preventScroll: true });
       sfx.win(); confetti(40);
@@ -955,6 +1002,16 @@
       sortables = [Sortable.create(answer, opts), Sortable.create(pool, opts)];
     }
 
+    let peekTimer;
+    peekBtn.addEventListener('click', () => {
+      if (round.solved) return;
+      round.hints++; // peeking is a hint, like the lightbulb
+      clearTimeout(peekTimer);
+      feedback.textContent = round.sentence; feedback.className = 'feedback peek';
+      sfx.hint();
+      const r = round;
+      peekTimer = setTimeout(() => { if (round === r && !r.solved && feedback.classList.contains('peek')) { feedback.textContent = ''; feedback.className = 'feedback'; } }, 3000);
+    });
     prevBtn.addEventListener('click', () => { stopSpeech(); if (pos > 0) { pos--; loadRound(); window.scrollTo(0, 0); } });
     resetBtn.addEventListener('click', resetRound);
     hintBtn.addEventListener('click', hint);
@@ -1068,9 +1125,11 @@
   /* ================================================================ */
   async function showProfile() {
     document.title = `My profile · ${config.appName}`;
-    loading();
+    const my = viewId;
+    showSkeleton('profile');
     let data;
-    try { data = await api('GET', '/api/me'); } catch (e) { if (e.status !== 401) errorView(e, showProfile); return; }
+    try { data = await freshMe(); } catch (e) { if (my === viewId && e.status !== 401) errorView(e, showProfile); return; }
+    if (my !== viewId) return;
     me = data.user;
     const s = data.stats;
 
@@ -1083,7 +1142,7 @@
       h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save name'));
     nameForm.addEventListener('submit', async e => {
       e.preventDefault(); nameMsg.textContent = '';
-      try { const r = await api('PATCH', '/api/me', { name: nameInput.value }); me = r.user; toast('Name saved'); }
+      try { const r = await api('PATCH', '/api/me', { name: nameInput.value }); me = r.user; meRequest = null; saveHome(null); toast('Name saved'); }
       catch (err) { nameMsg.textContent = err.message; }
     });
 
@@ -1104,7 +1163,7 @@
 
     const logout = async () => {
       try { await api('POST', '/api/auth/logout'); } catch (e) { /* ignore */ }
-      me = null;
+      me = null; meRequest = null; saveHome(null);
       navigate('/login', true);
     };
 
@@ -1128,19 +1187,34 @@
   /* ================================================================ */
   /* Boot                                                              */
   /* ================================================================ */
+  // /api/me is asked for once and shared: the app start and the home screen both need it.
+  let meRequest = null;
+  function freshMe() {
+    if (!meRequest) meRequest = api('GET', '/api/me').finally(() => setTimeout(() => { meRequest = null; }, 1500));
+    return meRequest;
+  }
+
   async function loadMe() {
     try {
-      me = (await api('GET', '/api/me')).user;
+      me = (await freshMe()).user;
       outbox.flush();
     } catch (e) {
-      me = null;
+      // Only a real "not logged in" answer logs out. With no network we keep what we know, so the app still opens offline.
+      if (e.status === 401 || e.status === 403 || !me) me = null;
     }
   }
 
   (async function boot() {
-    try { config = { ...config, ...(await api('GET', '/api/config')) }; } catch (e) { /* offline: use defaults */ }
-    if (!/^\/(login|signup)$/.test(location.pathname)) await loadMe();
-    route();
+    const onAuth = /^\/(login|signup)$/.test(location.pathname);
+    const cached = location.pathname === '/' && homeCache ? homeCache : null;
+    if (cached) me = cached.user; // local data: paint the home screen right away, check the login in the background
+    const cfg = api('GET', '/api/config').then(c => { config = { ...config, ...c }; }).catch(() => { /* offline: use defaults */ });
+    const who = onAuth ? Promise.resolve() : loadMe();
+    if (onAuth || cached) route(); // nothing to wait for
+    await Promise.all([cfg, who]);
+    if (onAuth) { if (!config.allowSignup && location.pathname === '/signup') route(); }
+    else if (cached) { if (!me) { saveHome(null); goLogin(); } }
+    else route();
   })();
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {

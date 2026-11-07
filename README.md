@@ -21,6 +21,7 @@ and the teacher dashboard shows exactly what each student has done.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
   the first sentence. Saved progress, unlocked units and stars are never reset or lowered. If the student does better
   than before, the improvement is added as **extra stars** (shown as "+N extra"; also visible to the teacher).
+- **Instant screens:** while data loads, a skeleton that mirrors the real screen is shown (it is part of the first HTML, so it appears before any JavaScript runs), then the content fades in with no layout jump. The home screen of a returning student is drawn at once from data saved on the device and refreshed in the background.
 - Works offline for a while: finished sentences are queued and sent when the connection returns
 - Home page with stars, sentences, day streak and lessons completed; profile page to change name and password
 - "Practise your own text" (not tracked)

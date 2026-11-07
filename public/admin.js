@@ -10,9 +10,9 @@
   try { token = localStorage.getItem(TOKEN_KEY); } catch (e) {}
   let levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
   let dirty = false;
+  let viewId = 0; // changes on every navigation, so a slow response can't draw over a newer screen
 
   /* ================= helpers ================= */
-  const setView = (...nodes) => view.replaceChildren(...nodes.flat().filter(n => n !== null && n !== undefined && n !== false));
   function h(tag, attrs, ...children) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -96,7 +96,27 @@
   // "⭐ 24/30" plus a small "+3 extra" when the student improved by practising again
   const starsCell = p => (p.stars ? h('span', null, `⭐ ${p.stars}/${p.maxStars}`, p.extra ? h('small', { class: 'extra', title: 'Stars gained by practising again' }, ` +${p.extra} extra`) : null) : '–');
   const avatar = name => h('span', { class: 'avatar', 'aria-hidden': 'true' }, (name || '?').trim().charAt(0).toUpperCase());
-  const loading = () => setView(h('div', { class: 'state' }, h('div', { class: 'spinner' }), 'Loading…'));
+  // Shows a screen; if a skeleton is on screen the content fades in over it while the skeleton fades out.
+  function setView(...nodes) {
+    const kids = nodes.flat().filter(n => n !== null && n !== undefined && n !== false);
+    const layer = view.querySelector(':scope > .sk-layer');
+    view.removeAttribute('aria-busy');
+    if (!layer) return view.replaceChildren(...kids);
+    view.replaceChildren(layer, ...kids);
+    kids.forEach(k => k.classList && k.classList.add('reveal'));
+    layer.classList.add('out');
+    if (getComputedStyle(layer).animationName === 'none') layer.remove();
+    else layer.addEventListener('animationend', () => layer.remove(), { once: true });
+  }
+  // Placeholder that mirrors the real screen ('tiles' = cards and charts, 'list' = rows). Markup lives in admin.html.
+  function loading(kind = 'list') {
+    const old = view.querySelector(':scope > .sk-layer');
+    if (old && old.dataset.kind === kind && view.children.length === 1) return;
+    const layer = h('div', { class: 'sk-layer', 'data-kind': kind, role: 'status', 'aria-label': 'Loading' });
+    layer.append(document.getElementById('sk-' + kind).content.cloneNode(true));
+    view.replaceChildren(layer);
+    view.setAttribute('aria-busy', 'true');
+  }
   const errorBox = e => setView(h('div', { class: 'state' }, h('div', { class: 'big' }, '⚠️'), h('p', null, e.message),
     h('button', { class: 'btn btn-ghost', type: 'button', onclick: route }, 'Try again')));
   function backLink(href, text) {
@@ -178,6 +198,7 @@
 
   /* ================= router ================= */
   function route() {
+    viewId++;
     if (!token) return showLogin();
     tabs.hidden = false;
     document.getElementById('logout').hidden = false;
@@ -207,9 +228,11 @@
 
   /* ================= overview ================= */
   async function showOverview() {
-    loading();
+    const my = viewId;
+    loading('tiles');
     let d;
-    try { d = await api('GET', '/api/admin/overview'); } catch (e) { return errorBox(e); }
+    try { d = await api('GET', '/api/admin/overview'); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
     const s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
     setView(
@@ -229,9 +252,11 @@
 
   /* ================= students ================= */
   async function showStudents() {
-    loading();
+    const my = viewId;
+    loading('list');
     let users;
-    try { users = (await api('GET', '/api/admin/users')).users; } catch (e) { return errorBox(e); }
+    try { users = (await api('GET', '/api/admin/users')).users; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
 
     const search = h('input', { class: 'search', type: 'search', placeholder: 'Search by name or email…', 'aria-label': 'Search students' });
     const list = h('div', { class: 'admin-list' });
@@ -288,9 +313,11 @@
   }
 
   async function showStudent(id) {
-    loading();
+    const my = viewId;
+    loading('tiles');
     let d;
-    try { d = await api('GET', `/api/admin/users/${id}`); } catch (e) { return errorBox(e); }
+    try { d = await api('GET', `/api/admin/users/${id}`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
     const u = d.user, s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
 
@@ -426,9 +453,11 @@
 
   /* ================= lessons ================= */
   async function showLessons() {
-    loading();
+    const my = viewId;
+    loading('list');
     let lessons;
-    try { const d = await api('GET', '/api/admin/lessons'); lessons = d.lessons; levels = d.levels || levels; } catch (e) { return errorBox(e); }
+    try { const d = await api('GET', '/api/admin/lessons'); lessons = d.lessons; levels = d.levels || levels; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
 
     const list = h('ul', { class: 'admin-list' }, lessons.map(l => {
       const copy = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async e => {
@@ -487,7 +516,8 @@
 
   // ctx = { userId }: editing from a student's card. The lesson stays private to that student.
   async function showEditor(id, ctx) {
-    loading();
+    const my = viewId;
+    loading('list');
     const home = ctx ? `#/students/${ctx.userId}` : '#/lessons';
     let lesson = { title: '', emoji: '📘', slug: '', level: 'A1', description: '', sentences: [], published: true, visibility: ctx ? 'assigned' : 'public', assignedUserIds: [] };
     let users = [];
@@ -495,7 +525,8 @@
       const [l, u] = await Promise.all([id ? api('GET', `/api/admin/lessons/${id}`) : null, api('GET', '/api/admin/users')]);
       if (l) lesson = l.lesson;
       users = u.users;
-    } catch (e) { return errorBox(e); }
+    } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
     const owner = ctx ? users.find(x => x.id === ctx.userId) : null;
     if (ctx && !owner) return errorBox(new Error('Student not found.'));
     let slugTouched = Boolean(id);
@@ -691,9 +722,11 @@
   }
 
   async function showLessonProgress(id) {
-    loading();
+    const my = viewId;
+    loading('tiles');
     let d;
-    try { d = await api('GET', `/api/admin/lessons/${id}/progress`); } catch (e) { return errorBox(e); }
+    try { d = await api('GET', `/api/admin/lessons/${id}/progress`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    if (my !== viewId) return;
     const l = d.lesson;
     const st = d.students;
     const count = k => st.filter(x => x.progress.status === k).length;

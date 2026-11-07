@@ -24,8 +24,34 @@
       <a href="#/students" data-tab="students">👥 Students</a>
       <a href="#/lessons" data-tab="lessons">📚 Lessons</a>
     </nav>
-    <main id="view"></main>
+    <main id="view" aria-busy="true">{{SKELETON}}</main>
   </div>
+
+  <!-- Skeleton screens (see index.html). Same idea: painted from the first byte, cloned again while data loads. -->
+  <template id="sk-tiles">
+    <div class="head-row"><i class="sk sk-title sk-admin-title"></i><i class="sk sk-btn-sm sk-admin-btn"></i></div>
+    <div class="tiles">
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+      <div class="tile-stat"><i class="sk sk-tile-v"></i><i class="sk sk-line w-70 sm"></i></div>
+    </div>
+    <div class="panel"><i class="sk sk-line w-50 lg"></i><div class="sk sk-chart"></div></div>
+    <div class="panel"><i class="sk sk-line w-30 lg"></i><div class="sk-rows"><i class="sk sk-row"></i><i class="sk sk-row"></i><i class="sk sk-row"></i></div></div>
+  </template>
+
+  <template id="sk-list">
+    <div class="head-row"><i class="sk sk-title sk-admin-title"></i><i class="sk sk-btn-sm sk-admin-btn"></i></div>
+    <div class="sk sk-search"></div>
+    <ul class="admin-list">
+      <li class="admin-item sk-item"><i class="sk sk-avatar"></i><div class="info"><i class="sk sk-line w-50"></i><i class="sk sk-line w-90 sm"></i></div></li>
+      <li class="admin-item sk-item"><i class="sk sk-avatar"></i><div class="info"><i class="sk sk-line w-50"></i><i class="sk sk-line w-90 sm"></i></div></li>
+      <li class="admin-item sk-item"><i class="sk sk-avatar"></i><div class="info"><i class="sk sk-line w-50"></i><i class="sk sk-line w-90 sm"></i></div></li>
+      <li class="admin-item sk-item"><i class="sk sk-avatar"></i><div class="info"><i class="sk sk-line w-50"></i><i class="sk sk-line w-90 sm"></i></div></li>
+    </ul>
+  </template>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/vendor/Sortable.min.js"></script>
   <script src="/admin.js"></script>
