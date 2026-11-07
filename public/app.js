@@ -29,6 +29,18 @@
   /* ================================================================ */
   /* Utilities                                                         */
   /* ================================================================ */
+  // Phones from before 2020 do not have replaceChildren; this keeps every screen working on them.
+  if (!Element.prototype.replaceChildren) {
+    Element.prototype.replaceChildren = function (...nodes) {
+      while (this.firstChild) this.removeChild(this.firstChild);
+      this.append(...nodes);
+    };
+  }
+
+  const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const toNum = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const clampNum = (v, min, max) => Math.min(max, Math.max(min, toNum(v)));
+
   function h(tag, attrs, ...children) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -42,15 +54,32 @@
     return el;
   }
 
+  // Everything read from the device is treated as untrusted: it may be missing, damaged or from an older version.
   const storage = {
     get(key, fallback) {
       try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch (e) { return fallback; }
     },
-    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode */ } },
+    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode or full */ } },
   };
 
-  const settings = Object.assign({ sound: true }, storage.get('ws:settings', {}));
+  const settings = (() => {
+    const saved = storage.get('ws:settings', null);
+    return { sound: isObj(saved) && typeof saved.sound === 'boolean' ? saved.sound : true };
+  })();
   const saveSettings = () => storage.set('ws:settings', settings);
+
+  // Timers that belong to the screen on display (spoken sentences, the peek). They are all cancelled when the
+  // student leaves, so nothing speaks or changes on a screen that is no longer there.
+  const screenTimers = new Set();
+  function later(fn, ms) {
+    const id = setTimeout(() => { screenTimers.delete(id); fn(); }, ms);
+    screenTimers.add(id);
+    return id;
+  }
+  function clearScreenTimers() { screenTimers.forEach(clearTimeout); screenTimers.clear(); }
+
+  // Restarts a CSS animation (remove the class, force one reflow, add it back).
+  function restartAnimation(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
 
   let toastTimer;
   function toast(msg) {
@@ -73,39 +102,54 @@
   let me = null;
   let config = { appName: APP_NAME, allowSignup: true };
 
+  const REQUEST_TIMEOUT_MS = 20000;
+
   async function api(method, url, body) {
-    const res = await fetch(url, {
-      method,
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}) },
-      body: method === 'GET' ? undefined : JSON.stringify(body || {}),
-    });
-    if (res.status === 204) return {};
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const e = new Error(data.error || `Something went wrong (${res.status}).`);
-      e.status = res.status;
-      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; dropData(); goLogin(); }
-      if (res.status === 403 && /disabled/i.test(e.message)) { me = null; toast(e.message); goLogin(); }
-      throw e;
+    // A request that never answers (bad signal) is cut off, so it cannot block everything queued behind it.
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS) : 0;
+    try {
+      const res = await fetch(url, {
+        method,
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}) },
+        body: method === 'GET' ? undefined : JSON.stringify(body || {}),
+        signal: ctl ? ctl.signal : undefined,
+      });
+      if (res.status === 204) return {};
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const e = new Error((isObj(data) && data.error) || `Something went wrong (${res.status}).`);
+        e.status = res.status;
+        if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; dropData(); goLogin(); }
+        if (res.status === 403 && /disabled/i.test(e.message)) { me = null; toast(e.message); goLogin(); }
+        throw e;
+      }
+      return data;
+    } finally {
+      clearTimeout(timer);
     }
-    return data;
   }
 
   /* ---------- Offline-safe progress saving ---------- */
   // Progress calls go through an outbox: if the network fails they are kept and sent later,
   // so a finished sentence is never lost.
+  const OUTBOX_MAX = 500; // a very long offline stretch must not fill the device
+  const isRetryable = e => !e.status || e.status >= 500 || e.status === 429; // network trouble: keep and try again
   const outbox = {
     key: 'ws:outbox',
-    items() { return storage.get(this.key, []); },
-    save(list) { storage.set(this.key, list); },
+    items() {
+      const v = storage.get(this.key, []);
+      return Array.isArray(v) ? v.filter(i => isObj(i) && typeof i.url === 'string' && typeof i.id === 'string') : [];
+    },
+    save(list) { storage.set(this.key, list.slice(-OUTBOX_MAX)); },
     flushing: false,
     async send(url, body) {
       const item = { id: uid(), user: me && me.id, url, body };
       try {
         return await api('POST', url, body);
       } catch (e) {
-        if (!e.status || e.status >= 500 || e.status === 429) {
+        if (isRetryable(e)) {
           this.save([...this.items(), item]);
           return null;
         }
@@ -122,30 +166,102 @@
           try {
             await api('POST', item.url, item.body); sent++;
           } catch (e) {
-            if (!e.status || e.status >= 500 || e.status === 429 || e.status === 401) break; // try again later
+            if (isRetryable(e) || e.status === 401) break; // try again later
           }
           this.save(this.items().filter(x => x.id !== item.id));
         }
+      } catch (e) {
+        /* the queue is kept; the next flush tries again */
       } finally {
         this.flushing = false;
         if (sent) scheduleSync(400);
       }
     },
   };
-  window.addEventListener('online', () => outbox.flush());
+  window.addEventListener('online', () => { outbox.flush(); });
 
   /* ---------- The student's data: in memory and on the device ---------- */
   // Everything the app needs (lessons, sentences, the student's own progress) is loaded once with GET /api/app and
   // saved on the device. It is read synchronously when the script starts, so every screen opens at once, with no
   // waiting for the network. Progress is applied here first (same rules as the server) and sent in the background.
-  let S = storage.get('ws:app', null); // { user, stats, lessons: [...] }
+  const APP_KEY = 'ws:app';
+  const APP_VERSION = 1; // bump when the saved shape changes; older copies are then ignored and fetched again
+
+  // Checks and cleans a copy of the student's data (from the server or from the device). Anything that is not
+  // exactly the shape the screens expect is dropped, so damaged data can never break a screen.
+  function sanitizeApp(d) {
+    try {
+      if (!isObj(d) || !isObj(d.user) || typeof d.user.id !== 'string' || !Array.isArray(d.lessons)) return null;
+      const st = isObj(d.stats) ? d.stats : {};
+      const text = v => (v === null || v === undefined ? '' : String(v));
+      const lessons = [];
+      for (const l of d.lessons) {
+        if (!isObj(l) || typeof l.slug !== 'string' || !Array.isArray(l.units)) continue;
+        const units = [];
+        for (const u of l.units) {
+          if (!isObj(u) || typeof u.id !== 'string' || !Array.isArray(u.sentences)) continue;
+          units.push({
+            id: u.id,
+            title: text(u.title),
+            sentences: u.sentences.filter(x => isObj(x) && typeof x.en === 'string' && x.en.trim())
+              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3) })),
+          });
+        }
+        if (!units.length) continue;
+        const lp = isObj(l.lp) ? l.lp : null;
+        lessons.push({
+          slug: l.slug, title: text(l.title), level: text(l.level), description: text(l.description), emoji: text(l.emoji) || '📘',
+          assigned: Boolean(l.assigned),
+          units,
+          lp: lp ? { started_at: lp.started_at || null, last_activity_at: lp.last_activity_at || null, completed_at: lp.completed_at || null, time_spent_sec: toNum(lp.time_spent_sec) } : null,
+          unitRows: (Array.isArray(l.unitRows) ? l.unitRows : []).filter(r => isObj(r) && typeof r.unit_id === 'string')
+            .map(r => ({ unit_id: r.unit_id, learn_index: toNum(r.learn_index), learned_at: r.learned_at || null })),
+        });
+      }
+      return {
+        user: { id: d.user.id, name: text(d.user.name), email: text(d.user.email), createdAt: d.user.createdAt || null },
+        stats: { sentencesSolved: toNum(st.sentencesSolved), stars: toNum(st.stars), extraStars: toNum(st.extraStars),
+          lessonsCompleted: toNum(st.lessonsCompleted), timeSpent: toNum(st.timeSpent), streak: toNum(st.streak) },
+        lessons,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function loadSaved() {
+    const saved = storage.get(APP_KEY, null);
+    // Older releases saved the data itself; newer ones wrap it with a version number.
+    return sanitizeApp(isObj(saved) && saved.v === APP_VERSION ? saved.data : saved);
+  }
+
+  let S = null;                        // { user, stats, lessons: [...] }
+  let bySlug = new Map();              // slug -> lesson, for instant lookups
+  const setData = d => { S = d; bySlug = new Map(d ? d.lessons.map(l => [l.slug, l]) : []); };
+  setData(loadSaved());                // read once, synchronously, when the script starts
+
   let synced = false;                  // true once this visit has heard from the server
   let rev = 0;                         // counts local changes, so a late server answer can never undo them
   let rerender = null;                 // redraws the current screen from S (only for screens that just display data)
   const models = new WeakMap();
-  const saveData = () => storage.set('ws:app', S);
-  const dropData = () => { S = null; synced = false; storage.set('ws:app', null); storage.set('ws:home', null); };
-  const rawLesson = slug => (S ? S.lessons.find(l => l.slug === slug) || null : null);
+
+  // Saving is batched: a burst of changes (a sentence solved, then the next...) is written once, shortly after,
+  // instead of re-writing the whole copy every time. It is also written the moment the page is hidden or closed.
+  let saveTimer = 0;
+  function writeData() {
+    saveTimer = 0;
+    storage.set(APP_KEY, S ? { v: APP_VERSION, data: S } : null);
+  }
+  const saveData = () => { if (!saveTimer) saveTimer = setTimeout(writeData, 250); };
+  function flushData() { if (saveTimer) { clearTimeout(saveTimer); writeData(); } }
+  const dropData = () => {
+    clearTimeout(saveTimer); saveTimer = 0;
+    setData(null); synced = false;
+    storage.set(APP_KEY, null); storage.set('ws:home', null);
+  };
+  window.addEventListener('pagehide', flushData);
+
+  const rawLesson = slug => bySlug.get(slug) || null;
   const modelOf = raw => { let m = models.get(raw); if (!m) models.set(raw, m = Progress.modelOf(raw)); return m; };
 
   const lessonList = () => S.lessons.map(l => ({
@@ -177,18 +293,26 @@
   }
 
   // Asks the server for the latest and quietly swaps it in. If the student did something meanwhile, or progress
-  // is still waiting to be sent, the (older) answer is ignored and we ask again a moment later.
-  let syncing = false, syncTimer = 0;
+  // is still waiting to be sent, the (older) answer is ignored and we ask again a moment later, waiting longer
+  // each time (so a long offline stretch costs no battery).
+  let syncing = false, syncTimer = 0, syncMisses = 0;
   function scheduleSync(ms) { clearTimeout(syncTimer); syncTimer = setTimeout(refresh, ms == null ? 1500 : ms); }
   async function refresh() {
     if (syncing) return;
     syncing = true;
     const startRev = rev, hadData = Boolean(S);
     try {
-      const d = await api('GET', '/api/app');
-      if (startRev !== rev || outbox.items().length) { scheduleSync(1500); return; }
+      const d = sanitizeApp(await api('GET', '/api/app'));
+      if (!d) throw new Error('Unexpected answer from the server.');
+      if (startRev !== rev || outbox.items().length) {
+        outbox.flush();
+        syncMisses = Math.min(syncMisses + 1, 5);
+        scheduleSync(Math.min(30000, 1500 * 2 ** syncMisses));
+        return;
+      }
+      syncMisses = 0;
       const changed = JSON.stringify(d) !== JSON.stringify(S);
-      S = d; me = d.user; synced = true; saveData();
+      setData(d); me = d.user; synced = true; saveData();
       if (!hadData || app.querySelector(':scope > .sk-layer')) route();        // a screen was waiting for data
       else if (changed && rerender) rerender();
     } catch (e) {
@@ -197,7 +321,10 @@
       syncing = false;
     }
   }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && me) { outbox.flush(); scheduleSync(200); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) flushData();
+    else if (me) { outbox.flush(); scheduleSync(200); }
+  });
 
   /* ---------- Sound, speech, confetti ---------- */
   let audioCtx;
@@ -205,7 +332,7 @@
     if (!settings.sound) return;
     try {
       audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
+      if (audioCtx.state === 'suspended') { const r = audioCtx.resume(); if (r && r.catch) r.catch(() => {}); }
       const o = audioCtx.createOscillator(), g = audioCtx.createGain(), s = audioCtx.currentTime + at;
       o.type = type || 'triangle'; o.frequency.value = freq;
       g.gain.setValueAtTime(0.16, s); g.gain.exponentialRampToValueAtTime(0.001, s + dur);
@@ -231,22 +358,26 @@
   }
   if (canSpeak) { pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
   function speak(text, slow, onEnd) {
-    if (!canSpeak) return;
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = voice ? voice.lang : 'en-US';
-    if (voice) u.voice = voice;
-    u.rate = slow ? 0.6 : 0.9;
-    if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
-    speechSynthesis.speak(u);
+    if (!canSpeak || !text) { if (onEnd) onEnd(); return; }
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(String(text));
+      u.lang = voice ? voice.lang : 'en-US';
+      if (voice) u.voice = voice;
+      u.rate = slow ? 0.6 : 0.9;
+      if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
+      speechSynthesis.speak(u);
+    } catch (e) {
+      if (onEnd) onEnd(); // speech is a bonus; the lesson goes on without it
+    }
   }
-  const stopSpeech = () => { if (canSpeak) speechSynthesis.cancel(); };
+  const stopSpeech = () => { if (canSpeak) { try { speechSynthesis.cancel(); } catch (e) { /* ignore */ } } };
 
   const cv = document.getElementById('confetti');
-  const cx = cv.getContext('2d');
+  const cx = cv && cv.getContext ? cv.getContext('2d') : null;
   let confettiRun = 0;
   function confetti(n) {
-    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (!cx || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     const run = ++confettiRun;
     cv.width = innerWidth; cv.height = innerHeight;
     const cols = ['#4F5BD5', '#8C96FF', '#F2A516', '#2F9E5B', '#18181B'];
@@ -280,11 +411,20 @@
   }
 
   const ABBR = /(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|No|e\.g|i\.e|a\.m|p\.m|U\.S|U\.K|[A-Z])\.$/i;
+  // Cuts a line after every . ! ? … that is followed by spaces (the punctuation stays with its sentence).
+  function splitAfterPunctuation(line) {
+    const parts = [];
+    const re = /[.!?…]\s+/g;
+    let last = 0, m;
+    while ((m = re.exec(line))) { parts.push(line.slice(last, m.index + 1)); last = m.index + m[0].length; }
+    parts.push(line.slice(last));
+    return parts;
+  }
   function splitSentences(text) {
     const out = [];
-    for (const line of text.replace(/\r/g, '').split(/\n+/)) {
+    for (const line of String(text).replace(/\r/g, '').split(/\n+/)) {
       let buf = '';
-      for (const part of line.split(/(?<=[.!?…])\s+/)) {
+      for (const part of splitAfterPunctuation(line)) {
         buf = buf ? buf + ' ' + part : part;
         if (!ABBR.test(buf)) { out.push(buf.trim()); buf = ''; }
       }
@@ -314,7 +454,12 @@
   let cleanup = null;
   let viewId = 0; // changes on every navigation, so a slow response can't draw over a newer screen
   function navigate(path, replace) {
-    if (replace) history.replaceState(null, '', path); else history.pushState(null, '', path);
+    try {
+      // Opening the page you are already on must not add a second history entry.
+      if (replace || path === location.pathname + location.search) history.replaceState(null, '', path); else history.pushState(null, '', path);
+    } catch (e) {
+      try { history.replaceState(null, '', '/'); } catch (e2) { /* keep the current address */ }
+    }
     route();
   }
   function goLogin() {
@@ -323,13 +468,51 @@
     navigate('/login' + (here && here !== '/' ? `?next=${encodeURIComponent(here)}` : ''), true);
   }
 
+  // Remembers how far each list screen was scrolled, so coming back (the arrow, or the phone's back button)
+  // lands exactly where the student left, e.g. on the lesson they just opened, not at the top.
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  const scrollPos = new Map(); // "/path?query" -> scrollY
+  const SCROLL_MEMORY_MAX = 200;
+  let shownKey = null;         // the screen that is on display now
+  let scrollQueued = false;
+  // Scrolling fires very often; the position is noted at most once per frame.
+  window.addEventListener('scroll', () => {
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      if (!shownKey) return;
+      scrollPos.delete(shownKey); // re-insert so the most recent screens are the ones kept
+      scrollPos.set(shownKey, window.scrollY);
+      if (scrollPos.size > SCROLL_MEMORY_MAX) scrollPos.delete(scrollPos.keys().next().value);
+    });
+  }, { passive: true });
+  const isListScreen = p => p === '/' || p === '/completed' || /^\/lesson\/[a-z0-9-]+$/.test(p);
+
   function route() {
     viewId++;
     rerender = null;
-    if (cleanup) { cleanup(); cleanup = null; }
+    if (cleanup) { try { cleanup(); } catch (e) { /* the old screen is gone either way */ } cleanup = null; }
+    clearScreenTimers();
     stopSpeech();
-    window.scrollTo(0, 0);
     const path = location.pathname.replace(/\/+$/, '') || '/';
+    const key = location.pathname + location.search;
+    const back = isListScreen(path) ? scrollPos.get(key) || 0 : 0;
+    shownKey = null; // ignore the scroll jumps caused by swapping the screen
+    const id = viewId;
+    try {
+      dispatch(path);
+    } catch (e) {
+      // One screen failing must not leave a blank page: show the normal "try again" screen instead.
+      console.error(e);
+      try { errorView({ message: 'Something went wrong. Please try again.' }, route); } catch (e2) { /* nothing more to do */ }
+    }
+    if (id !== viewId) return; // the screen sent us elsewhere; that route has already taken care of the scroll
+    window.scrollTo(0, back);
+    shownKey = key;
+  }
+
+  function dispatch(path) {
     if (path === '/login') return showAuth('login');
     if (path === '/signup') return showAuth('signup');
     if (!me) return goLogin();
@@ -339,6 +522,7 @@
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/(learn|build|review)$/))) return navigate(`/lesson/${m[1]}`, true);
     if (path === '/practice') return showPractice();
     if (path === '/profile') return showProfile();
+    if (path === '/completed') return showCompleted();
     if (path !== '/') history.replaceState(null, '', '/');
     showHome();
   }
@@ -347,6 +531,7 @@
     const a = e.target.closest('a[data-link]');
     if (!a || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
     e.preventDefault();
+    if (a.hasAttribute('data-top')) scrollPos.delete(a.getAttribute('href')); // a fresh start at the top, not the old spot
     navigate(a.getAttribute('href'));
   });
   app.addEventListener('contextmenu', e => { if (e.target.closest('.tile')) e.preventDefault(); });
@@ -410,7 +595,8 @@
     const isSignup = mode === 'signup';
     document.title = `${isSignup ? 'Sign up' : 'Log in'} · ${config.appName}`;
     const next = new URLSearchParams(location.search).get('next');
-    const safeNext = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+    // Only an address inside this app is accepted: starts with a single '/', plain printable characters.
+    const safeNext = typeof next === 'string' && /^\/(?![/\\])[\x21-\x7e]*$/.test(next) ? next : '/';
     const msg = h('p', { class: 'form-msg', role: 'alert' });
     const name = h('input', { id: 'f-name', type: 'text', autocomplete: 'name', required: true, maxlength: '60', placeholder: 'e.g. Sara Ahmed' });
     const email = h('input', { id: 'f-email', type: 'email', autocomplete: 'email', required: true, maxlength: '254', placeholder: 'you@example.com', inputmode: 'email' });
@@ -435,7 +621,9 @@
         if (isSignup) body.name = name.value;
         await api('POST', isSignup ? '/api/auth/signup' : '/api/auth/login', body);
         dropData(); // never keep anything that belongs to someone else
-        S = await api('GET', '/api/app'); me = S.user; synced = true; saveData();
+        const fresh = sanitizeApp(await api('GET', '/api/app'));
+        if (!fresh) throw new Error('Unexpected answer from the server. Please try again.');
+        setData(fresh); me = fresh.user; synced = true; saveData();
         outbox.flush();
         navigate(safeNext, true);
         if (isSignup) toast(`Welcome, ${me.name}`);
@@ -465,13 +653,6 @@
   /* ================================================================ */
   let levelFilter = storage.get('ws:level', 'All');
 
-  const STATUS_LABEL = {
-    new: 'New',
-    learning: 'Learning',
-    building: 'In progress',
-    completed: 'Completed',
-  };
-
   function statusText(p) {
     if (p.completed) return '✓ Completed';
     if (p.status === 'new' || p.currentUnit === null) return 'New';
@@ -495,9 +676,12 @@
     outbox.flush();
   }
 
-  function renderHome(lessons, stats) {
+  function renderHome(all, stats) {
+    // Finished lessons move to their own page, so this list only holds what is still to do.
+    const lessons = all.filter(l => !l.progress.completed);
+    const finished = all.filter(l => l.progress.completed);
     const cont = lessons
-      .filter(l => !l.progress.completed && l.progress.lastActivityAt)
+      .filter(l => l.progress.lastActivityAt)
       .sort((a, b) => new Date(b.progress.lastActivityAt) - new Date(a.progress.lastActivityAt))[0];
     const assigned = lessons.filter(l => l.assigned);
 
@@ -535,14 +719,48 @@
         statTile('flame', stats.streak, 'Streak'),
         statTile('trophy', stats.lessonsCompleted, 'Lessons')),
       cont ? continueCard(cont) : null,
+      finished.length ? completedLink(finished) : null,
       assigned.length ? h('section', { class: 'section' },
         h('h2', null, 'For you'),
         h('div', { class: 'lesson-grid' }, assigned.map(lessonCard))) : null,
       h('section', { class: 'section' },
         h('h2', null, 'All lessons'),
-        lessons.length ? chips : h('p', { class: 'empty' }, 'No lessons yet. Your teacher will add some soon.'),
+        lessons.length ? chips : h('p', { class: 'empty' }, finished.length ? 'You finished every lesson! 🎉 Play your own text below, or open a finished lesson to play it again.' : 'No lessons yet. Your teacher will add some soon.'),
         grid)
     );
+  }
+
+  function completedLink(finished) {
+    const stars = finished.reduce((a, l) => a + l.progress.stars, 0);
+    return h('a', { class: 'lesson-card card-done', href: '/completed', 'data-link': true },
+      h('span', { class: 'emoji', html: ICON.trophy }),
+      h('div', { class: 'body' },
+        h('div', { class: 'title' }, 'Completed lessons'),
+        h('div', { class: 'desc' }, `${plural(finished.length, 'lesson')} finished · ★ ${stars}`)),
+      h('span', { class: 'chev', html: ICON.next }));
+  }
+
+  // Every lesson the student has finished (open one to see the stars or play it again).
+  function showCompleted() {
+    document.title = `Completed lessons · ${config.appName}`;
+    if (!S) return showSkeleton('home');
+    const draw = () => {
+      const done = lessonList().filter(l => l.progress.completed)
+        .sort((a, b) => new Date(b.progress.completedAt || 0) - new Date(a.progress.completedAt || 0));
+      const stars = done.reduce((a, l) => a + l.progress.stars, 0);
+      setView(
+        h('header', { class: 'appbar' },
+          h('a', { class: 'icon-btn', href: '/', 'data-link': true, 'aria-label': 'Back to lessons', html: ICON.back }),
+          h('div', { class: 'tools' }, soundButton())),
+        h('h1', null, 'Completed lessons 🏆'),
+        h('p', { class: 'subtitle' }, done.length ? `${plural(done.length, 'lesson')} finished · ★ ${stars} stars` : 'Finish a lesson and it will come here.'),
+        done.length
+          ? h('div', { class: 'lesson-grid' }, done.map(lessonCard))
+          : h('div', { class: 'state' }, h('div', { class: 'big', 'aria-hidden': 'true' }, '🏆'), h('p', null, 'No finished lessons yet. Keep going, you can do it! 💪'),
+              h('a', { class: 'btn btn-primary', href: '/', 'data-link': true }, 'Go to my lessons')));
+    };
+    rerender = draw;
+    draw();
   }
 
   function statTile(iconName, value, label, sub) {
@@ -701,7 +919,7 @@
           h('summary', null, 'More options'),
           h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' Start lesson over', onclick: restartLesson }),
           h('p', { class: 'muted' }, 'Replay everything from Unit 1. Your saved progress is never lost, and better results count as extra stars.')) : null,
-        p.completed ? h('div', { class: 'hub-actions' }, h('a', { class: 'btn btn-primary btn-block', href: '/', 'data-link': true }, 'Choose another lesson')) : null)
+        p.completed ? h('div', { class: 'hub-actions' }, h('a', { class: 'btn btn-primary btn-block', href: '/', 'data-link': true, 'data-top': true }, 'Choose another lesson')) : null)
     );
   }
 
@@ -739,6 +957,7 @@
     document.title = `Learn · ${lesson.title} · ${config.appName}`;
     const sentences = unit.sentences;
     const total = sentences.length;
+    if (!total) return navigate(`/lesson/${slug}`, true); // a unit without sentences has nothing to learn
     const learnUrl = `/api/lessons/${slug}/units/${unit.id}/learn`;
     // Progress is saved on the device at once and sent to the server in the background.
     const sendLearn = (index, done, seconds) => {
@@ -805,13 +1024,13 @@
         h('span', { class: 'word', role: 'button', tabindex: '0', onclick: () => speak(stripEdges(w) || w, true),
           onkeydown: e => { if (e.key === 'Enter') speak(stripEdges(w) || w, true); } }, w),
       ]));
-      card.classList.remove('flip-in'); void card.offsetWidth; card.classList.add('flip-in');
+      restartAnimation(card, 'flip-in');
       prev.disabled = i === 0;
       next.innerHTML = i === total - 1 ? (restart || !up.learned ? 'Start building ' : 'Done ') + ICON.next : 'Next ' + ICON.next;
       next.className = 'btn ' + (i === total - 1 ? 'btn-accent' : 'btn-primary');
       prev.className = 'btn btn-ghost';
       shownAt = Date.now();
-      if (autoSpeak && settings.sound) setTimeout(() => speakCard(false), 250);
+      if (autoSpeak && settings.sound) later(() => speakCard(false), 250);
     }
 
     const secondsOnCard = () => Math.min(120, Math.round((Date.now() - shownAt) / 1000));
@@ -872,7 +1091,8 @@
    * @param o.mode     'build' | 'review' | 'practice'
    */
   function runPuzzle(o) {
-    const { lesson, slug, items, mode, exitPath, unit, unitIndex, restart, chain } = o;
+    const { lesson, slug, items, mode, exitPath, unit, unitIndex, chain } = o;
+    if (!Array.isArray(items) || !items.length) return navigate(exitPath || '/', true); // nothing to play
     const tracked = Boolean(slug);
     const total = tracked ? unit.sentences.length : items.length;
     let doneCount = tracked && mode === 'build' ? unit.sentences.filter(s => s.stars).length : 0;
@@ -941,7 +1161,7 @@
       sortables.forEach(s => s.option('disabled', false));
       updateBar();
       // The sentence is read aloud first, so the child can listen and then build it.
-      if (settings.sound && canSpeak) { const r = round; setTimeout(() => { if (round === r && !r.solved) speak(r.sentence); }, 350); }
+      if (settings.sound && canSpeak) { const r = round; later(() => { if (round === r && !r.solved) speak(r.sentence); }, 350); }
     }
 
     function updateLeft() {
@@ -987,7 +1207,7 @@
         h('div', { class: 'sentence' }, round.sentence),
         h('div', { class: 'stars', 'aria-label': `${s} of 3 stars` }, starNodes(s)));
       solvedPanel.hidden = false;
-      solvedPanel.classList.remove('pop'); void solvedPanel.offsetWidth; solvedPanel.classList.add('pop');
+      restartAnimation(solvedPanel, 'pop');
       // Practising a sentence again: a better result than before is added as extra stars.
       if (local && local.replay && local.extra > 0)
         solvedPanel.append(h('div', { class: 'extra-tag' }, `+${local.extra} extra ${local.extra === 1 ? 'star' : 'stars'} added to your score!`));
@@ -998,7 +1218,7 @@
       nextBtn.innerHTML = (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next;
       nextBtn.focus({ preventScroll: true });
       sfx.win(); confetti(40);
-      if (settings.sound) setTimeout(() => speak(round.sentence), 450);
+      if (settings.sound) later(() => speak(round.sentence), 450);
     }
 
     function hint() {
@@ -1011,7 +1231,7 @@
       if (!tile) return;
       answer.insertBefore(tile, answer.children[i] || null);
       round.hints++;
-      tile.classList.remove('flash'); void tile.offsetWidth; tile.classList.add('flash');
+      restartAnimation(tile, 'flash');
       sfx.hint();
       afterChange(true);
       if (!round.solved && pool.children.length) { feedback.textContent = `“${want}” is word ${i + 1}.`; feedback.className = 'feedback'; }
@@ -1055,13 +1275,14 @@
       feedback.textContent = round.sentence; feedback.className = 'feedback peek';
       sfx.hint();
       const r = round;
-      peekTimer = setTimeout(() => { if (round === r && !r.solved && feedback.classList.contains('peek')) { feedback.textContent = ''; feedback.className = 'feedback'; } }, 3000);
+      peekTimer = later(() => { if (round === r && !r.solved && feedback.classList.contains('peek')) { feedback.textContent = ''; feedback.className = 'feedback'; } }, 3000);
     });
     prevBtn.addEventListener('click', () => { stopSpeech(); if (pos > 0) { pos--; loadRound(); window.scrollTo(0, 0); } });
     resetBtn.addEventListener('click', resetRound);
     hintBtn.addEventListener('click', hint);
     listenBtn.addEventListener('click', () => speak(round.sentence));
     nextBtn.addEventListener('click', () => {
+      clearScreenTimers();
       stopSpeech();
       if (++pos < items.length) { loadRound(); window.scrollTo(0, 0); } else finish();
     });
@@ -1097,7 +1318,7 @@
             nextUnit.title, h('span', { html: ICON.next })));
         actions.append(h('a', { class: 'btn ' + (actions.children.length ? 'btn-ghost' : 'btn-primary'), href: `/lesson/${slug}`, 'data-link': true }, 'Back to lesson'));
         if (mode === 'review' && weak.length) actions.append(h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => runPuzzle({ ...o, items: weak }) }, `Practise ${plural(weak.length, 'hard sentence')}`));
-        actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true }, 'All lessons'));
+        actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true, 'data-top': true }, 'All lessons'));
       } else {
         if (weak.length) actions.append(h('button', { class: 'btn btn-primary', type: 'button', onclick: () => runPuzzle({ ...o, items: weak }) }, `Practise ${plural(weak.length, 'hard sentence')}`));
         actions.append(h('button', { class: 'btn ' + (weak.length ? 'btn-ghost' : 'btn-primary'), type: 'button', onclick: () => runPuzzle(o) }, 'Play again'));
@@ -1243,7 +1464,7 @@
     // First visit: the skeleton from the HTML stays until the first answer arrives.
     if (S) { me = S.user; route(); }
     await Promise.all([cfg, refresh()]);
-  })();
+  })().catch(e => console.error(e));
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
     window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));

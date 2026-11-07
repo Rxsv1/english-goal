@@ -14,7 +14,14 @@ function createPool() {
   }
   const ssl = /^(1|true|require)$/i.test(process.env.PGSSL || '') ? { rejectUnauthorized: false } : undefined;
   // pg also reads PGPASSWORD / PGUSER / PGHOST etc. for anything missing from DATABASE_URL.
-  return new Pool({ connectionString: process.env.DATABASE_URL, ssl, max: 10 });
+  return new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl,
+    max: 10,
+    connectionTimeoutMillis: 10000, // fail fast instead of queueing forever when the database is unreachable
+    idleTimeoutMillis: 30000,
+    statement_timeout: 30000,       // one runaway query must not hold a connection for ever
+  });
 }
 
 /** Creates or upgrades all tables. Safe to run on every start. */
@@ -129,8 +136,10 @@ async function migrate(pool) {
     }
     if (old.rows.length) console.log(`[db] Upgraded ${old.rows.length} lessons to units`);
 
-    const { rows } = await client.query('SELECT COUNT(*)::int AS n FROM lessons');
-    if (rows[0].n === 0) {
+    // Starter lessons go into a brand-new database only. A teacher who deleted every lesson on purpose
+    // (and already has students) must not see them come back after a restart.
+    const { rows } = await client.query('SELECT (SELECT COUNT(*) FROM lessons)::int AS lessons, (SELECT COUNT(*) FROM users)::int AS users');
+    if (rows[0].lessons === 0 && rows[0].users === 0) {
       for (const [i, l] of seed.entries()) {
         await client.query(
           `INSERT INTO lessons (id, slug, title, level, description, emoji, published, position, units, sentences)

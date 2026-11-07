@@ -663,3 +663,7 @@ details.start-over { margin: 12px 0 0; text-align: center; }
   animation: busy-bar 1s linear infinite;
 }
 @keyframes busy-bar { from { background-position: -40% 0; } to { background-position: 140% 0; } }
+
+.card-done { margin-top: 16px; }
+.card-done .emoji { background: var(--success); color: var(--success-text); }
+.card-done .emoji svg { width: 24px; height: 24px; }

@@ -13,6 +13,32 @@
   let viewId = 0; // changes on every navigation, so a slow response can't draw over a newer screen
 
   /* ================= helpers ================= */
+  // Phones and tablets from before 2020 do not have replaceChildren; this keeps every screen working on them.
+  if (!Element.prototype.replaceChildren) {
+    Element.prototype.replaceChildren = function (...nodes) {
+      while (this.firstChild) this.removeChild(this.firstChild);
+      this.append(...nodes);
+    };
+  }
+
+  // Runs `fn` at most once per frame, however often it is called (typing, scrolling...).
+  function oncePerFrame(fn) {
+    let queued = false;
+    return () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; fn(); });
+    };
+  }
+
+  // The list of lessons uses drag-and-drop; it is torn down before that screen is replaced or drawn again.
+  let activeSortable = null;
+  function disposeSortable() {
+    if (!activeSortable) return;
+    try { activeSortable.destroy(); } catch (e) { /* already gone */ }
+    activeSortable = null;
+  }
+
   function h(tag, attrs, ...children) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
@@ -35,19 +61,32 @@
     clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
   }
 
+  const REQUEST_TIMEOUT_MS = 30000;
+
   async function api(method, url, body, raw) {
     if (method !== 'GET') cache.clear(); // anything we change makes the remembered pages out of date
-    const res = await fetch(url, {
-      method,
-      headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: 'Bearer ' + token } : {}) },
-      body: method === 'GET' ? undefined : JSON.stringify(body || {}),
-    });
-    if (res.status === 401 && url !== '/api/admin/login') { logout(); throw new Error('Your session expired. Please log in again.'); }
-    if (raw && res.ok) return res;
-    if (res.status === 204) return {};
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-    return data;
+    // A request that never answers (bad signal) is cut off instead of leaving the screen waiting for ever.
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS) : 0;
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: method === 'GET' ? undefined : JSON.stringify(body || {}),
+        signal: ctl ? ctl.signal : undefined,
+      });
+      if (res.status === 401 && url !== '/api/admin/login') { logout(); throw new Error('Your session expired. Please log in again.'); }
+      if (raw && res.ok) return res;
+      if (res.status === 204) return {};
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);
+      return data;
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('The server took too long to answer. Please try again.');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /* Pages already seen are kept in memory, so opening them again is instant. They are refreshed quietly in the
@@ -159,7 +198,8 @@
     return a;
   }
 
-  function describeEvent(e) {
+  function describeEvent(ev) {
+    const e = { ...ev, data: ev && ev.data && typeof ev.data === 'object' ? ev.data : {} };
     const L = e.lessonTitle ? `“${e.lessonTitle}”` : 'a lesson';
     switch (e.type) {
       case 'signup': return ['🆕', 'joined'];
@@ -233,12 +273,16 @@
   }
 
   /* ================= router ================= */
+  const SAFE_SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
+
   function route(keepScroll) {
     viewId++;
+    disposeSortable();
     if (!token) return showLogin();
     tabs.hidden = false;
     document.getElementById('logout').hidden = false;
-    const parts = (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean);
+    let parts = (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean).slice(0, 5);
+    if (!parts.every(x => SAFE_SEGMENT.test(x))) parts = []; // an odd address just opens the overview
     const tab = parts[0] || 'overview';
     tabs.querySelectorAll('a').forEach(a => { if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
     if (keepScroll !== true) window.scrollTo(0, 0);
@@ -255,9 +299,15 @@
     }
     showOverview();
   }
+  let shownHash = location.hash; // the address of the screen on display
   window.addEventListener('hashchange', () => {
-    if (dirty && !confirm('You have unsaved changes. Leave anyway?')) return;
+    if (location.hash === shownHash) return; // that was our own undo (below)
+    if (dirty && !confirm('You have unsaved changes. Leave anyway?')) {
+      location.replace(shownHash || '#/'); // stay on the screen being edited, and put its address back
+      return;
+    }
     dirty = false;
+    shownHash = location.hash;
     route();
   });
   window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
@@ -311,7 +361,7 @@
           h('span', { title: 'Time spent' }, `⏱️ ${fmtTime(u.stats.timeSpent)}`)))) :
         [h('p', { class: 'state' }, users.length ? 'No students match your search.' : 'No students yet. Share the app link so they can sign up, or add one here.')]));
     };
-    search.addEventListener('input', draw);
+    search.addEventListener('input', oncePerFrame(draw));
 
     // Add-student form
     const f = { name: h('input', { id: 'n-name', maxlength: '60' }), email: h('input', { id: 'n-email', type: 'email', maxlength: '254' }), pw: h('input', { id: 'n-pw', type: 'text', maxlength: '128', placeholder: 'At least 8 characters' }) };
@@ -515,7 +565,8 @@
           copy));
     }));
 
-    if (window.Sortable) Sortable.create(list, {
+    disposeSortable();
+    if (window.Sortable) activeSortable = Sortable.create(list, {
       handle: '.handle', animation: 150, forceFallback: true,
       onEnd: async () => {
         const ids = [...list.children].map(li => li.dataset.id);
@@ -595,7 +646,7 @@
       }) : [h('p', { class: 'muted' }, users.length ? 'No students match.' : 'No students yet.')]));
       pickCount.textContent = `${selected.size} selected`;
     };
-    pickSearch.addEventListener('input', drawPicks);
+    pickSearch.addEventListener('input', oncePerFrame(drawPicks));
     const picker = h('div', { class: 'picker' }, pickSearch, pickList,
       h('div', { class: 'picker-foot' }, pickCount,
         h('span', { class: 'toolbar' },
@@ -607,9 +658,10 @@
 
     // ---- Units editor ----
     const lines = text => text.split('\n').map(x => x.trim().replace(/\s+/g, ' ')).filter(Boolean);
-    let units = (lesson.units && lesson.units.length ? lesson.units : [{ id: null, title: 'Unit 1', sentences: [] }])
-      .map(u => ({ id: u.id || null, title: u.title, text: u.sentences.map(x => x.en).join('\n') }));
+    const units = (lesson.units && lesson.units.length ? lesson.units : [{ id: null, title: 'Unit 1', sentences: [] }])
+      .map(u => ({ id: u.id || null, title: u.title, text: (u.sentences || []).map(x => x.en).join('\n') }));
     const unitsBox = h('div', { class: 'units-editor' });
+    const scheduleCheck = oncePerFrame(() => checkSentences()); // re-checking every line on every key press would be wasteful
 
     function moveUnit(i, d) {
       const j = i + d;
@@ -631,7 +683,7 @@
           oninput: e => { u.title = e.target.value; dirty = true; } });
         const ta = h('textarea', { rows: '6', spellcheck: 'true', 'aria-label': `Unit ${i + 1} sentences`,
           placeholder: 'One sentence per line, for example:\nWhere is the check-in desk?\nCan I see your passport, please?',
-          oninput: e => { u.text = e.target.value; dirty = true; msg.textContent = ''; checkSentences(); } });
+          oninput: e => { u.text = e.target.value; dirty = true; msg.textContent = ''; scheduleCheck(); } });
         ta.value = u.text;
         u.ta = ta;
         u.check = h('div', { class: 'check' });

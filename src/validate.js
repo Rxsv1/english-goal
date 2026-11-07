@@ -42,7 +42,7 @@ function validateLesson(input) {
   if (!title) errors.push('Title is required.');
   else if (title.length > 80) errors.push('Title must be 80 characters or fewer.');
 
-  let slug = str(input.slug).toLowerCase() || slugify(title);
+  const slug = str(input.slug).toLowerCase() || slugify(title);
   if (!slug) errors.push('Link name (slug) is required.');
   else if (!SLUG_RE.test(slug) || slug.length > 60)
     errors.push('Link name may use only a-z, 0-9 and single dashes (max 60 characters).');
@@ -87,6 +87,7 @@ function validateLesson(input) {
       while (seenIds.has(id)) id = newUnitId();
       seenIds.add(id);
       const list = Array.isArray(u && u.sentences) ? u.sentences : [];
+      if (list.length > MAX_SENTENCES) { errors.push(`Unit ${un} (${utitle}): at most ${MAX_SENTENCES} sentences.`); return; }
       if (!list.length) errors.push(`Unit ${un} (${utitle}): add at least one sentence.`);
       const out = [];
       list.forEach((sn, i) => {

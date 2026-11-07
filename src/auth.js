@@ -26,13 +26,28 @@ async function hashPassword(password) {
   return `scrypt$${salt.toString('base64')}$${hash.toString('base64')}`;
 }
 
+const MAX_PASSWORD_CHARS = 1024; // far above the 128 we accept; stops absurdly long inputs from being hashed
+
 async function verifyPassword(password, stored) {
-  const [algo, saltB64, hashB64] = String(stored || '').split('$');
-  if (algo !== 'scrypt' || !saltB64 || !hashB64) return false;
-  const expected = Buffer.from(hashB64, 'base64');
-  const actual = await scrypt(password, Buffer.from(saltB64, 'base64'), expected.length);
-  return crypto.timingSafeEqual(actual, expected);
+  try {
+    if (typeof password !== 'string' || password.length > MAX_PASSWORD_CHARS) return false;
+    const [algo, saltB64, hashB64] = String(stored || '').split('$');
+    if (algo !== 'scrypt' || !saltB64 || !hashB64) return false;
+    const expected = Buffer.from(hashB64, 'base64');
+    if (!expected.length) return false;
+    const actual = await scrypt(password, Buffer.from(saltB64, 'base64'), expected.length);
+    return crypto.timingSafeEqual(actual, expected);
+  } catch (e) {
+    return false; // a damaged stored hash must never crash a login
+  }
 }
+
+// A valid hash of a random password. Logging in with an unknown email is checked against it, so the
+// answer takes as long as for a real account and cannot be used to discover which emails exist.
+const DUMMY_HASH = (() => {
+  const salt = crypto.randomBytes(16);
+  return `scrypt$${salt.toString('base64')}$${crypto.scryptSync(crypto.randomBytes(16), salt, 64).toString('base64')}`;
+})();
 
 const safeEqual = (a, b) => {
   const ha = crypto.createHash('sha256').update(String(a)).digest();
@@ -48,7 +63,8 @@ function sign(payload) {
 }
 
 function unsign(token) {
-  const [body, sig] = String(token || '').split('.');
+  if (typeof token !== 'string' || token.length > 4096) return null;
+  const [body, sig] = token.split('.');
   if (!body || !sig) return null;
   const expected = crypto.createHmac('sha256', SECRET).update(body).digest('base64url');
   if (!safeEqual(sig, expected)) return null;
@@ -66,7 +82,9 @@ function readCookie(req, name) {
   const header = req.headers.cookie || '';
   for (const part of header.split(';')) {
     const i = part.indexOf('=');
-    if (i > -1 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+    if (i > -1 && part.slice(0, i).trim() === name) {
+      try { return decodeURIComponent(part.slice(i + 1).trim()); } catch (e) { return null; } // malformed % escapes
+    }
   }
   return null;
 }
@@ -86,6 +104,8 @@ function clearUserCookie(req, res) {
 }
 
 /* ---------- rate limiting (in memory) ---------- */
+const LIMITER_MAX_KEYS = 20000; // upper bound on memory, whatever an attacker sends
+
 function limiter(max, windowMs) {
   const hits = new Map();
   setInterval(() => {
@@ -96,7 +116,11 @@ function limiter(max, windowMs) {
     hit(key) {
       const now = Date.now();
       const h = hits.get(key);
-      if (!h || h.reset < now) { hits.set(key, { n: 1, reset: now + windowMs }); return false; }
+      if (!h || h.reset < now) {
+        if (hits.size >= LIMITER_MAX_KEYS) hits.delete(hits.keys().next().value); // drop the oldest entry
+        hits.set(key, { n: 1, reset: now + windowMs });
+        return false;
+      }
       h.n++;
       return h.n > max;
     },
@@ -143,6 +167,7 @@ module.exports = {
   ADMIN_PASSWORD,
   hashPassword,
   verifyPassword,
+  DUMMY_HASH,
   safeEqual,
   setUserCookie,
   clearUserCookie,

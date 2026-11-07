@@ -19,7 +19,9 @@
   /** The lesson's units (older rows without units are treated as one unit). */
   const unitsOf = lesson => (Array.isArray(lesson.units) && lesson.units.length
     ? lesson.units
-    : [{ id: 'main', title: 'Unit 1', sentences: lesson.sentences || [] }]);
+    : [{ id: 'main', title: 'Unit 1', sentences: Array.isArray(lesson.sentences) ? lesson.sentences : [] }]);
+
+  const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0); // never lets NaN reach the screen
 
   /**
    * Combines a lesson with one student's progress.
@@ -35,9 +37,10 @@
     extra = extra || new Map();
     let prevDone = true;
     const units = unitsOf(lesson).map(u => {
-      const total = u.sentences.length;
+      const list = Array.isArray(u.sentences) ? u.sentences : [];
+      const total = list.length;
       let done = 0, stars = 0, bonus = 0;
-      for (const s of u.sentences) {
+      for (const s of list) {
         const st = solved.get(s.en);
         if (st) { done++; stars += st; bonus += extra.get(s.en) || 0; }
       }
@@ -57,7 +60,7 @@
         extra: bonus,
         maxStars: total * 3,
         learned,
-        learnIndex: row ? Math.min(row.learn_index, Math.max(0, total - 1)) : 0,
+        learnIndex: row ? Math.max(0, Math.min(num(row.learn_index), total - 1)) : 0,
         completed,
         locked,
         status: completed ? 'completed' : learned ? 'building' : row ? 'learning' : 'new',
@@ -86,7 +89,7 @@
       completedAt: lp ? lp.completed_at : null,
       startedAt: lp ? lp.started_at : null,
       lastActivityAt: lp ? lp.last_activity_at : null,
-      timeSpent: lp ? lp.time_spent_sec : 0,
+      timeSpent: lp ? num(lp.time_spent_sec) : 0,
       status,
       units,
     };
@@ -102,7 +105,7 @@
   /** Progress summary for one lesson copy. */
   function modelOf(raw) {
     const solved = new Map(), extra = new Map();
-    for (const u of raw.units) for (const s of u.sentences) {
+    for (const u of raw.units || []) for (const s of u.sentences || []) {
       if (s.stars) solved.set(s.en, s.stars);
       if (s.extra) extra.set(s.en, s.extra);
     }
@@ -113,7 +116,7 @@
   function touchLesson(raw, seconds, now) {
     if (!raw.lp) raw.lp = { started_at: now, last_activity_at: now, completed_at: null, time_spent_sec: 0 };
     raw.lp.last_activity_at = now;
-    raw.lp.time_spent_sec += seconds || 0;
+    raw.lp.time_spent_sec = num(raw.lp.time_spent_sec) + num(seconds);
   }
 
   /** Cards step: the progress only ever moves forward. */
@@ -121,7 +124,7 @@
     touchLesson(raw, seconds, now);
     let row = (raw.unitRows = raw.unitRows || []).find(r => r.unit_id === unitId);
     if (!row) raw.unitRows.push(row = { unit_id: unitId, learn_index: 0, learned_at: null });
-    row.learn_index = Math.max(row.learn_index, index);
+    row.learn_index = Math.max(num(row.learn_index), num(index));
     if (done && !row.learned_at) row.learned_at = now;
   }
 
@@ -132,23 +135,23 @@
    */
   function applySolve(raw, stats, sentence, stars, seconds, now) {
     let found = null;
-    for (const u of raw.units) for (const s of u.sentences) if (s.en === sentence) found = s;
+    for (const u of raw.units || []) for (const s of u.sentences || []) if (s.en === sentence) found = s;
     if (!found) return null;
     const lessonWasDone = modelOf(raw).completed;
-    const before = found.stars || 0;
+    const before = num(found.stars);
     const replay = before > 0;
     const extra = replay ? Math.max(0, stars - before) : 0;
     found.stars = Math.max(before, stars);
-    found.extra = (found.extra || 0) + extra;
+    found.extra = num(found.extra) + extra;
     touchLesson(raw, seconds, now);
     const m = modelOf(raw);
     if (stats) {
-      if (!replay) stats.sentencesSolved += 1;
-      stats.stars += found.stars - before;
-      stats.extraStars = (stats.extraStars || 0) + extra;
-      stats.timeSpent += seconds || 0;
+      if (!replay) stats.sentencesSolved = num(stats.sentencesSolved) + 1;
+      stats.stars = num(stats.stars) + found.stars - before;
+      stats.extraStars = num(stats.extraStars) + extra;
+      stats.timeSpent = num(stats.timeSpent) + num(seconds);
       if (!stats.streak) stats.streak = 1;
-      if (m.completed && !lessonWasDone && !raw.lp.completed_at) { raw.lp.completed_at = now; stats.lessonsCompleted += 1; }
+      if (m.completed && !lessonWasDone && !raw.lp.completed_at) { raw.lp.completed_at = now; stats.lessonsCompleted = num(stats.lessonsCompleted) + 1; }
     }
     return { stars, best: found.stars, extra, replay, completed: m.completed };
   }

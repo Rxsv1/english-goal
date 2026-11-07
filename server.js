@@ -116,7 +116,7 @@ app.get('/manifest.webmanifest', (req, res) => {
 });
 
 app.get('/admin', sendPage('admin.html', () => 'tiles'));
-app.get(['/', '/login', '/signup', '/profile', '/practice', '/lesson/:slug', '/lesson/:slug/:step', '/lesson/:slug/u/:unit/:step'], sendPage('index.html', studentSkeleton));
+app.get(['/', '/login', '/signup', '/profile', '/practice', '/completed', '/lesson/:slug', '/lesson/:slug/:step', '/lesson/:slug/u/:unit/:step'], sendPage('index.html', studentSkeleton));
 
 app.use(express.static(PUBLIC_DIR, {
   index: false,
@@ -128,8 +128,11 @@ app.use(express.static(PUBLIC_DIR, {
 app.use((req, res) => res.status(404).type('html').send(renderPage('index.html', studentSkeleton(req.path))));
 
 app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'File is too large (max 1 MB).' });
+  // Bad requests (for example a malformed URL) are the caller's mistake, not a server failure.
+  if (err.status >= 400 && err.status < 500) return res.status(err.status).json({ error: 'Bad request.' });
   console.error(err);
   res.status(500).json({ error: 'Something went wrong on the server.' });
 });
@@ -148,8 +151,26 @@ app.use((err, req, res, next) => {
       await new Promise(r => setTimeout(r, attempt * 2000));
     }
   }
-  app.listen(PORT, HOST, () => {
+  const server = app.listen(PORT, HOST, () => {
     console.log(`${APP_NAME} running on http://${HOST}:${PORT}`);
     if (!auth.ADMIN_PASSWORD) console.warn('ADMIN_PASSWORD is not set - the /admin page is disabled.');
   });
+  // Load balancers keep connections open for about 60 s; staying open a little longer avoids sporadic 502s.
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+
+  // A redeploy sends SIGTERM: finish the requests in progress (a child's last save!), then close the database.
+  let stopping = false;
+  const shutdown = signal => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`[server] ${signal} received, finishing open requests...`);
+    setTimeout(() => process.exit(0), 10000).unref(); // never hang a redeploy
+    server.close(() => pool.end().catch(() => {}).then(() => process.exit(0)));
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 })();
+
+// A forgotten .catch somewhere must not take the whole app (and every student's session) down.
+process.on('unhandledRejection', reason => console.error('[server] unhandled rejection:', reason && reason.stack ? reason.stack : reason));

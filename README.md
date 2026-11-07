@@ -16,6 +16,7 @@ and the teacher dashboard shows exactly what each student has done.
   and **2. Build** (tap or drag words into order; hints, stars, red marks for wrong words). Build unlocks after the cards.
 - Progress is saved after every card and every sentence. It never goes backwards, and the best stars are kept.
   Students can stop at any time and continue on any device ("Continue where you stopped").
+- **Home keeps your place, finished lessons move away:** going back from a lesson (the arrow or the phone's back button) returns to the same spot in the list. A lesson the student finishes leaves the home list and appears on the **Completed lessons** page (a 🏆 row on the home screen), where it can still be opened and played again.
 - **Go back to anything:** every unit a student has opened can be revisited: read its cards again (jump to any card
   with the `1 / 5` button), practise the whole unit, or open **All sentences** to listen to or practise one single sentence.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
@@ -104,6 +105,15 @@ A sentence may appear only once per lesson. `visibility` is `"public"` (all stud
 Importing from a student's card always creates new private lessons for that student (it never overwrites other lessons).
 Importing a lesson with an existing `slug` from the Lessons page updates it and keeps student progress (units are matched by title). If a sentence's text changes,
 students need to build that one sentence again.
+
+## Reliability and safety
+
+- Anything read from the device (saved progress, settings, the offline queue) is checked before use; damaged or old data is ignored and fetched again, so it can never break a screen.
+- Requests have time limits, the offline queue is size-limited, and background syncing backs off when the network is down.
+- Malformed requests get a 4xx answer (never a 500); logging in costs the same time whether or not the email exists; the activity log can never block a login.
+- On a redeploy the server finishes open requests before it stops (SIGTERM), so a child's last save is not cut off.
+- Starter lessons are only added to a brand-new database, never again after a teacher has deleted them.
+- `npm test` checks all of this, including that the browser and the server work out stars identically.
 
 ## How stars and "extra" work
 

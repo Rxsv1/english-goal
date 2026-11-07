@@ -299,6 +299,51 @@ test('GET /app returns only what the student may see, in one request', { skip },
   assert.equal((await call('GET', '/api/app')).status, 401, 'needs a login');
 });
 
+test('malformed requests are answered politely, never with a server error', { skip }, async () => {
+  const kai = await newStudent('Kai');
+  // a damaged cookie (bad % escape) must mean "not logged in", not a crash
+  const badCookie = await fetch(BASE + '/api/app', { headers: { Cookie: 'ws_session=%E0%A4%A' } });
+  assert.equal(badCookie.status, 401);
+  // a malformed address is the caller's mistake (4xx), not a server failure
+  const badUrl = await fetch(BASE + '/lesson/%E0%A4%A');
+  assert.ok(badUrl.status >= 400 && badUrl.status < 500, `got ${badUrl.status}`);
+  // absurdly long input
+  const longSentence = 'x'.repeat(50000);
+  assert.equal((await kai.as('POST', '/lessons/anything/solve', { sentence: longSentence })).status, 404);
+  const lessons = (await kai.as('GET', '/app')).data.lessons;
+  assert.equal((await kai.as('POST', `/lessons/${lessons[0].slug}/solve`, { sentence: longSentence })).status, 400);
+  // wrong types everywhere
+  assert.equal((await kai.as('POST', `/lessons/${lessons[0].slug}/solve`, { sentence: { a: 1 }, mistakes: 'abc', hints: [] })).status, 400);
+  assert.equal((await call('POST', '/api/auth/login', { email: { $ne: 1 }, password: 12345 })).status, 401);
+  assert.equal((await call('POST', '/api/auth/login', { email: 'a'.repeat(500) + '@x.com', password: 'p' })).status, 401);
+  assert.equal((await call('POST', '/api/auth/login', { email: 'kai@example.com', password: 'p'.repeat(100000) })).status, 401);
+  // login for an unknown email gives the same answer as a wrong password
+  const unknown = await call('POST', '/api/auth/login', { email: 'nobody-here@example.com', password: 'password123' });
+  assert.equal(unknown.status, 401);
+  assert.equal(unknown.data.error, 'Wrong email or password.');
+  // lists sent by the dashboard are bounded and typed
+  assert.equal((await admin('POST', '/reorder', { ids: Array.from({ length: 6000 }, (_, i) => 'id' + i) })).status, 400);
+  assert.equal((await admin('POST', '/reorder', { ids: ['ok', 5] })).status, 400);
+  assert.equal((await admin('PUT', `/users/${kai.id}/assignments`, { lessonIds: 'nope' })).status, 400);
+  // a unit with far too many sentences is refused before it is processed
+  const huge = await admin('POST', '/lessons', { title: 'Huge', units: [{ title: 'U', sentences: Array.from({ length: 300 }, (_, i) => ({ en: `Sentence number ${i} here` })) }] });
+  assert.equal(huge.status, 400);
+});
+
+test('starter lessons do not come back after a teacher deleted them', { skip }, async () => {
+  const { Pool } = require('pg');
+  const { migrate } = require('../src/db');
+  const pool = new Pool({ connectionString: DB });
+  try {
+    await pool.query('DELETE FROM lessons');
+    await migrate(pool); // what happens at every restart; students exist, so nothing is re-added
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM lessons');
+    assert.equal(rows[0].n, 0);
+  } finally {
+    await pool.end();
+  }
+});
+
 test('compressed responses are served', { skip }, async () => {
   const res = await fetch(BASE + '/app.js', { headers: { 'Accept-Encoding': 'gzip' } });
   assert.equal(res.headers.get('content-encoding'), 'gzip');

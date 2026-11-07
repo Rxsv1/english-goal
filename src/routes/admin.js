@@ -8,6 +8,8 @@ const { summarize, unitsOf, groupSolved, groupUnits, streak, EXTRA_SQL } = requi
 const { slugify } = require('../validate');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+// A list of ids sent by the dashboard: strings only, and not absurdly many.
+const isIdList = v => Array.isArray(v) && v.length <= 5000 && v.every(x => typeof x === 'string' && x.length <= 64);
 
 const lessonOut = (l, extra = {}) => ({
   id: l.id,
@@ -207,7 +209,7 @@ module.exports = function adminRoutes(pool) {
   // Replace the list of private lessons given to one student.
   r.put('/users/:id/assignments', wrap(async (req, res) => {
     const ids = req.body && req.body.lessonIds;
-    if (!Array.isArray(ids) || !ids.every(x => typeof x === 'string')) return res.status(400).json({ error: 'lessonIds must be a list.' });
+    if (!isIdList(ids)) return res.status(400).json({ error: 'lessonIds must be a list.' });
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -350,7 +352,7 @@ module.exports = function adminRoutes(pool) {
 
   r.post('/reorder', wrap(async (req, res) => {
     const ids = req.body && req.body.ids;
-    if (!Array.isArray(ids) || !ids.every(x => typeof x === 'string')) return res.status(400).json({ error: 'ids must be a list.' });
+    if (!isIdList(ids)) return res.status(400).json({ error: 'ids must be a list.' });
     await pool.query('UPDATE lessons l SET position = t.pos FROM unnest($1::text[]) WITH ORDINALITY AS t(id, pos) WHERE l.id = t.id', [ids]);
     res.status(204).end();
   }));
@@ -453,7 +455,7 @@ module.exports = function adminRoutes(pool) {
     }
     const esc = v => {
       const s = v === null || v === undefined ? '' : String(v);
-      const safe = /^[=+\-@]/.test(s) ? "'" + s : s; // avoid spreadsheet formula injection
+      const safe = /^[=+\-@\t\r]/.test(s) ? "'" + s : s; // avoid spreadsheet formula injection
       return /[",\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
     };
     const lines = [['Student', 'Email', 'Lesson', 'Level', 'Status', 'Units done', 'Total units', 'Cards learned', 'Sentences solved', 'Total sentences', 'Stars', 'Of which extra (from retries)', 'Max stars', 'Minutes spent', 'Completed at', 'Last activity'].join(',')];

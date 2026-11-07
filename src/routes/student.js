@@ -18,6 +18,8 @@ module.exports = function studentRoutes(pool) {
 
   const logEvent = (userId, lessonId, type, data = {}) =>
     pool.query('INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,$3,$4::jsonb)', [userId, lessonId, type, JSON.stringify(data)]);
+  // The activity log is for the teacher. If writing to it fails, the student must still be able to log in or sign up.
+  const logQuietly = (...args) => logEvent(...args).catch(e => console.error('[events] could not log:', e.message));
 
   const publicUser = u => ({ id: u.id, name: u.name, email: u.email, createdAt: u.created_at });
 
@@ -37,7 +39,7 @@ module.exports = function studentRoutes(pool) {
       if (e.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Please log in.' });
       throw e;
     }
-    await logEvent(id, null, 'signup');
+    await logQuietly(id, null, 'signup');
     auth.setUserCookie(req, res, id);
     res.status(201).json({ user: { id, name: user.name, email: user.email } });
   }));
@@ -47,14 +49,16 @@ module.exports = function studentRoutes(pool) {
     const password = String((req.body && req.body.password) || '');
     const key = req.ip + '|' + email;
     if (loginLimit.hit(key)) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+    if (email.length > 254) return res.status(401).json({ error: 'Wrong email or password.' });
     const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     const u = rows[0];
-    if (!u || !(await auth.verifyPassword(password, u.password_hash)))
-      return res.status(401).json({ error: 'Wrong email or password.' });
+    // Always do the same amount of work, so the response time does not reveal whether the email exists.
+    const passwordOk = await auth.verifyPassword(password, u ? u.password_hash : auth.DUMMY_HASH);
+    if (!u || !passwordOk) return res.status(401).json({ error: 'Wrong email or password.' });
     if (u.disabled) return res.status(403).json({ error: 'Your account has been disabled. Please contact your teacher.' });
     loginLimit.clear(key);
     await pool.query('UPDATE users SET last_seen_at = now() WHERE id = $1', [u.id]);
-    await logEvent(u.id, null, 'login');
+    await logQuietly(u.id, null, 'login');
     auth.setUserCookie(req, res, u.id);
     res.json({ user: publicUser(u) });
   }));
@@ -244,7 +248,7 @@ module.exports = function studentRoutes(pool) {
     const unit = unitsOf(lesson).find(u => u.id === req.params.unitId);
     if (!unit) return res.status(404).json({ error: 'This unit no longer exists.' });
     if (await isUnitLocked(pool, uid, lesson, unit.id)) return res.status(403).json({ error: 'Finish the previous unit first.' });
-    const index = clampInt(req.body && req.body.index, 0, unit.sentences.length - 1);
+    const index = clampInt(req.body && req.body.index, 0, Math.max(0, unit.sentences.length - 1));
     const seconds = clampInt(req.body && req.body.seconds, 0, 600);
     const done = Boolean(req.body && req.body.done);
 
@@ -284,7 +288,7 @@ module.exports = function studentRoutes(pool) {
     const lesson = await loadVisibleLesson(uid, req.params.slug);
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
     const b = req.body || {};
-    const sentence = String(b.sentence || '');
+    const sentence = String(b.sentence || '').slice(0, 400); // lessons cap sentences at 200 characters
     const unit = unitsOf(lesson).find(u => u.sentences.some(s => s.en === sentence));
     if (!unit) return res.status(400).json({ error: 'This sentence is not in the lesson any more.' });
     const mistakes = clampInt(b.mistakes, 0, 999);
@@ -381,7 +385,7 @@ module.exports = function studentRoutes(pool) {
     const unitId = req.body && typeof req.body.unitId === 'string' ? req.body.unitId : null;
     const unit = unitId ? unitsOf(lesson).find(u => u.id === unitId) : null;
     if (unitId && !unit) return res.status(404).json({ error: 'This unit no longer exists.' });
-    await logEvent(uid, lesson.id, 'restart', unit ? { unit: unit.title, unitId: unit.id } : {});
+    await logQuietly(uid, lesson.id, 'restart', unit ? { unit: unit.title, unitId: unit.id } : {});
     res.status(204).end();
   }));
 
