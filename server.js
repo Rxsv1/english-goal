@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const compression = require('compression');
 const { createPool, migrate } = require('./src/db');
 const auth = require('./src/auth');
 
@@ -17,6 +18,7 @@ pool.on('error', err => console.error('[db] idle client error:', err.message));
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 
 /* ---------- Security headers ---------- */
