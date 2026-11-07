@@ -37,6 +37,9 @@
     };
   }
 
+  // Pinch-zoom is switched off (the page also says so in its viewport tag). iPhones ignore that tag, so the gesture itself is stopped.
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(type => document.addEventListener(type, e => e.preventDefault()));
+
   const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
   const toNum = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
   const clampNum = (v, min, max) => Math.min(max, Math.max(min, toNum(v)));
@@ -906,13 +909,11 @@
         const label = step === 'learn' ? (up.learnIndex > 0 ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : (up.grammarDone ? 'Continue' : 'Start');
         action = h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, step), 'data-link': true }, '▶ ', label);
       }
-      // Any unit the student can open can be revisited: read the cards again, practise, or start it over.
+      // Any unit the student can open can be revisited. These buttons are always in view (nothing is hidden behind a menu).
       const again = !up.locked && up.status !== 'new' ? h('div', { class: 'unit-actions' },
         h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'learn'), 'data-link': true, html: ICON.cards + ' Cards' }),
         up.learned ? h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'review'), 'data-link': true, html: ICON.puzzle + ' Practise' }) : null,
-        up.learned && up.grammarTotal && up.solved === up.total ? h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'grammar') + '?replay=1', 'data-link': true }, '✏️ Grammar') : null,
-        up.learned ? h('button', { class: 'btn btn-ghost btn-sm', type: 'button', html: ICON.reset + ' Restart', title: 'Play this unit again from the first sentence. Your saved progress is kept.',
-          onclick: () => restartUnit(i) }) : null) : null;
+        up.learned && up.grammarTotal && up.solved === up.total ? h('a', { class: 'btn btn-ghost btn-sm', href: unitPath(slug, unit, 'grammar') + '?replay=1', 'data-link': true }, '✏️ Grammar') : null) : null;
 
       // Every sentence of an opened unit: listen to it, or practise just that one.
       const sentences = up.learned ? h('details', { class: 'unit-sentences' },
@@ -940,8 +941,8 @@
                   up.stars ? h('span', { class: 'star', html: ICON.star }, String(up.stars)) : null,
                   up.extra ? h('span', { class: 'extra', title: 'Stars gained by practising again' }, `+${up.extra} extra`) : null))),
         action,
-        // Everything else is tucked away so a child only sees one big button.
-        again || sentences ? h('details', { class: 'unit-more' }, h('summary', null, 'More'), again, sentences) : null);
+        again,
+        sentences);
     });
 
     // Start the lesson over from Unit 1. Nothing is deleted: saved progress and stars stay, and any
@@ -977,10 +978,15 @@
             multi ? `${p.unitsCompleted} of ${p.unitsTotal} units · ` : '', `${p.solved} of ${p.total} sentences built`)),
         !p.completed && !didAnything(p) ? h('p', { class: 'how' }, '👀 Look and listen', h('span', { class: 'arrow' }, ' → '), '🧩 Build the sentence') : null,
         h('ol', { class: 'units' }, unitCards),
+        // The lesson's ONE settings button: starting over (the whole lesson, or a single unit of a longer lesson).
         canRestart ? h('details', { class: 'start-over' },
-          h('summary', null, 'More options'),
-          h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' Start lesson over', onclick: restartLesson }),
-          h('p', { class: 'muted' }, 'Replay everything from Unit 1. Your saved progress is never lost, and better results count as extra stars.')) : null,
+          h('summary', null, 'More'),
+          h('div', { class: 'more-list' },
+            h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' Start lesson over', onclick: restartLesson }),
+            multi ? lesson.units.map((unit, i) => (p.units[i].learned
+              ? h('button', { class: 'btn btn-ghost btn-block', type: 'button', html: ICON.reset + ' ', onclick: () => restartUnit(i) }, `Restart Unit ${i + 1} · ${unit.title}`)
+              : null)) : null),
+          h('p', { class: 'muted' }, 'Replay from the first sentence. Your saved progress is never lost, and better results count as extra stars.')) : null,
         p.completed ? h('div', { class: 'hub-actions' }, h('a', { class: 'btn btn-primary btn-block', href: '/', 'data-link': true, 'data-top': true }, 'Choose another lesson')) : null)
     );
   }
@@ -1196,7 +1202,8 @@
 
     const resetBtn = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.reset + '<span class="lbl">Reset</span>', 'aria-label': 'Put the words back and shuffle' });
     const hintBtn = h('button', { class: 'btn btn-ghost', type: 'button', html: ICON.hint + '<span class="lbl">Hint</span>', 'aria-label': 'Hint' });
-    const listenBtn = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: ICON.sound + ' Listen', 'aria-label': 'Listen to the sentence' });
+    // Hearing the sentence would give the answer away, so Listen only appears once the sentence has been solved.
+    const listenBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true, html: ICON.sound + '<span class="lbl">Listen</span>', 'aria-label': 'Listen to the sentence' });
     const checkHint = h('button', { class: 'btn btn-status', type: 'button', disabled: true, 'aria-hidden': 'true', tabindex: '-1' }, '');
     const prevBtn = h('button', { class: 'btn btn-ghost', type: 'button', hidden: true, 'aria-label': 'Previous sentence', title: 'Previous sentence', html: ICON.back });
     const peekBtn = h('button', { class: 'btn btn-ghost btn-big', type: 'button', html: '👀 Peek', 'aria-label': 'Peek at the sentence for 3 seconds (counts as a hint)' });
@@ -1210,10 +1217,10 @@
         pill, soundButton()),
       h('div', { class: 'progress-track', role: 'progressbar' }, fill),
       h('p', { class: 'prompt' }, '👆 Tap the words in the right order'),
-      h('div', { class: 'listen-row listen-peek' }, canSpeak ? listenBtn : null, peekBtn),
+      h('div', { class: 'listen-row listen-peek' }, peekBtn),
       answerBox, pool, feedback, solvedPanel,
-      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, nextBtn),
-      h('p', { class: 'kbd-hint' }, 'Backspace undo  ·  H hint  ·  P peek  ·  L listen  ·  Enter next') // shown on computers only
+      h('div', { class: 'actions' }, prevBtn, resetBtn, hintBtn, checkHint, listenBtn, nextBtn),
+      h('p', { class: 'kbd-hint' }, 'Backspace undo  ·  H hint  ·  P peek  ·  Enter next') // shown on computers only
     );
 
     const tilesIn = zone => [...zone.children];
@@ -1239,13 +1246,11 @@
       answerBox.classList.remove('solved');
       solvedPanel.hidden = true;
       feedback.textContent = ''; feedback.className = 'feedback';
-      resetBtn.hidden = false; hintBtn.hidden = false; peekBtn.hidden = false; nextBtn.hidden = true; checkHint.hidden = false;
+      resetBtn.hidden = false; hintBtn.hidden = false; peekBtn.hidden = false; nextBtn.hidden = true; checkHint.hidden = false; listenBtn.hidden = true;
       prevBtn.hidden = !(canGoBack && pos > 0);
       updateLeft();
       sortables.forEach(s => s.option('disabled', false));
       updateBar();
-      // The sentence is read aloud first, so the child can listen and then build it.
-      if (settings.sound && canSpeak) { const r = round; later(() => { if (round === r && !r.solved) speak(r.sentence); }, 350); }
     }
 
     function updateLeft() {
@@ -1298,7 +1303,7 @@
       const praise = s === 3 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : s === 2 ? ['Well done! 👏', 'Great job! 😊', 'Nice work! 👍'] : ['You got it! 💪', 'Good job, keep going! 🌈'];
       feedback.textContent = praise[(Math.random() * praise.length) | 0];
       feedback.className = 'feedback good';
-      resetBtn.hidden = true; hintBtn.hidden = true; peekBtn.hidden = true; nextBtn.hidden = false; checkHint.hidden = true;
+      resetBtn.hidden = true; hintBtn.hidden = true; peekBtn.hidden = true; nextBtn.hidden = false; checkHint.hidden = true; listenBtn.hidden = !canSpeak;
       nextBtn.innerHTML = (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next;
       nextBtn.focus({ preventScroll: true });
       sfx.win(); confetti(40);

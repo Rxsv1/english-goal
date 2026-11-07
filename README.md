@@ -14,6 +14,7 @@ Every unit follows the same three steps, built around memorising whole sentences
 1. **Read and say it.** The student reads the sentence, listens to it (normal or slow), then says it out loud and taps
    **"I said it out loud"**. The next sentence stays locked until they do. (Going back to a unit they already learned is free.)
 2. **Re-order to prove it.** The sentence is hidden and its words are shuffled; the student puts them back in order.
+   There is no Listen button (and nothing is read aloud) until the sentence is solved, because hearing it would give the answer away.
 3. **Grammar gap.** One word is missing from the sentence and the student chooses the right one of **three**. When the
    last gap is answered, the unit (and, after the last unit, the lesson) ends.
 
@@ -50,7 +51,7 @@ I live [in|on|at] Cairo.
 - **On a computer** the app uses the whole window instead of a phone-sized strip: a dashboard on the home screen, lessons in a
   grid, a lesson's summary beside its units, and a larger stage for the cards and puzzle (everything also grows on big monitors).
   Phones and narrow windows are unchanged. With a keyboard: **Backspace** takes the last word back,
-  **H** hint, **P** peek, **L** listen, **S** "I said it", **1-2-3** choose the first/second/third grammar word, **Enter** next, **← →** move between cards.
+  **H** hint, **P** peek, **S** "I said it" (and **L** to listen once a sentence is solved), **1-2-3** choose the first/second/third grammar word, **Enter** next, **← →** move between cards.
 - **Go back to anything:** every unit a student has opened can be revisited: read its cards again (jump to any card
   with the `1 / 5` button), practise the whole unit, or open **All sentences** to listen to or practise one single sentence.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
