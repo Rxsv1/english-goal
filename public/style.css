@@ -655,3 +655,11 @@ details.start-over { margin: 12px 0 0; text-align: center; }
 .sk-auth-title { width: 55%; }
 .auth-form .sk-input { height: 48px; border-radius: 12px; }
 .auth-form .sk-btn-block { height: 52px; border-radius: var(--r-md); margin-top: 8px; }
+
+/* A thin line along the top while a page that has not been seen yet is on its way. The current screen stays put. */
+.busy::before {
+  content: ''; position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 60; pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent) no-repeat; background-size: 40% 100%;
+  animation: busy-bar 1s linear infinite;
+}
+@keyframes busy-bar { from { background-position: -40% 0; } to { background-position: 140% 0; } }

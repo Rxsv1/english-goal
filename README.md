@@ -21,7 +21,13 @@ and the teacher dashboard shows exactly what each student has done.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
   the first sentence. Saved progress, unlocked units and stars are never reset or lowered. If the student does better
   than before, the improvement is added as **extra stars** (shown as "+N extra"; also visible to the teacher).
-- **Instant screens:** while data loads, a skeleton that mirrors the real screen is shown (it is part of the first HTML, so it appears before any JavaScript runs), then the content fades in with no layout jump. The home screen of a returning student is drawn at once from data saved on the device and refreshed in the background.
+- **Everything is instant.** When a student opens the app, one request (`GET /api/app`) loads all their lessons, sentences and
+  progress. It is kept in memory and on the device, so every screen (home, lesson, cards, puzzle, results, profile) opens at
+  once with no waiting for the network, and a returning student never sees a loading screen. Stars, extra stars and unlocked
+  units are worked out on the device with the same rules as the server (`public/progress-core.js`, shared by both) and saved to
+  the server in the background; the server is then asked quietly for the latest and the screen is redrawn only if something
+  changed (for example a new lesson from the teacher). The very first visit shows a skeleton that is already in the HTML.
+  The teacher dashboard works the same way: pages you have seen open instantly and refresh in the background.
 - Works offline for a while: finished sentences are queued and sent when the connection returns
 - Home page with stars, sentences, day streak and lessons completed; profile page to change name and password
 - "Practise your own text" (not tracked)
@@ -128,12 +134,13 @@ The test database is wiped on every run, so use an empty one.
 server.js               Express app, security headers, pages
 src/db.js               PostgreSQL connection + automatic table setup
 src/auth.js             Passwords (scrypt), sessions (signed cookies), rate limits
-src/progress.js         Stars, lesson status, streaks
+src/progress.js         Progress queries and streaks (uses public/progress-core.js)
 src/routes/student.js   Sign-up/login, lessons, saving progress
 src/routes/admin.js     Teacher API: overview, students, lessons, assignments, CSV
 src/validate.js         Input rules
 test/api.test.js        End-to-end API tests (run with TEST_DATABASE_URL set to an empty test database)
 src/seed.js             6 starter lessons (only added to an empty database)
+public/progress-core.js Scoring rules shared by the server and the browser
 public/app.js           Student app
 public/admin.js         Teacher dashboard
 ```

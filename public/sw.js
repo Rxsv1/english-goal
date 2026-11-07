@@ -1,9 +1,9 @@
 /* Offline support. Everything is fetched from the network first, so updates show up
    immediately; the saved copy is only used when there is no internet.
    API calls are never cached (progress is queued by the app itself when offline). */
-const VERSION = 'v7';
+const VERSION = 'v8';
 const SHELL = `shell-${VERSION}`;
-const SHELL_FILES = ['/', '/app.js', '/style.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
+const SHELL_FILES = ['/', '/app.js', '/progress-core.js', '/style.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(SHELL).then(c => c.addAll(SHELL_FILES)).then(() => self.skipWaiting()));

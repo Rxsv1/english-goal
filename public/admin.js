@@ -36,6 +36,7 @@
   }
 
   async function api(method, url, body, raw) {
+    if (method !== 'GET') cache.clear(); // anything we change makes the remembered pages out of date
     const res = await fetch(url, {
       method,
       headers: { Accept: 'application/json', ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: 'Bearer ' + token } : {}) },
@@ -48,6 +49,41 @@
     if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
     return data;
   }
+
+  /* Pages already seen are kept in memory, so opening them again is instant. They are refreshed quietly in the
+     background and redrawn only if something changed (and never while you are typing). */
+  const cache = new Map();   // url -> { data, t }
+  const inflight = new Map();
+  function fetchFresh(url) {
+    if (!inflight.has(url)) inflight.set(url, api('GET', url).then(d => { cache.set(url, { data: d, t: Date.now() }); return d; })
+      .finally(() => inflight.delete(url)));
+    return inflight.get(url);
+  }
+  function get(url) {
+    const hit = cache.get(url);
+    if (!hit) return fetchFresh(url);
+    if (Date.now() - hit.t > 1500) {
+      const my = viewId;
+      fetchFresh(url).then(d => {
+        const typing = document.activeElement && view.contains(document.activeElement) && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+        if (JSON.stringify(d) !== JSON.stringify(hit.data) && my === viewId && !dirty && !typing) route(true);
+      }).catch(() => {});
+    }
+    return Promise.resolve(hit.data);
+  }
+  const warm = url => { if (token && !cache.has(url)) fetchFresh(url).catch(() => {}); };
+  // Start loading the main lists early, and a student's page as soon as a finger or mouse gets near it.
+  function warmMain() { warm('/api/admin/overview'); warm('/api/admin/users'); warm('/api/admin/lessons'); }
+  function warmLink(e) {
+    const a = e.target.closest && e.target.closest('a[href^="#/"]');
+    if (!a) return;
+    const m = a.getAttribute('href').match(/^#\/(students|lessons)\/([^/]+)(?:\/(progress))?$/);
+    if (!m || m[2] === 'new') return;
+    if (m[1] === 'students') warm(`/api/admin/users/${m[2]}`);
+    else if (m[3]) warm(`/api/admin/lessons/${m[2]}/progress`);
+  }
+  document.addEventListener('pointerover', warmLink);
+  document.addEventListener('touchstart', warmLink, { passive: true });
 
   async function download(url, filename) {
     try {
@@ -101,6 +137,7 @@
     const kids = nodes.flat().filter(n => n !== null && n !== undefined && n !== false);
     const layer = view.querySelector(':scope > .sk-layer');
     view.removeAttribute('aria-busy');
+    view.classList.remove('busy');
     if (!layer) return view.replaceChildren(...kids);
     view.replaceChildren(layer, ...kids);
     kids.forEach(k => k.classList && k.classList.add('reveal'));
@@ -108,14 +145,11 @@
     if (getComputedStyle(layer).animationName === 'none') layer.remove();
     else layer.addEventListener('animationend', () => layer.remove(), { once: true });
   }
-  // Placeholder that mirrors the real screen ('tiles' = cards and charts, 'list' = rows). Markup lives in admin.html.
-  function loading(kind = 'list') {
-    const old = view.querySelector(':scope > .sk-layer');
-    if (old && old.dataset.kind === kind && view.children.length === 1) return;
-    const layer = h('div', { class: 'sk-layer', 'data-kind': kind, role: 'status', 'aria-label': 'Loading' });
-    layer.append(document.getElementById('sk-' + kind).content.cloneNode(true));
-    view.replaceChildren(layer);
-    view.setAttribute('aria-busy', 'true');
+  // First open: the skeleton from the HTML is already on screen, so there is nothing to do. Later, when a page has
+  // not been seen yet, the current screen simply stays and a thin line runs along the top until the next one is ready.
+  function loading() {
+    if (view.querySelector(':scope > .sk-layer')) return;
+    view.classList.add('busy');
   }
   const errorBox = e => setView(h('div', { class: 'state' }, h('div', { class: 'big' }, '⚠️'), h('p', null, e.message),
     h('button', { class: 'btn btn-ghost', type: 'button', onclick: route }, 'Try again')));
@@ -169,6 +203,7 @@
   /* ================= auth ================= */
   function logout() {
     token = null;
+    cache.clear();
     try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
     showLogin();
   }
@@ -188,6 +223,7 @@
         token = (await api('POST', '/api/admin/login', { password: pw.value })).token;
         try { localStorage.setItem(TOKEN_KEY, token); } catch (err) {}
         route();
+        warmMain();
       } catch (err) { msg.textContent = err.message; }
     });
     setView(h('section', { class: 'auth' },
@@ -197,7 +233,7 @@
   }
 
   /* ================= router ================= */
-  function route() {
+  function route(keepScroll) {
     viewId++;
     if (!token) return showLogin();
     tabs.hidden = false;
@@ -205,7 +241,7 @@
     const parts = (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean);
     const tab = parts[0] || 'overview';
     tabs.querySelectorAll('a').forEach(a => { if (a.dataset.tab === tab) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
-    window.scrollTo(0, 0);
+    if (keepScroll !== true) window.scrollTo(0, 0);
     if (tab === 'students') {
       if (parts[1] && parts[2] === 'lessons' && parts[3] === 'new') return showEditor(null, { userId: parts[1] });
       if (parts[1] && parts[2] === 'lessons' && parts[3] && parts[4] === 'edit') return showEditor(parts[3], { userId: parts[1] });
@@ -231,7 +267,7 @@
     const my = viewId;
     loading('tiles');
     let d;
-    try { d = await api('GET', '/api/admin/overview'); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    try { d = await get('/api/admin/overview'); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
@@ -255,7 +291,7 @@
     const my = viewId;
     loading('list');
     let users;
-    try { users = (await api('GET', '/api/admin/users')).users; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    try { users = (await get('/api/admin/users')).users; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
 
     const search = h('input', { class: 'search', type: 'search', placeholder: 'Search by name or email…', 'aria-label': 'Search students' });
@@ -316,7 +352,7 @@
     const my = viewId;
     loading('tiles');
     let d;
-    try { d = await api('GET', `/api/admin/users/${id}`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    try { d = await get(`/api/admin/users/${id}`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const u = d.user, s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
@@ -456,7 +492,7 @@
     const my = viewId;
     loading('list');
     let lessons;
-    try { const d = await api('GET', '/api/admin/lessons'); lessons = d.lessons; levels = d.levels || levels; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    try { const d = await get('/api/admin/lessons'); lessons = d.lessons; levels = d.levels || levels; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
 
     const list = h('ul', { class: 'admin-list' }, lessons.map(l => {
@@ -522,7 +558,7 @@
     let lesson = { title: '', emoji: '📘', slug: '', level: 'A1', description: '', sentences: [], published: true, visibility: ctx ? 'assigned' : 'public', assignedUserIds: [] };
     let users = [];
     try {
-      const [l, u] = await Promise.all([id ? api('GET', `/api/admin/lessons/${id}`) : null, api('GET', '/api/admin/users')]);
+      const [l, u] = await Promise.all([id ? api('GET', `/api/admin/lessons/${id}`) : null, get('/api/admin/users')]);
       if (l) lesson = l.lesson;
       users = u.users;
     } catch (e) { return my === viewId ? errorBox(e) : undefined; }
@@ -725,7 +761,7 @@
     const my = viewId;
     loading('tiles');
     let d;
-    try { d = await api('GET', `/api/admin/lessons/${id}/progress`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    try { d = await get(`/api/admin/lessons/${id}/progress`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const l = d.lesson;
     const st = d.students;
@@ -763,4 +799,5 @@
 
   /* ================= boot ================= */
   route();
+  warmMain();
 })();

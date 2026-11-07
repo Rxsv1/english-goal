@@ -67,24 +67,67 @@ module.exports = function studentRoutes(pool) {
   /* ================= Everything below needs a logged-in student ================= */
   r.use(requireUser);
 
-  r.get('/me', wrap(async (req, res) => {
-    const uid = req.user.id;
+  async function loadStats(uid) {
     const [sp, lp, days] = await Promise.all([
       pool.query(`SELECT COUNT(*)::int AS solved, COALESCE(SUM(stars),0)::int AS stars, COALESCE(SUM(${EXTRA_SQL}),0)::int AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT COUNT(*) FILTER (WHERE completed_at IS NOT NULL)::int AS completed, COALESCE(SUM(time_spent_sec),0)::int AS time FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
                   WHERE user_id = $1 AND type IN ('sentence_solved','cards_done','lesson_start') ORDER BY d DESC LIMIT 400`, [uid]),
     ]);
+    return {
+      sentencesSolved: sp.rows[0].solved,
+      stars: sp.rows[0].stars,
+      extraStars: sp.rows[0].extra,
+      lessonsCompleted: lp.rows[0].completed,
+      timeSpent: lp.rows[0].time,
+      streak: streak(days.rows.map(x => x.d)),
+    };
+  }
+
+  r.get('/me', wrap(async (req, res) => {
+    res.json({ user: publicUser(req.user), stats: await loadStats(req.user.id) });
+  }));
+
+  // Everything the app needs to run, in one request: the student, their stats, and every lesson they can
+  // open with all its sentences and their own progress. The app keeps this on the device and works from it,
+  // so no screen ever waits for the network (see public/app.js).
+  r.get('/app', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const [stats, lessons, lp, sp, up] = await Promise.all([
+      loadStats(uid),
+      pool.query(`SELECT l.* FROM lessons l WHERE ${VISIBLE_SQL} ORDER BY l.position, l.title`, [uid]),
+      pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
+      pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
+    ]);
+    const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
+    const solved = groupSolved(sp.rows);
+    const extras = groupSolved(sp.rows, 'extra');
+    const unitMap = groupUnits(up.rows);
+    const iso = d => (d ? new Date(d).toISOString() : null);
+    res.set('Cache-Control', 'no-store');
     res.json({
       user: publicUser(req.user),
-      stats: {
-        sentencesSolved: sp.rows[0].solved,
-        stars: sp.rows[0].stars,
-        extraStars: sp.rows[0].extra,
-        lessonsCompleted: lp.rows[0].completed,
-        timeSpent: lp.rows[0].time,
-        streak: streak(days.rows.map(x => x.d)),
-      },
+      stats,
+      lessons: lessons.rows.map(l => {
+        const s = solved.get(l.id) || new Map(), x = extras.get(l.id) || new Map();
+        const p = lpMap.get(l.id);
+        return {
+          slug: l.slug,
+          title: l.title,
+          level: l.level,
+          description: l.description,
+          emoji: l.emoji,
+          assigned: l.visibility === 'assigned',
+          units: unitsOf(l).map(u => ({
+            id: u.id,
+            title: u.title,
+            sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0 })),
+          })),
+          lp: p ? { started_at: iso(p.started_at), last_activity_at: iso(p.last_activity_at), completed_at: iso(p.completed_at), time_spent_sec: p.time_spent_sec } : null,
+          unitRows: [...(unitMap.get(l.id) || new Map()).values()].map(r => ({ unit_id: r.unit_id, learn_index: r.learn_index, learned_at: iso(r.learned_at) })),
+        };
+      }),
     });
   }));
 

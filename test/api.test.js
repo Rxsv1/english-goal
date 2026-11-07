@@ -239,6 +239,66 @@ test('a unit the student already finished is never locked, even if a new unit is
   assert.ok(lesson.units.length === 2);
 });
 
+test('the on-device progress rules give exactly the same result as the server', { skip }, async () => {
+  const Core = require('../public/progress-core.js');
+  const eva = await newStudent('Eva');
+  const made = await admin('POST', `/users/${eva.id}/lessons`, lessonBody('Parity lesson'));
+  const slug = made.data.lesson.slug;
+  const snapshot = async () => (await eva.as('GET', '/app')).data;
+  const mine = d => d.lessons.find(l => l.slug === slug);
+
+  // Start from the bootstrap data, then apply every action locally AND on the server.
+  const local = await snapshot();
+  const raw = mine(local);
+  const u1 = raw.units[0], u2 = raw.units[1];
+  const steps = [
+    ['learn', u1.id, 0, false], ['learn', u1.id, 1, true],
+    ['solve', 'I like green apples', 0, 3],          // 1 star
+    ['solve', 'She is reading a book', 0, 1],        // 2 stars
+    ['solve', 'I like green apples', 0, 0],          // retry, perfect: +2 extra
+    ['solve', 'She is reading a book', 5, 5],        // worse retry: nothing changes
+    ['learn', u2.id, 0, true],
+    ['solve', 'We are going home now', 0, 0],        // finishes the lesson
+    ['solve', 'We are going home now', 2, 0],
+  ];
+  for (const [kind, a, b, c] of steps) {
+    if (kind === 'learn') {
+      Core.applyLearn(raw, a, b, c, 0, new Date().toISOString());
+      assert.equal((await eva.as('POST', `/lessons/${slug}/units/${a}/learn`, c ? { index: b, done: true } : { index: b })).status, 200);
+    } else {
+      const stars = Core.starsFor(b, c);
+      const r = Core.applySolve(raw, local.stats, a, stars, 0, new Date().toISOString());
+      const server = await solve(eva, slug, a, b, c);
+      assert.equal(server.status, 200, JSON.stringify(server.data));
+      assert.equal(r.extra, server.data.extra, `extra for "${a}"`);
+      assert.equal(r.best, server.data.best, `best for "${a}"`);
+      assert.equal(r.completed, server.data.completed, `completed after "${a}"`);
+    }
+  }
+
+  const remote = await snapshot();
+  // Everything except the clock times (device and server clocks differ by a few milliseconds).
+  const plain = m => { const o = JSON.parse(JSON.stringify(m)); for (const k of ['startedAt', 'lastActivityAt', 'completedAt']) o[k] = o[k] ? 'set' : null; return o; };
+  // The progress numbers must match what the server works out from its own data.
+  assert.deepEqual(plain(Core.modelOf(raw)), plain(Core.modelOf(mine(remote))));
+  assert.deepEqual(local.stats, { ...remote.stats, streak: local.stats.streak }, 'overall stats');
+  // ...and what the classic per-lesson endpoint reports.
+  const classic = (await eva.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.deepEqual(plain(Core.modelOf(mine(remote))), plain(classic));
+});
+
+test('GET /app returns only what the student may see, in one request', { skip }, async () => {
+  const mia = await newStudent('Mia');
+  const other = await newStudent('Noa');
+  const made = await admin('POST', `/users/${other.id}/lessons`, lessonBody('Noa only'));
+  const data = (await mia.as('GET', '/app')).data;
+  assert.equal(data.user.name, 'Mia');
+  assert.ok(Array.isArray(data.lessons) && data.lessons.length >= 1);
+  assert.ok(!data.lessons.some(l => l.slug === made.data.lesson.slug), "another student's private lesson is not included");
+  assert.ok(data.lessons.every(l => l.units.every(u => u.sentences.every(s => typeof s.en === 'string' && s.stars === 0))));
+  assert.equal((await call('GET', '/api/app')).status, 401, 'needs a login');
+});
+
 test('compressed responses are served', { skip }, async () => {
   const res = await fetch(BASE + '/app.js', { headers: { 'Accept-Encoding': 'gzip' } });
   assert.equal(res.headers.get('content-encoding'), 'gzip');

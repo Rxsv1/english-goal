@@ -2,6 +2,7 @@
 (function () {
   'use strict';
 
+  const Progress = window.ProgressCore; // the scoring rules, shared with the server (progress-core.js)
   const app = document.getElementById('app');
   const APP_NAME = (document.querySelector('meta[name="app-name"]') || {}).content || 'WordStack';
   const MAX_PRACTICE = 30;
@@ -84,7 +85,7 @@
     if (!res.ok) {
       const e = new Error(data.error || `Something went wrong (${res.status}).`);
       e.status = res.status;
-      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; saveHome(null); goLogin(); }
+      if (res.status === 401 && !url.startsWith('/api/auth/') && url !== '/api/me') { me = null; dropData(); goLogin(); }
       if (res.status === 403 && /disabled/i.test(e.message)) { me = null; toast(e.message); goLogin(); }
       throw e;
     }
@@ -114,11 +115,12 @@
     async flush() {
       if (this.flushing || !me) return;
       this.flushing = true;
+      let sent = 0;
       try {
         for (const item of this.items()) {
           if (item.user !== me.id) continue;
           try {
-            await api('POST', item.url, item.body);
+            await api('POST', item.url, item.body); sent++;
           } catch (e) {
             if (!e.status || e.status >= 500 || e.status === 429 || e.status === 401) break; // try again later
           }
@@ -126,10 +128,76 @@
         }
       } finally {
         this.flushing = false;
+        if (sent) scheduleSync(400);
       }
     },
   };
   window.addEventListener('online', () => outbox.flush());
+
+  /* ---------- The student's data: in memory and on the device ---------- */
+  // Everything the app needs (lessons, sentences, the student's own progress) is loaded once with GET /api/app and
+  // saved on the device. It is read synchronously when the script starts, so every screen opens at once, with no
+  // waiting for the network. Progress is applied here first (same rules as the server) and sent in the background.
+  let S = storage.get('ws:app', null); // { user, stats, lessons: [...] }
+  let synced = false;                  // true once this visit has heard from the server
+  let rev = 0;                         // counts local changes, so a late server answer can never undo them
+  let rerender = null;                 // redraws the current screen from S (only for screens that just display data)
+  const models = new WeakMap();
+  const saveData = () => storage.set('ws:app', S);
+  const dropData = () => { S = null; synced = false; storage.set('ws:app', null); storage.set('ws:home', null); };
+  const rawLesson = slug => (S ? S.lessons.find(l => l.slug === slug) || null : null);
+  const modelOf = raw => { let m = models.get(raw); if (!m) models.set(raw, m = Progress.modelOf(raw)); return m; };
+
+  const lessonList = () => S.lessons.map(l => ({
+    slug: l.slug, title: l.title, level: l.level, description: l.description, emoji: l.emoji, assigned: l.assigned,
+    count: l.units.reduce((a, u) => a + u.sentences.length, 0), progress: modelOf(l),
+  }));
+  // A private copy for a screen to work with (a round must not change under its own feet).
+  function lessonView(slug) {
+    const raw = rawLesson(slug);
+    if (!raw) return null;
+    return {
+      lesson: { slug: raw.slug, title: raw.title, level: raw.level, description: raw.description, emoji: raw.emoji, assigned: raw.assigned,
+        units: JSON.parse(JSON.stringify(raw.units)) },
+      progress: modelOf(raw),
+    };
+  }
+  function noteLearn(slug, unitId, index, done, seconds) {
+    const raw = rawLesson(slug);
+    if (!raw) return;
+    Progress.applyLearn(raw, unitId, index, done, seconds, new Date().toISOString());
+    models.delete(raw); rev++; saveData();
+  }
+  function noteSolve(slug, sentence, stars, seconds) {
+    const raw = rawLesson(slug);
+    const r = raw && Progress.applySolve(raw, S.stats, sentence, stars, seconds, new Date().toISOString());
+    if (!r) return { stars, best: stars, extra: 0, replay: false, completed: false };
+    models.delete(raw); rev++; saveData();
+    return r;
+  }
+
+  // Asks the server for the latest and quietly swaps it in. If the student did something meanwhile, or progress
+  // is still waiting to be sent, the (older) answer is ignored and we ask again a moment later.
+  let syncing = false, syncTimer = 0;
+  function scheduleSync(ms) { clearTimeout(syncTimer); syncTimer = setTimeout(refresh, ms == null ? 1500 : ms); }
+  async function refresh() {
+    if (syncing) return;
+    syncing = true;
+    const startRev = rev, hadData = Boolean(S);
+    try {
+      const d = await api('GET', '/api/app');
+      if (startRev !== rev || outbox.items().length) { scheduleSync(1500); return; }
+      const changed = JSON.stringify(d) !== JSON.stringify(S);
+      S = d; me = d.user; synced = true; saveData();
+      if (!hadData || app.querySelector(':scope > .sk-layer')) route();        // a screen was waiting for data
+      else if (changed && rerender) rerender();
+    } catch (e) {
+      if (!S && e.status !== 401) errorView(e, () => { refresh(); });
+    } finally {
+      syncing = false;
+    }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && me) { outbox.flush(); scheduleSync(200); } });
 
   /* ---------- Sound, speech, confetti ---------- */
   let audioCtx;
@@ -257,6 +325,7 @@
 
   function route() {
     viewId++;
+    rerender = null;
     if (cleanup) { cleanup(); cleanup = null; }
     stopSpeech();
     window.scrollTo(0, 0);
@@ -365,8 +434,9 @@
         const body = { email: email.value, password: password.value };
         if (isSignup) body.name = name.value;
         await api('POST', isSignup ? '/api/auth/signup' : '/api/auth/login', body);
-        meRequest = null; // never reuse an answer that belongs to someone else
-        await loadMe();
+        dropData(); // never keep anything that belongs to someone else
+        S = await api('GET', '/api/app'); me = S.user; synced = true; saveData();
+        outbox.flush();
         navigate(safeNext, true);
         if (isSignup) toast(`Welcome, ${me.name}`);
       } catch (err) {
@@ -417,28 +487,11 @@
     return where + (u.learned ? `Step 2 · ${u.solved} of ${u.total} built` : 'Step 1 · learning the sentences');
   }
 
-  // The last home screen is kept on this device. It is read once, synchronously, when the script starts, so
-  // the lesson list can be drawn at once while fresh data loads. Fresh data then replaces it only if it differs.
-  let homeCache = storage.get('ws:home', null);
-  const saveHome = data => { homeCache = data; storage.set('ws:home', data); };
-
-  async function showHome() {
+  function showHome() {
     document.title = config.appName;
-    const my = viewId;
-    const cached = homeCache && me && homeCache.uid === me.id ? homeCache : null;
-    if (cached) renderHome(cached.lessons, cached.stats); else showSkeleton('home');
-    let lessons, stats;
-    try {
-      const [l, m] = await Promise.all([api('GET', '/api/lessons'), freshMe()]);
-      lessons = l.lessons; stats = m.stats; me = m.user;
-    } catch (e) {
-      if (my === viewId && !cached && e.status !== 401) errorView(e, showHome);
-      return;
-    }
-    const fresh = { uid: me.id, user: me, lessons, stats };
-    const changed = !cached || JSON.stringify([cached.lessons, cached.stats]) !== JSON.stringify([lessons, stats]);
-    saveHome(fresh);
-    if (my === viewId && changed) renderHome(lessons, stats);
+    if (!S) return showSkeleton('home');
+    rerender = () => renderHome(lessonList(), S.stats);
+    rerender();
     outbox.flush();
   }
 
@@ -540,23 +593,21 @@
   /* ================================================================ */
   /* Lesson page: list of units                                        */
   /* ================================================================ */
-  let lessonCache = null; // { slug, lesson, progress }
-
-  async function loadLesson(slug) {
-    const data = await api('GET', `/api/lessons/${slug}`);
-    lessonCache = { slug, ...data };
-    return lessonCache;
-  }
-
   const unitPath = (slug, unit, step) => `/lesson/${slug}/u/${unit.id}/${step}`;
 
-  async function showLessonHub(slug) {
-    const my = viewId;
-    showSkeleton('hub');
-    let data;
-    try { data = await loadLesson(slug); } catch (e) { if (my === viewId && e.status !== 401) errorView(e, () => showLessonHub(slug)); return; }
-    if (my !== viewId) return;
-    lessonCache = null;
+  // A lesson we don't have (yet): wait for the first answer from the server, then decide.
+  function missingLesson(kind) {
+    if (!synced) return showSkeleton(kind);
+    errorView({ status: 404 });
+  }
+
+  function showLessonHub(slug) {
+    const draw = () => { const data = lessonView(slug); if (data) renderHub(slug, data); else missingLesson('hub'); };
+    rerender = draw;
+    draw();
+  }
+
+  function renderHub(slug, data) {
     const { lesson, progress: p } = data;
     document.title = `${lesson.title} · ${config.appName}`;
     const multi = lesson.units.length > 1;
@@ -654,16 +705,9 @@
     );
   }
 
-  async function showLessonStep(slug, unitId, step) {
-    const my = viewId;
-    let data = lessonCache && lessonCache.slug === slug ? lessonCache : null;
-    if (!data) {
-      showSkeleton('step');
-      try { data = await loadLesson(slug); }
-      catch (e) { if (my === viewId && e.status !== 401) errorView(e, () => showLessonStep(slug, unitId, step)); return; }
-      if (my !== viewId) return;
-    }
-    lessonCache = null; // refetch next time so progress is fresh
+  function showLessonStep(slug, unitId, step) {
+    const data = lessonView(slug);
+    if (!data) return missingLesson('step');
     const ui = data.lesson.units.findIndex(u => u.id === unitId);
     if (ui < 0) { toast('This unit was changed by your teacher.'); return navigate(`/lesson/${slug}`, true); }
     const unit = data.lesson.units[ui];
@@ -696,6 +740,11 @@
     const sentences = unit.sentences;
     const total = sentences.length;
     const learnUrl = `/api/lessons/${slug}/units/${unit.id}/learn`;
+    // Progress is saved on the device at once and sent to the server in the background.
+    const sendLearn = (index, done, seconds) => {
+      noteLearn(slug, unit.id, index, done, seconds);
+      return outbox.send(learnUrl, done ? { index, done: true, seconds } : { index, seconds });
+    };
     let i = up.learned ? 0 : Math.min(up.learnIndex, total - 1);
     let reach = up.learned ? total - 1 : Math.min(up.learnIndex, total - 1); // furthest card the student may jump to
     let shownAt = Date.now();
@@ -770,9 +819,8 @@
     async function go(delta) {
       const secs = secondsOnCard();
       if (delta > 0 && i === total - 1) {
-        next.disabled = true;
-        await outbox.send(learnUrl, { index: i, done: true, seconds: secs }).catch(e => toast(e.message));
-        next.disabled = false;
+        sendLearn(i, true, secs).catch(e => toast(e.message));
+        scheduleSync(1500);
         sfx.finish();
         if (restart) navigate(reviewPath, true);
         else if (!up.learned) { toast('Great! Now build the sentences 🧩'); navigate(unitPath(slug, unit, 'build'), true); }
@@ -782,7 +830,7 @@
       i = Math.max(0, Math.min(total - 1, i + delta));
       reach = Math.max(reach, i);
       sfx.card();
-      if (delta > 0 && !up.learned) outbox.send(learnUrl, { index: i, seconds: secs }).catch(() => {});
+      if (delta > 0 && !up.learned) sendLearn(i, false, secs).catch(() => {});
       render(true);
     }
 
@@ -809,7 +857,7 @@
     document.addEventListener('keydown', onKey);
     cleanup = () => document.removeEventListener('keydown', onKey);
 
-    if (up.status === 'new') outbox.send(learnUrl, { index: 0, seconds: 0 }).catch(() => {});
+    if (up.status === 'new') sendLearn(0, false, 0).catch(() => {});
     render(true);
   }
 
@@ -832,7 +880,7 @@
 
     const results = []; // stars per item this round
     let pos = 0, round = null, sortables = [];
-    const saves = []; // every save request of this round, so the result screen waits for all of them
+    const locals = []; // what each sentence of this round earned, worked out on the device at once
     const canGoBack = mode !== 'build';
 
     const pill = h('div', { class: 'pill' });
@@ -922,11 +970,13 @@
       const s = starsFor(round.mistakes + round.hints);
       results[pos] = s;
       const seconds = Math.min(600, Math.round((Date.now() - round.startedAt) / 1000));
-      let saved = null;
+      let local = null;
       if (tracked) {
-        saved = outbox.send(`/api/lessons/${slug}/solve`, { sentence: round.sentence, mistakes: round.mistakes, hints: round.hints, seconds, cid: round.cid })
+        // Stars, extra and unlocks are worked out here and now (same rules as the server), so nothing waits for the network.
+        local = noteSolve(slug, round.sentence, s, seconds);
+        locals[pos] = local;
+        outbox.send(`/api/lessons/${slug}/solve`, { sentence: round.sentence, mistakes: round.mistakes, hints: round.hints, seconds, cid: round.cid })
           .catch(e => { toast(e.message); return null; });
-        saves.push(saved);
         if (mode === 'build') doneCount++;
       }
       sortables.forEach(x => x.option('disabled', true));
@@ -939,13 +989,8 @@
       solvedPanel.hidden = false;
       solvedPanel.classList.remove('pop'); void solvedPanel.offsetWidth; solvedPanel.classList.add('pop');
       // Practising a sentence again: a better result than before is added as extra stars.
-      if (saved) {
-        const thisRound = round;
-        saved.then(r => {
-          if (r && r.replay && r.extra > 0 && round === thisRound)
-            solvedPanel.append(h('div', { class: 'extra-tag' }, `+${r.extra} extra ${r.extra === 1 ? 'star' : 'stars'} added to your score!`));
-        });
-      }
+      if (local && local.replay && local.extra > 0)
+        solvedPanel.append(h('div', { class: 'extra-tag' }, `+${local.extra} extra ${local.extra === 1 ? 'star' : 'stars'} added to your score!`));
       const praise = s === 3 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : s === 2 ? ['Well done! 👏', 'Great job! 😊', 'Nice work! 👍'] : ['You got it! 💪', 'Good job, keep going! 🌈'];
       feedback.textContent = praise[(Math.random() * praise.length) | 0];
       feedback.className = 'feedback good';
@@ -1027,19 +1072,18 @@
     document.addEventListener('keydown', onKey);
     cleanup = () => { document.removeEventListener('keydown', onKey); sortables.forEach(s => s.destroy()); };
 
-    async function finish() {
+    function finish() {
       cleanup(); cleanup = null;
-      const outcomes = tracked ? await Promise.all(saves) : [];
-      const offline = outcomes.some(r => r === null);
-      const extraGained = outcomes.reduce((a, r) => a + ((r && r.extra) || 0), 0);
+      const offline = tracked && (!navigator.onLine || outbox.items().length > 0);
+      const extraGained = locals.reduce((a, r) => a + ((r && r.extra) || 0), 0);
       const earned = results.reduce((a, b) => a + (b || 0), 0);
       const max = items.length * 3;
       const building = tracked && mode === 'build';
       const unitDone = building; // a build round only ends when every remaining sentence of the unit is built
-      const serverDone = outcomes.some(r => r && r.completed);
-      const lessonDone = building && (outcomes.length && !offline ? serverDone : unitIndex === lesson.units.length - 1);
+      const now = tracked ? lessonView(slug) : null; // the up-to-date state, worked out on the device
+      const lessonDone = building && Boolean(now && now.progress.completed);
       const nextUnit = tracked ? lesson.units[unitIndex + 1] : null;
-      const nextOpen = nextUnit && o.progress && o.progress.units[unitIndex + 1] && !o.progress.units[unitIndex + 1].locked;
+      const nextOpen = nextUnit && now && now.progress.units[unitIndex + 1] && !now.progress.units[unitIndex + 1].locked;
       const weak = items.filter((_, i) => (results[i] || 0) < 3);
       const replayed = tracked && mode === 'review';
 
@@ -1078,6 +1122,7 @@
           h('span', { class: 's', 'aria-label': `${results[i] || 0} stars` }, starNodes(results[i] || 0))))),
         actions));
       sfx.finish(); confetti(lessonDone ? 200 : 120);
+      if (tracked) scheduleSync(1500); // check with the server in the background
     }
 
     loadRound();
@@ -1123,13 +1168,11 @@
   /* ================================================================ */
   /* Profile                                                           */
   /* ================================================================ */
-  async function showProfile() {
+  function showProfile() {
     document.title = `My profile · ${config.appName}`;
-    const my = viewId;
-    showSkeleton('profile');
-    let data;
-    try { data = await freshMe(); } catch (e) { if (my === viewId && e.status !== 401) errorView(e, showProfile); return; }
-    if (my !== viewId) return;
+    if (!S) return showSkeleton('profile');
+    rerender = showProfile;
+    const data = { user: S.user, stats: S.stats };
     me = data.user;
     const s = data.stats;
 
@@ -1142,7 +1185,7 @@
       h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save name'));
     nameForm.addEventListener('submit', async e => {
       e.preventDefault(); nameMsg.textContent = '';
-      try { const r = await api('PATCH', '/api/me', { name: nameInput.value }); me = r.user; meRequest = null; saveHome(null); toast('Name saved'); }
+      try { const r = await api('PATCH', '/api/me', { name: nameInput.value }); me = r.user; S.user = r.user; saveData(); toast('Name saved'); }
       catch (err) { nameMsg.textContent = err.message; }
     });
 
@@ -1163,7 +1206,7 @@
 
     const logout = async () => {
       try { await api('POST', '/api/auth/logout'); } catch (e) { /* ignore */ }
-      me = null; meRequest = null; saveHome(null);
+      me = null; dropData();
       navigate('/login', true);
     };
 
@@ -1187,34 +1230,19 @@
   /* ================================================================ */
   /* Boot                                                              */
   /* ================================================================ */
-  // /api/me is asked for once and shared: the app start and the home screen both need it.
-  let meRequest = null;
-  function freshMe() {
-    if (!meRequest) meRequest = api('GET', '/api/me').finally(() => setTimeout(() => { meRequest = null; }, 1500));
-    return meRequest;
-  }
-
-  async function loadMe() {
-    try {
-      me = (await freshMe()).user;
-      outbox.flush();
-    } catch (e) {
-      // Only a real "not logged in" answer logs out. With no network we keep what we know, so the app still opens offline.
-      if (e.status === 401 || e.status === 403 || !me) me = null;
-    }
-  }
-
   (async function boot() {
     const onAuth = /^\/(login|signup)$/.test(location.pathname);
-    const cached = location.pathname === '/' && homeCache ? homeCache : null;
-    if (cached) me = cached.user; // local data: paint the home screen right away, check the login in the background
     const cfg = api('GET', '/api/config').then(c => { config = { ...config, ...c }; }).catch(() => { /* offline: use defaults */ });
-    const who = onAuth ? Promise.resolve() : loadMe();
-    if (onAuth || cached) route(); // nothing to wait for
-    await Promise.all([cfg, who]);
-    if (onAuth) { if (!config.allowSignup && location.pathname === '/signup') route(); }
-    else if (cached) { if (!me) { saveHome(null); goLogin(); } }
-    else route();
+    if (onAuth) {
+      route();
+      await cfg;
+      if (!config.allowSignup && location.pathname === '/signup') route();
+      return;
+    }
+    // Returning student: everything is on the device, so the screen opens at once and the server is asked in the background.
+    // First visit: the skeleton from the HTML stays until the first answer arrives.
+    if (S) { me = S.user; route(); }
+    await Promise.all([cfg, refresh()]);
   })();
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
