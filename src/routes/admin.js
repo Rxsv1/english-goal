@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateLesson, validateUser, LEVELS } = require('../validate');
-const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, streak, EXTRA_SQL } = require('../progress');
+const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL } = require('../progress');
 const { slugify } = require('../validate');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -121,9 +121,123 @@ module.exports = function adminRoutes(pool) {
     lessonsStarted: u.lessons_started, timeSpent: u.time_spent,
   });
 
+  // The student list: besides the totals, when each student was last active, which lesson they are on, and their quiz results.
   r.get('/users', wrap(async (req, res) => {
-    const { rows } = await pool.query(`${USER_STATS_SQL} ORDER BY u.last_seen_at DESC NULLS LAST, u.created_at DESC`);
-    res.json({ users: rows.map(u => ({ ...userOut(u), stats: statsOut(u) })) });
+    const [{ rows }, last, current, quiz, lastQuiz] = await Promise.all([
+      pool.query(`${USER_STATS_SQL} ORDER BY u.last_seen_at DESC NULLS LAST, u.created_at DESC`),
+      pool.query('SELECT user_id, MAX(last_activity_at) AS at FROM lesson_progress GROUP BY user_id'),
+      // the lesson they worked on most recently that is not finished (or, if all are finished, the latest one)
+      pool.query(`SELECT DISTINCT ON (lp.user_id) lp.user_id, l.title, l.emoji, lp.completed_at
+                  FROM lesson_progress lp JOIN lessons l ON l.id = lp.lesson_id
+                  ORDER BY lp.user_id, (lp.completed_at IS NULL) DESC, lp.last_activity_at DESC`),
+      pool.query(`SELECT user_id, COUNT(*) FILTER (WHERE passed AND NOT grandfathered)::int AS passed_n, COUNT(*)::int AS attempts
+                  FROM quiz_attempts WHERE NOT grandfathered GROUP BY user_id`),
+      pool.query(`SELECT DISTINCT ON (user_id) user_id, score, total, passed, created_at FROM quiz_attempts
+                  WHERE NOT grandfathered ORDER BY user_id, created_at DESC`),
+    ]);
+    const lastBy = new Map(last.rows.map(x => [x.user_id, x.at]));
+    const curBy = new Map(current.rows.map(x => [x.user_id, x]));
+    const qBy = new Map(quiz.rows.map(x => [x.user_id, x]));
+    const lqBy = new Map(lastQuiz.rows.map(x => [x.user_id, x]));
+    res.json({
+      users: rows.map(u => {
+        const c = curBy.get(u.id), q = qBy.get(u.id), lq = lqBy.get(u.id);
+        return {
+          ...userOut(u),
+          stats: statsOut(u),
+          lastActiveAt: lastBy.get(u.id) || null,
+          currentLesson: c ? { title: c.title, emoji: c.emoji, completed: Boolean(c.completed_at) } : null,
+          quiz: { passed: q ? q.passed_n : 0, attempts: q ? q.attempts : 0, last: lq ? { score: lq.score, total: lq.total, passed: lq.passed, at: lq.created_at } : null },
+        };
+      }),
+    });
+  }));
+
+  // Students who need a look: nothing done for 7 days (and still lessons to do), or 3 failed tries at the same quiz.
+  r.get('/attention', wrap(async (req, res) => {
+    const [inactive, failing] = await Promise.all([
+      pool.query(`
+        SELECT u.id, u.name, u.email, COALESCE(MAX(lp.last_activity_at), u.created_at) AS last_active,
+               (SELECT COUNT(*) FROM lessons l WHERE l.published AND (l.visibility = 'public'
+                  OR EXISTS (SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = l.id AND a.user_id = u.id)))::int AS visible,
+               COUNT(lp.lesson_id) FILTER (WHERE lp.completed_at IS NOT NULL)::int AS done
+        FROM users u LEFT JOIN lesson_progress lp ON lp.user_id = u.id
+        WHERE NOT u.disabled
+        GROUP BY u.id
+        HAVING COALESCE(MAX(lp.last_activity_at), u.created_at) < now() - interval '7 days'`),
+      pool.query(`
+        SELECT u.id AS user_id, u.name, u.email, l.* , a.scope, COUNT(*)::int AS fails
+        FROM quiz_attempts a JOIN users u ON u.id = a.user_id JOIN lessons l ON l.id = a.lesson_id
+        WHERE NOT a.voided AND NOT a.passed AND NOT u.disabled
+          AND NOT EXISTS (SELECT 1 FROM quiz_attempts p WHERE p.user_id = a.user_id AND p.lesson_id = a.lesson_id
+                          AND p.scope = a.scope AND p.passed AND NOT p.voided)
+        GROUP BY u.id, u.name, u.email, l.id, a.scope
+        HAVING COUNT(*) >= 3`),
+    ]);
+    const byUser = new Map();
+    const entry = (id, name, email) => { if (!byUser.has(id)) byUser.set(id, { userId: id, name, email, reasons: [] }); return byUser.get(id); };
+    for (const x of inactive.rows) {
+      if (x.visible <= x.done) continue; // nothing left to do
+      entry(x.id, x.name, x.email).reasons.push({ type: 'inactive', days: Math.floor((Date.now() - new Date(x.last_active).getTime()) / 86400000), lastActiveAt: x.last_active });
+    }
+    for (const x of failing.rows) {
+      entry(x.user_id, x.name, x.email).reasons.push({ type: 'quiz', lesson: x.title, emoji: x.emoji, quiz: scopeLabel(x, x.scope), fails: x.fails });
+    }
+    res.json({ students: [...byUser.values()].sort((a, b) => b.reasons.length - a.reasons.length || a.name.localeCompare(b.name)) });
+  }));
+
+  // "Unit 2 · Discussing results" / "Final quiz" for a quiz scope of a lesson row.
+  function scopeLabel(lesson, scope) {
+    if (scope === 'final') return 'Final quiz';
+    const units = unitsOf(lesson);
+    const i = units.findIndex(u => 'unit:' + u.id === scope);
+    return i < 0 ? 'Unit quiz' : units.length > 1 ? `Unit ${i + 1} · ${units[i].title}` : 'Quiz';
+  }
+
+  // Every quiz attempt of one student, with each question and what they chose (not the automatic credit for old progress).
+  r.get('/users/:id/quiz', wrap(async (req, res) => {
+    const uid = req.params.id;
+    const [att, live] = await Promise.all([
+      pool.query(`SELECT a.id, a.scope, a.score, a.total, a.passed, a.details, a.seconds, a.voided, a.created_at AS attempt_at, l.*, a.id AS attempt_id
+                  FROM quiz_attempts a JOIN lessons l ON l.id = a.lesson_id
+                  WHERE a.user_id = $1 AND NOT a.grandfathered ORDER BY a.created_at DESC, a.id DESC LIMIT 100`, [uid]),
+      pool.query(`SELECT a.lesson_id, a.scope, BOOL_OR(a.passed) AS passed, BOOL_AND(a.grandfathered) AS credit, l.*
+                  FROM quiz_attempts a JOIN lessons l ON l.id = a.lesson_id
+                  WHERE a.user_id = $1 AND NOT a.voided GROUP BY a.lesson_id, a.scope, l.id`, [uid]),
+    ]);
+    res.json({
+      attempts: att.rows.map(a => ({
+        id: a.attempt_id, lessonId: a.id, lesson: a.title, emoji: a.emoji, scope: a.scope, label: scopeLabel(a, a.scope),
+        score: a.score, total: a.total, passed: a.passed, voided: a.voided, seconds: a.seconds, at: a.attempt_at, details: a.details,
+      })),
+      live: live.rows.map(x => ({ lessonId: x.lesson_id, lesson: x.title, emoji: x.emoji, scope: x.scope, label: scopeLabel(x, x.scope), passed: x.passed, credit: x.credit })),
+    });
+  }));
+
+  // The teacher lets a student take a quiz again: its attempts are "voided", so it no longer counts as passed.
+  // The unit/lesson that depended on it is open again until the student passes.
+  r.post('/users/:id/lessons/:lessonId/quiz/reset', wrap(async (req, res) => {
+    const { id: uid, lessonId } = req.params;
+    const scope = String((req.body && req.body.scope) || '').slice(0, 80);
+    if (scope !== 'final' && !scope.startsWith('unit:')) return res.status(400).json({ error: 'Unknown quiz.' });
+    const { rows: [l] } = await pool.query('SELECT * FROM lessons WHERE id = $1', [lessonId]);
+    if (!l) return res.status(404).json({ error: 'Lesson not found.' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const v = await client.query('UPDATE quiz_attempts SET voided = TRUE WHERE user_id = $1 AND lesson_id = $2 AND scope = $3 AND NOT voided', [uid, lessonId, scope]);
+      if (!v.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'This student has not taken that quiz.' }); }
+      await client.query('UPDATE lesson_progress SET completed_at = NULL WHERE user_id = $1 AND lesson_id = $2', [uid, lessonId]);
+      await client.query("INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'quiz_reset',$3::jsonb)",
+        [uid, lessonId, JSON.stringify({ scope, label: scopeLabel(l, scope) })]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.status(204).end();
   }));
 
   r.post('/users', wrap(async (req, res) => {
@@ -146,7 +260,7 @@ module.exports = function adminRoutes(pool) {
     const { rows: [u] } = await pool.query(`${USER_STATS_SQL} WHERE u.id = $1`, [uid]);
     if (!u) return res.status(404).json({ error: 'Student not found.' });
 
-    const [lessons, lp, sp, up, assigned, days, events, daily] = await Promise.all([
+    const [lessons, lp, sp, up, assigned, days, events, daily, qa] = await Promise.all([
       pool.query(`SELECT l.*, (SELECT COUNT(*) FROM lesson_assignments a WHERE a.lesson_id = l.id)::int AS assigned_count
                   FROM lessons l ORDER BY l.position, l.title`),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
@@ -154,18 +268,20 @@ module.exports = function adminRoutes(pool) {
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
       pool.query('SELECT lesson_id FROM lesson_assignments WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
-                  WHERE user_id = $1 AND type IN ('sentence_solved','cards_done','lesson_start') ORDER BY d DESC LIMIT 400`, [uid]),
-      recentEvents({ userId: uid, limit: 60 }),
+                  WHERE user_id = $1 AND type IN ('sentence_solved','grammar_solved') ORDER BY d DESC LIMIT 400`, [uid]),
+      recentEvents({ userId: uid, limit: 400 }),
       pool.query(`SELECT to_char(d, 'YYYY-MM-DD') AS day, COUNT(e.id)::int AS solved
         FROM generate_series((now() AT TIME ZONE 'UTC')::date - 13, (now() AT TIME ZONE 'UTC')::date, interval '1 day') d
         LEFT JOIN events e ON (e.created_at AT TIME ZONE 'UTC')::date = d AND e.user_id = $1 AND e.type = 'sentence_solved'
         GROUP BY d ORDER BY d`, [uid]),
+      pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [uid]),
     ]);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
     const extras = groupSolved(sp.rows, 'extra');
     const grammars = groupGrammar(sp.rows);
     const unitMap = groupUnits(up.rows);
+    const quizBy = groupQuiz(qa.rows);
     const assignedIds = new Set(assigned.rows.map(x => x.lesson_id));
 
     res.json({
@@ -175,7 +291,7 @@ module.exports = function adminRoutes(pool) {
         ...lessonOut(l, { assignedCount: l.assigned_count }),
         assignedToUser: assignedIds.has(l.id),
         visibleToUser: l.published && (l.visibility === 'public' || assignedIds.has(l.id)),
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id)),
       })),
       daily: daily.rows,
       events,
@@ -264,13 +380,15 @@ module.exports = function adminRoutes(pool) {
   r.get('/lessons/:id/progress', wrap(async (req, res) => {
     const { rows: [l] } = await pool.query('SELECT * FROM lessons WHERE id = $1', [req.params.id]);
     if (!l) return res.status(404).json({ error: 'Lesson not found.' });
-    const [users, lp, sp] = await Promise.all([
+    const [users, lp, sp, qa] = await Promise.all([
       pool.query(`SELECT u.* FROM users u WHERE $2 = 'public' OR EXISTS (SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = $1 AND a.user_id = u.id)
                     OR EXISTS (SELECT 1 FROM lesson_progress p WHERE p.lesson_id = $1 AND p.user_id = u.id)
                   ORDER BY u.name`, [l.id, l.visibility]),
       pool.query('SELECT * FROM lesson_progress WHERE lesson_id = $1', [l.id]),
       pool.query(`SELECT user_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE lesson_id = $1`, [l.id]),
+      pool.query(`SELECT user_id, scope, passed FROM quiz_attempts WHERE lesson_id = $1 AND ${PASSED_QUIZ_SQL}`, [l.id]),
     ]);
+    const quizByUser = groupQuiz(qa.rows, 'user_id');
     const up = await pool.query('SELECT * FROM unit_progress WHERE lesson_id = $1', [l.id]);
     const unitsByUser = groupUnits(up.rows, 'user_id');
     const lpMap = new Map(lp.rows.map(x => [x.user_id, x]));
@@ -279,8 +397,36 @@ module.exports = function adminRoutes(pool) {
     const grammarByUser = groupGrammar(sp.rows, 'user_id');
     res.json({
       lesson: lessonOut(l, { units: unitsOf(l).map(u => ({ id: u.id, title: u.title, count: u.sentences.length })) }),
-      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id), grammarByUser.get(u.id)) })),
+      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id), grammarByUser.get(u.id), quizByUser.get(u.id)) })),
     });
+  }));
+
+  // The sentences students find hardest in one lesson: wrong tries and hints while building, wrong grammar choices, wrong quiz answers.
+  r.get('/lessons/:id/hard', wrap(async (req, res) => {
+    const { rows: [l] } = await pool.query('SELECT * FROM lessons WHERE id = $1', [req.params.id]);
+    if (!l) return res.status(404).json({ error: 'Lesson not found.' });
+    const [sp, qz] = await Promise.all([
+      pool.query(`SELECT sentence, COUNT(*)::int AS students, COALESCE(SUM(total_mistakes),0)::int AS mistakes, COALESCE(SUM(total_hints),0)::int AS hints,
+                         COALESCE(SUM(grammar_mistakes),0)::int AS grammar, COALESCE(SUM(times_solved),0)::int AS plays
+                  FROM sentence_progress WHERE lesson_id = $1 GROUP BY sentence`, [l.id]),
+      pool.query(`SELECT d->>'sentence' AS sentence, COUNT(*)::int AS asked,
+                         COUNT(*) FILTER (WHERE NOT (d->>'correct')::boolean)::int AS wrong,
+                         COUNT(DISTINCT a.user_id) FILTER (WHERE NOT (d->>'correct')::boolean)::int AS students_wrong
+                  FROM quiz_attempts a, jsonb_array_elements(a.details) d
+                  WHERE a.lesson_id = $1 AND NOT a.grandfathered GROUP BY 1`, [l.id]),
+    ]);
+    const spBy = new Map(sp.rows.map(x => [x.sentence, x])), qzBy = new Map(qz.rows.map(x => [x.sentence, x]));
+    const out = [];
+    unitsOf(l).forEach((u, ui) => u.sentences.forEach(sn => {
+      const a = spBy.get(sn.en) || {}, q = qzBy.get(sn.en) || {};
+      const score = (a.mistakes || 0) + (a.hints || 0) + (a.grammar || 0) + (q.wrong || 0);
+      if (score > 0) out.push({
+        sentence: sn.en, unit: unitsOf(l).length > 1 ? `Unit ${ui + 1}` : null, students: a.students || 0, plays: a.plays || 0,
+        mistakes: a.mistakes || 0, hints: a.hints || 0, grammar: a.grammar || 0, quizAsked: q.asked || 0, quizWrong: q.wrong || 0, quizStudentsWrong: q.students_wrong || 0, score,
+      });
+    }));
+    out.sort((x, y) => y.score - x.score);
+    res.json({ sentences: out.slice(0, 15) });
   }));
 
   async function saveAssignments(client, lessonId, userIds) {
@@ -437,6 +583,13 @@ module.exports = function adminRoutes(pool) {
     ]);
     const assigned = await pool.query('SELECT lesson_id, user_id FROM lesson_assignments');
     const up = await pool.query('SELECT * FROM unit_progress');
+    const qzRows = await pool.query(`SELECT user_id, lesson_id, scope, passed FROM quiz_attempts WHERE ${PASSED_QUIZ_SQL}`);
+    const qzMap = new Map();
+    for (const row of qzRows.rows) {
+      const k = row.user_id + '|' + row.lesson_id;
+      if (!qzMap.has(k)) qzMap.set(k, { units: new Set(), final: false });
+      if (row.scope === 'final') qzMap.get(k).final = true; else qzMap.get(k).units.add(String(row.scope).replace(/^unit:/, ''));
+    }
     const upMap = new Map();
     for (const row of up.rows) {
       const k = row.user_id + '|' + row.lesson_id;
@@ -470,7 +623,7 @@ module.exports = function adminRoutes(pool) {
         const k = u.id + '|' + l.id;
         const visible = l.visibility === 'public' || assignedSet.has(l.id + '|' + u.id);
         if (!visible && !lpMap.has(k)) continue;
-        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k), grMap.get(k));
+        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k), grMap.get(k), qzMap.get(k));
         lines.push([u.name, u.email, l.title, l.level, p.status, p.unitsCompleted, p.unitsTotal, p.units.filter(u => u.learned).length + '/' + p.unitsTotal, p.solved, p.total, p.stars, p.extra, p.maxStars,
           Math.round(p.timeSpent / 60), p.completedAt ? new Date(p.completedAt).toISOString() : '',
           p.lastActivityAt ? new Date(p.lastActivityAt).toISOString() : ''].map(esc).join(','));

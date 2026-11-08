@@ -7,6 +7,16 @@ and the teacher dashboard shows exactly what each student has done.
 - **Students:** `https://your-app.cranl.net/`
 - **Teacher:** `https://your-app.cranl.net/admin`
 
+## One-screen lessons (phones)
+
+While a student plays a step (cards, build, grammar) the page is exactly one screen tall and never scrolls: a top bar, a stage
+that takes the space that is left, and a dock with round icon buttons and one main button pinned at the bottom.
+Results of a step ("Perfect!", "Next") slide up as a sheet over the dock. In the Build step the word tiles shrink a little for
+long sentences so everything fits; the code for this is `fit()` in `runPuzzle` (`public/app.js`) and the "v3" part of `public/style.css`.
+Progress inside a step is a row of dots, the Hint button shows how many of its 3 hints are left, and finishing a lesson opens a full-screen
+celebration with a "Next lesson" button. iPhones get a one-time "Add to Home Screen" tip, and a slim bar shows while the phone is offline.
+The lesson page shows only the current unit open; tapping any other unit opens a short list of its steps.
+
 ## The learning method
 
 Every unit follows the same three steps, built around memorising whole sentences so students can speak:
@@ -55,8 +65,8 @@ I live [in|on|at] Cairo.
 - **Go back to anything:** every unit a student has opened can be revisited: read its cards again (jump to any card
   with the `1 / 5` button), practise the whole unit, or open **All sentences** to listen to or practise one single sentence.
 - **Start over without losing anything:** *Restart* on a unit, or *Start lesson over* on the lesson page, replays it from
-  the first sentence. Saved progress, unlocked units and stars are never reset or lowered. If the student does better
-  than before, the improvement is added as **extra stars** (shown as "+N extra"; also visible to the teacher).
+  the first sentence. Saved progress, unlocked units and stars are never reset or changed: playing a sentence again is
+  **practice only** and gives no stars.
 - **Everything is instant.** When a student opens the app, one request (`GET /api/app`) loads all their lessons, sentences and
   progress. It is kept in memory and on the device, so every screen (home, lesson, cards, puzzle, results, profile) opens at
   once with no waiting for the network, and a returning student never sees a loading screen. Stars, extra stars and unlocked
@@ -150,11 +160,54 @@ students need to build that one sentence again.
 - Starter lessons are only added to a brand-new database, never again after a teacher has deleted them.
 - `npm test` checks all of this, including that the browser and the server work out stars identically.
 
-## How stars and "extra" work
+## How stars work
 
-Each sentence gives 3 stars (perfect), 2 (1-2 mistakes/hints) or 1. The first result is the student's base score and
-is what unlocks the next unit. When a sentence is played again, a lower or equal result changes nothing; a higher
-result raises the best score and the difference is counted as extra (best = first + extra, never above 3 per sentence).
+Each sentence gives 3 stars (perfect), 2 (1-2 mistakes/hints) or 1. In the Build step only the **first** wrong arrangement of a
+sentence counts as a mistake, and a sentence has at most 3 hints. The result of the first time is the student's score and is
+what unlocks the next unit. Playing a sentence again is practice only: the saved stars never change (so "extra" stars are always 0
+for new progress; older extra stars in the database are still shown). The streak counts the days on which the student finished at
+least one sentence (Build or Grammar); a missed day resets it to 0. The database is the source of truth: the phone saves progress
+at once, sends it in the background, and re-reads everything from the server when the app is opened, when the connection comes back
+and about once a minute.
+
+## Grammar gaps are automatic
+
+When a teacher saves a lesson (or imports a JSON file), every sentence without a gap that contains am/is/are, was/were, have/has or
+do/does gets a grammar gap automatically (switch in the lesson editor; it can be turned off). Sentences without one of those words
+get no gap, because a safe wrong choice cannot be made for them. Existing lessons are not changed until they are saved again.
+
+## Quizzes (required)
+
+Every unit ends with a **quiz** (step 4, after Cards, Build and Grammar), and a lesson with more than one unit ends with a **final quiz** of
+the whole lesson. A unit is finished when everything is built, the grammar is answered **and its quiz is passed**; a lesson is finished
+when every unit is and the final quiz is passed (a lesson with one unit has no final quiz: its unit quiz is the lesson's quiz).
+
+- Questions are multiple choice (3 options) and made automatically from the lesson's own sentences: *listen and choose the sentence*,
+  *choose the missing word* (a grammar gap is used when the sentence has one), and *choose the sentence whose words are in the right order*.
+  One question per sentence, at most 10, picked at random; every try is a new quiz. A phone that cannot speak gets no listening questions.
+- Pass mark **70%** (rounded up); try as many times as you like. A wrong answer shows the right one and moves on. No stars: pass or fail.
+- `public/quiz-core.js` builds and marks a quiz from a seed, and is shared by the app and the server. The phone sends only the seed and
+  the chosen answers; the server builds the same quiz again and marks it itself, so a pass cannot be made up.
+- Progress finished **before** quizzes existed keeps its credit (a one-time step in `src/db.js` gives it a passed quiz), so nobody sees a
+  finished unit or lesson become unfinished.
+
+### Teacher page
+
+- **Students:** last active, the lesson they are on, stars, quiz results; a **needs attention** list (no activity for 7 days while there is
+  still something to do, or 3 failed tries at the same quiz) on the Overview and as a filter in Students.
+- **A student's card:** a timeline of every step (by day, with mistakes, hints and time; filter: sentences / quizzes) and a **Quizzes** panel
+  with every attempt opening to each question, what the student chose and the right answer, plus **Reset quiz** (the student takes that quiz
+  again; the unit/lesson is open again until they pass; old attempts stay visible).
+- **A lesson's progress page:** a Final-quiz column and the **hardest sentences** (wrong tries and hints while building, wrong grammar choices,
+  wrong quiz answers, across all students).
+
+## On a computer
+
+From 900 px wide the app uses a calmer desktop layout: text size grows smoothly with the screen, pages are capped at about 1200 px, a lesson
+step is a centred column of about 900 px (buttons keep a sensible width instead of stretching), the "Perfect!" sheet is a card as wide as
+the puzzle, and the lesson page has two columns. Buttons have hover and keyboard-focus feedback, and Enter works as the main button on the
+cards. The teacher pages are up to 1280 px wide, and a student's card has two columns (numbers and lessons on the left, quizzes and the
+timeline on the right). Phones are not affected: all of this is inside `min-width` media queries.
 
 ## Run locally
 

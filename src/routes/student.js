@@ -4,7 +4,8 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateUser } = require('../validate');
-const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
+const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
+const Quiz = require('../../public/quiz-core');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const clampInt = (v, min, max) => Math.min(max, Math.max(min, Number.isFinite(+v) ? Math.round(+v) : 0));
@@ -76,7 +77,7 @@ module.exports = function studentRoutes(pool) {
       pool.query(`SELECT COUNT(*)::int AS solved, COALESCE(SUM(stars),0)::int AS stars, COALESCE(SUM(${EXTRA_SQL}),0)::int AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT COUNT(*) FILTER (WHERE completed_at IS NOT NULL)::int AS completed, COALESCE(SUM(time_spent_sec),0)::int AS time FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
-                  WHERE user_id = $1 AND type IN ('sentence_solved','cards_done','lesson_start') ORDER BY d DESC LIMIT 400`, [uid]),
+                  WHERE user_id = $1 AND type IN ('sentence_solved','grammar_solved') ORDER BY d DESC LIMIT 400`, [uid]),
     ]);
     return {
       sentencesSolved: sp.rows[0].solved,
@@ -97,13 +98,15 @@ module.exports = function studentRoutes(pool) {
   // so no screen ever waits for the network (see public/app.js).
   r.get('/app', wrap(async (req, res) => {
     const uid = req.user.id;
-    const [stats, lessons, lp, sp, up] = await Promise.all([
+    const [stats, lessons, lp, sp, up, qa] = await Promise.all([
       loadStats(uid),
       pool.query(`SELECT l.* FROM lessons l WHERE ${VISIBLE_SQL} ORDER BY l.position, l.title`, [uid]),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [uid]),
     ]);
+    const quizBy = groupQuiz(qa.rows);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
     const extras = groupSolved(sp.rows, 'extra');
@@ -117,8 +120,10 @@ module.exports = function studentRoutes(pool) {
       lessons: lessons.rows.map(l => {
         const s = solved.get(l.id) || new Map(), x = extras.get(l.id) || new Map(), g = grammars.get(l.id) || new Set();
         const p = lpMap.get(l.id);
+        const qz = quizBy.get(l.id) || { units: new Set(), final: false };
         return {
           slug: l.slug,
+          finalPassed: qz.final,
           title: l.title,
           level: l.level,
           description: l.description,
@@ -127,6 +132,7 @@ module.exports = function studentRoutes(pool) {
           units: unitsOf(l).map(u => ({
             id: u.id,
             title: u.title,
+            quizPassed: qz.units.has(u.id),
             sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}) })),
           })),
           lp: p ? { started_at: iso(p.started_at), last_activity_at: iso(p.last_activity_at), completed_at: iso(p.completed_at), time_spent_sec: p.time_spent_sec } : null,
@@ -157,17 +163,19 @@ module.exports = function studentRoutes(pool) {
   /* ================= Lessons & progress ================= */
   r.get('/lessons', wrap(async (req, res) => {
     const uid = req.user.id;
-    const [lessons, lp, sp, up] = await Promise.all([
+    const [lessons, lp, sp, up, qa] = await Promise.all([
       pool.query(`SELECT l.* FROM lessons l WHERE ${VISIBLE_SQL} ORDER BY l.position, l.title`, [uid]),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
+      pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [uid]),
     ]);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
     const extras = groupSolved(sp.rows, 'extra');
     const grammars = groupGrammar(sp.rows);
     const unitMap = groupUnits(up.rows);
+    const quizBy = groupQuiz(qa.rows);
     res.set('Cache-Control', 'no-store');
     res.json({
       lessons: lessons.rows.map(l => ({
@@ -178,7 +186,7 @@ module.exports = function studentRoutes(pool) {
         emoji: l.emoji,
         assigned: l.visibility === 'assigned',
         count: l.sentences.length,
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id)),
       })),
     });
   }));
@@ -192,11 +200,13 @@ module.exports = function studentRoutes(pool) {
     const uid = req.user.id;
     const lesson = await loadVisibleLesson(uid, req.params.slug);
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
-    const [lp, sp, up] = await Promise.all([
+    const [lp, sp, up, qa] = await Promise.all([
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
       pool.query(`SELECT sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2`, [uid, lesson.id]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
+      pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]),
     ]);
+    const quiz = groupQuiz(qa.rows).get(lesson.id);
     const solved = new Map(sp.rows.map(x => [x.sentence, x.stars]));
     const extras = new Map(sp.rows.filter(x => x.extra).map(x => [x.sentence, x.extra]));
     const grammar = new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence));
@@ -216,18 +226,19 @@ module.exports = function studentRoutes(pool) {
           sentences: u.sentences.map(s => ({ en: s.en, stars: solved.get(s.en) || 0, extra: extras.get(s.en) || 0, ...(s.gap ? { gap: s.gap, gdone: grammar.has(s.en) } : {}) })),
         })),
       },
-      progress: summarize(lesson, lp.rows[0], solved, unitRows, extras, grammar),
+      progress: summarize(lesson, lp.rows[0], solved, unitRows, extras, grammar, quiz),
     });
   }));
 
   // True when this unit is still locked for the student (a brand-new unit behind an unfinished one).
   async function isUnitLocked(db, uid, lesson, unitId) {
-    const [sp, up] = await Promise.all([
+    const [sp, up, qa] = await Promise.all([
       db.query('SELECT sentence, stars, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
       db.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]),
+      db.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]),
     ]);
     const p = summarize(lesson, null, new Map(sp.rows.map(x => [x.sentence, x.stars])), new Map(up.rows.map(x => [x.unit_id, x])),
-      undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)));
+      undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id));
     const u = p.units.find(x => x.id === unitId);
     return Boolean(u && u.locked);
   }
@@ -245,20 +256,22 @@ module.exports = function studentRoutes(pool) {
   }
 
   /**
-   * Called inside a transaction after progress changed. A unit is finished when all its sentences are built and all its
-   * grammar gaps answered; the lesson is finished when every unit is. The teacher's log gets one entry for each, once.
+   * Called inside a transaction after progress changed. A unit is finished when all its sentences are built, all its
+   * grammar gaps answered and its quiz passed; the lesson is finished when every unit is (and, with more than one unit,
+   * the final quiz is passed). The teacher's log gets one entry for each, once. `unit` is null after the final quiz.
    */
   async function completionChecks(client, uid, lesson, unit) {
-    const { rows } = await client.query(
-      'SELECT sentence, stars, grammar_done FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
+    const { rows } = await client.query('SELECT sentence, stars, grammar_done FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
+    const qa = await client.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]);
+    const quiz = groupQuiz(qa.rows).get(lesson.id) || { units: new Set(), final: false };
     const solved = new Map(rows.map(x => [x.sentence, x.stars]));
     const answered = new Set(rows.filter(x => x.grammar_done).map(x => x.sentence));
-    const isDone = u => u.sentences.every(sn => solved.has(sn.en) && (!sn.gap || answered.has(sn.en)));
+    const isDone = u => u.sentences.every(sn => solved.has(sn.en) && (!sn.gap || answered.has(sn.en))) && quiz.units.has(u.id);
     const allSentences = unitsOf(lesson).flatMap(u => u.sentences);
-    const allDone = unitsOf(lesson).every(isDone);
-    const unitDone = isDone(unit);
+    const allDone = unitsOf(lesson).every(isDone) && (unitsOf(lesson).length < 2 || quiz.final);
+    const unitDone = unit ? isDone(unit) : false;
     let justCompleted = false, unitJustCompleted = false;
-    if (unitDone) {
+    if (unit && unitDone) {
       const already = await client.query(
         "SELECT 1 FROM events WHERE user_id = $1 AND lesson_id = $2 AND type = 'unit_complete' AND data->>'unitId' = $3", [uid, lesson.id, unit.id]);
       if (!already.rowCount) {
@@ -353,18 +366,18 @@ module.exports = function studentRoutes(pool) {
       if (await touchLesson(client, uid, lesson.id, seconds)) await client.query(
         "INSERT INTO events (user_id, lesson_id, type) VALUES ($1,$2,'lesson_start')", [uid, lesson.id]);
 
-      // Practising again never lowers anything. A better result raises the best score, and the
-      // improvement is counted as "extra" on top of what the student first achieved.
+      // Practising again is practice only: the stars from the first time stay exactly as they were
+      // (no more, no less), so there is never any "extra". Only the practice counters are updated.
       const prevRow = await client.query(
         'SELECT stars FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3', [uid, lesson.id, sentence]);
       const replay = prevRow.rowCount > 0;
       const before = replay ? prevRow.rows[0].stars : 0;
-      const extra = replay ? Math.max(0, stars - before) : 0;
+      const extra = 0;
       const { rows: sp } = await client.query(
         `INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars, best_mistakes, best_hints, total_mistakes, total_hints)
          VALUES ($1,$2,$3,$4,$4,$5,$6,$5,$6)
          ON CONFLICT (user_id, lesson_id, sentence) DO UPDATE SET
-           stars = GREATEST(sentence_progress.stars, EXCLUDED.stars),
+           stars = sentence_progress.stars,
            best_mistakes = LEAST(sentence_progress.best_mistakes, EXCLUDED.best_mistakes),
            best_hints = LEAST(sentence_progress.best_hints, EXCLUDED.best_hints),
            times_solved = sentence_progress.times_solved + 1,
@@ -377,7 +390,7 @@ module.exports = function studentRoutes(pool) {
       await client.query(
         "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'sentence_solved',$3::jsonb)",
         [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, stars, mistakes, hints, seconds,
-          ...(replay ? { replay: true, extra } : {}), ...(cid ? { cid } : {}) })]);
+          ...(replay ? { replay: true } : {}), ...(cid ? { cid } : {}) })]);
 
       const done = await completionChecks(client, uid, lesson, unit);
       await client.query('COMMIT');
@@ -427,6 +440,79 @@ module.exports = function studentRoutes(pool) {
       const done = await completionChecks(client, uid, lesson, unit);
       await client.query('COMMIT');
       res.json({ completed: done.allDone, justCompleted: done.justCompleted, unitCompleted: done.unitDone, unitJustCompleted: done.unitJustCompleted });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }));
+
+  // Step 4 - a quiz attempt. `scope` is 'unit:<unitId>' (the mini quiz at the end of a unit) or 'final' (the whole lesson).
+  // The phone only sends the seed it used and the answers it chose; the server builds the same quiz again and marks it
+  // itself, so a pass can never be made up. Passing is what finishes the unit / lesson; failing just means "try again".
+  r.post('/lessons/:slug/quiz', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const lesson = await loadVisibleLesson(uid, req.params.slug);
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
+    const b = req.body || {};
+    const scope = String(b.scope || '').slice(0, 80);
+    const units = unitsOf(lesson);
+    const everything = units.flatMap(u => u.sentences);
+    let unit = null;
+    if (scope === 'final') {
+      if (units.length < 2) return res.status(400).json({ error: 'This lesson has no final quiz.' });
+    } else if (scope.startsWith('unit:')) {
+      unit = units.find(u => u.id === scope.slice(5));
+      if (!unit) return res.status(404).json({ error: 'This unit no longer exists.' });
+    } else return res.status(400).json({ error: 'Unknown quiz.' });
+    const seed = clampInt(b.seed, 0, 2147483646);
+    const seconds = clampInt(b.seconds, 0, 3600);
+    const cid = typeof b.cid === 'string' ? b.cid.slice(0, 64) : null;
+    const questions = Quiz.build({ sentences: unit ? unit.sentences : everything, context: everything, seed, noListen: Boolean(b.noListen) });
+    const picks = Array.isArray(b.picks) ? b.picks.slice(0, 50).map(x => (Number.isInteger(x) ? x : -1)) : [];
+    if (!questions.length || picks.length !== questions.length) return res.status(400).json({ error: 'Answer every question.' });
+    const graded = Quiz.grade(questions, picks);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [uid + lesson.id]);
+      if (cid) {
+        const dup = await client.query('SELECT 1 FROM quiz_attempts WHERE user_id = $1 AND cid = $2', [uid, cid]);
+        if (dup.rowCount) { await client.query('ROLLBACK'); return res.json({ duplicate: true }); }
+      }
+      // The quiz is the last step: everything must be built (and the grammar answered) first; the final quiz needs every unit finished.
+      const sp = await client.query('SELECT sentence, stars, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
+      const up = await client.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
+      const qa = await client.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]);
+      const state = summarize(lesson, null, new Map(sp.rows.map(x => [x.sentence, x.stars])), new Map(up.rows.map(x => [x.unit_id, x])),
+        undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id));
+      if (unit) {
+        const u = state.units.find(x => x.id === unit.id);
+        if (u.locked) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Finish the previous unit first.' }); }
+        if (!u.quizReady && !u.quizPassed) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Build the sentences and finish the grammar first.' }); }
+      } else if (!state.units.every(u => u.completed)) {
+        await client.query('ROLLBACK'); return res.status(409).json({ error: 'Finish every unit first.' });
+      }
+      if (await touchLesson(client, uid, lesson.id, seconds)) await client.query(
+        "INSERT INTO events (user_id, lesson_id, type) VALUES ($1,$2,'lesson_start')", [uid, lesson.id]);
+      const details = questions.map((q, i) => ({
+        sentence: q.sentence, type: q.type, prompt: q.prompt, options: q.options, answer: q.answer, picked: graded.results[i].picked, correct: graded.results[i].correct,
+      }));
+      await client.query(
+        'INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, details, seconds, cid) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)',
+        [uid, lesson.id, scope, graded.score, graded.total, graded.passed, JSON.stringify(details), seconds, cid]);
+      await client.query(
+        "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'quiz_attempt',$3::jsonb)",
+        [uid, lesson.id, JSON.stringify({ scope, ...(unit ? { unit: unit.title, unitId: unit.id } : {}), score: graded.score, total: graded.total, needed: graded.needed, passed: graded.passed, seconds })]);
+      const done = await completionChecks(client, uid, lesson, unit);
+      await client.query('COMMIT');
+      res.json({
+        score: graded.score, total: graded.total, needed: graded.needed, passed: graded.passed,
+        results: graded.results.map(x => ({ correct: x.correct, answer: x.answer })),
+        completed: done.allDone, justCompleted: done.justCompleted, unitCompleted: done.unitDone, unitJustCompleted: done.unitJustCompleted,
+      });
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;

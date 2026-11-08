@@ -21,6 +21,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+  <div id="offline" class="offline" role="status" hidden></div>
   <main id="app" class="page" data-layout="{{LAYOUT}}" aria-busy="true">{{SKELETON}}</main>
 
   <!-- Skeleton screens. The server copies the right one into #app so it is painted before any JavaScript runs;
@@ -29,9 +30,7 @@
     <header class="appbar"><span class="brand"><i class="sk sk-logo"></i><i class="sk sk-line w-96"></i></span><div class="tools"><i class="sk sk-icon"></i><i class="sk sk-avatar"></i></div></header>
     <div class="sk sk-title"></div>
     <div class="sk sk-sub"></div>
-    <div class="stat-row">
-      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
-      <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
+    <div class="stat-row two">
       <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
       <div class="stat"><i class="sk sk-v"></i><i class="sk sk-l"></i></div>
     </div>
@@ -53,18 +52,17 @@
       <div class="sk sk-sub"></div>
       <div class="hub-progress"><i class="sk sk-big-num"></i><div class="progress-track"><i class="sk sk-fill"></i></div><i class="sk sk-line w-60 sk-hub-line"></i></div>
       <ol class="units">
-        <li class="unit"><div class="unit-head"><i class="sk sk-circle36"></i><div class="step-body"><i class="sk sk-line w-30 sm"></i><i class="sk sk-line w-60 lg"></i><i class="sk sk-line w-50 sm"></i></div></div><i class="sk sk-play"></i></li>
-        <li class="unit"><div class="unit-head"><i class="sk sk-circle36"></i><div class="step-body"><i class="sk sk-line w-30 sm"></i><i class="sk sk-line w-60 lg"></i><i class="sk sk-line w-50 sm"></i></div></div></li>
+        <li class="sk sk-urow"></li>
+        <li class="sk sk-urow"></li>
       </ol>
     </section>
   </template>
 
   <template id="sk-step">
-    <div class="game-top"><i class="sk sk-icon"></i><i class="sk sk-line w-50"></i><i class="sk sk-pill"></i><i class="sk sk-icon"></i></div>
+    <div class="game-top"><i class="sk sk-icon"></i><i class="sk sk-line w-30"></i><i class="sk sk-pill"></i><i class="sk sk-icon"></i></div>
     <div class="progress-track"><i class="sk sk-fill"></i></div>
-    <div class="sk sk-line w-60 sk-prompt"></div>
-    <div class="sk sk-stage"></div>
-    <div class="actions"><i class="sk sk-btn-sm"></i><i class="sk sk-btn-main"></i></div>
+    <div class="sk sk-stage-fill"></div>
+    <div class="dock"><div class="tools"><i class="sk sk-round"></i><i class="sk sk-round"></i></div><i class="sk sk-btn-main"></i></div>
   </template>
 
   <template id="sk-profile">
@@ -100,6 +98,7 @@
   <canvas id="confetti" aria-hidden="true"></canvas>
   <script src="/vendor/Sortable.min.js"></script>
   <script src="/progress-core.js"></script>
+  <script src="/quiz-core.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

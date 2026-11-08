@@ -75,7 +75,7 @@ for (const html of Object.values(rawPages))
 
 const studentSkeleton = p =>
   /^\/(login|signup)\/?$/.test(p) ? 'auth'
-    : /^\/lesson\/[^/]+\/u\//.test(p) ? 'step'
+    : /^\/lesson\/[^/]+\/(u\/|final$)/.test(p) ? 'step'
       : /^\/lesson\//.test(p) ? 'hub'
         : p === '/profile' ? 'profile'
           : p === '/practice' ? 'practice'

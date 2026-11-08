@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const seed = require('./seed');
 const { newUnitId } = require('./validate');
+const { summarize, unitsOf } = require('../public/progress-core');
 
 function createPool() {
   if (!process.env.DATABASE_URL && !process.env.PGHOST) {
@@ -124,7 +125,71 @@ async function migrate(pool) {
 
       -- Speeds up the "already finished this unit/lesson?" checks as the activity log grows.
       CREATE INDEX IF NOT EXISTS events_user_lesson_type ON events(user_id, lesson_id, type);
+
+      -- Quizzes: every attempt is kept (with each question and the student's answer) for the teacher. scope is 'final' or
+      -- 'unit:<unitId>'. A unit/lesson counts as passed while it has a passed attempt that was not "voided" (the teacher
+      -- voids a scope's attempts to make the student take that quiz again). grandfathered = credit given automatically to
+      -- progress that was finished before quizzes existed.
+      CREATE TABLE IF NOT EXISTS quiz_attempts (
+        id            BIGSERIAL PRIMARY KEY,
+        user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id     TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        scope         TEXT NOT NULL,
+        score         INTEGER NOT NULL,
+        total         INTEGER NOT NULL,
+        passed        BOOLEAN NOT NULL,
+        details       JSONB NOT NULL DEFAULT '[]'::jsonb,
+        seconds       INTEGER NOT NULL DEFAULT 0,
+        cid           TEXT,
+        voided        BOOLEAN NOT NULL DEFAULT FALSE,
+        grandfathered BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS quiz_attempts_user_lesson ON quiz_attempts(user_id, lesson_id, scope, created_at DESC);
+      CREATE INDEX IF NOT EXISTS quiz_attempts_lesson ON quiz_attempts(lesson_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS quiz_attempts_cid ON quiz_attempts(user_id, cid) WHERE cid IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, set_at TIMESTAMPTZ NOT NULL DEFAULT now());
     `);
+
+    // Upgrade (once): quizzes became a required step. Whatever a student had already finished before that keeps its credit,
+    // so nobody sees a finished unit or lesson become unfinished.
+    const flagged = await client.query("SELECT 1 FROM app_flags WHERE key = 'quiz_credit_v1'");
+    if (!flagged.rowCount) {
+      const lessons = await client.query('SELECT * FROM lessons');
+      const lps = await client.query('SELECT * FROM lesson_progress');
+      const sps = await client.query('SELECT user_id, lesson_id, sentence, stars, grammar_done AS gdone FROM sentence_progress');
+      const ups = await client.query('SELECT * FROM unit_progress');
+      const key = (u, l) => u + '|' + l;
+      const spBy = new Map(), upBy = new Map(), lpBy = new Map(lps.rows.map(x => [key(x.user_id, x.lesson_id), x]));
+      for (const r of sps.rows) { const k = key(r.user_id, r.lesson_id); if (!spBy.has(k)) spBy.set(k, []); spBy.get(k).push(r); }
+      for (const r of ups.rows) { const k = key(r.user_id, r.lesson_id); if (!upBy.has(k)) upBy.set(k, new Map()); upBy.get(k).set(r.unit_id, r); }
+      const lessonById = new Map(lessons.rows.map(l => [l.id, l]));
+      let credited = 0;
+      for (const [k, rows] of spBy) {
+        const [userId, lessonId] = k.split('|');
+        const l = lessonById.get(lessonId);
+        if (!l) continue;
+        const all = unitsOf(l);
+        // Pretend every quiz is passed: then "completed" simply means "built, and grammar answered".
+        const p = summarize(l, lpBy.get(k), new Map(rows.map(x => [x.sentence, x.stars])), upBy.get(k),
+          undefined, new Set(rows.filter(x => x.gdone).map(x => x.sentence)), { units: all.map(u => u.id), final: true });
+        for (const [i, u] of p.units.entries()) {
+          if (!u.completed) continue;
+          await client.query(
+            `INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, grandfathered) VALUES ($1,$2,$3,$4,$4,TRUE,TRUE)`,
+            [userId, lessonId, 'unit:' + all[i].id, all[i].sentences.length]);
+          credited++;
+        }
+        if (p.completed && p.hasFinal) {
+          await client.query(
+            `INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, grandfathered) VALUES ($1,$2,'final',$3,$3,TRUE,TRUE)`,
+            [userId, lessonId, all.reduce((a, u) => a + u.sentences.length, 0)]);
+          credited++;
+        }
+      }
+      await client.query("INSERT INTO app_flags (key) VALUES ('quiz_credit_v1') ON CONFLICT DO NOTHING");
+      if (credited) console.log(`[db] Quizzes: gave credit for ${credited} units/lessons finished before quizzes existed`);
+    }
 
     // Upgrade: lessons made before units existed become a single unit, keeping students' card progress.
     const old = await client.query('SELECT id FROM lessons WHERE units IS NULL');

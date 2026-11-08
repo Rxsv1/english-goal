@@ -139,6 +139,28 @@
   const countWords = s => s.trim().split(/\s+/).map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')).filter(Boolean).length;
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
+  // Automatic grammar gaps (on by default; the teacher's choice is remembered on this computer).
+  function autoGapsOn() { try { return localStorage.getItem('ws:admin-autogaps') !== '0'; } catch (e) { return true; } }
+  // A plain sentence line gets a gap when it has a safe word (be / have / do); lines that already have a gap, or a typing mistake, are left alone.
+  function withAutoGap(line) {
+    const parsed = GrammarCore.parseLine(line);
+    if (parsed.error || parsed.gap) return line;
+    return GrammarCore.suggestLine(parsed.en) || line;
+  }
+  // The same for lessons that come from an imported JSON file (sentences written as text or as { en }).
+  function autoGapItems(items) {
+    if (!autoGapsOn()) return items;
+    const one = sn => (typeof sn === 'string' ? withAutoGap(sn)
+      : sn && typeof sn === 'object' && typeof sn.en === 'string' && (sn.gap === undefined || sn.gap === null) ? { ...sn, en: withAutoGap(sn.en) } : sn);
+    return items.map(l => {
+      if (!l || typeof l !== 'object') return l;
+      const out = { ...l };
+      if (Array.isArray(l.units)) out.units = l.units.map(u => (u && Array.isArray(u.sentences) ? { ...u, sentences: u.sentences.map(one) } : u));
+      if (Array.isArray(l.sentences)) out.sentences = l.sentences.map(one);
+      return out;
+    });
+  }
+
   function timeAgo(d) {
     if (!d) return 'never';
     const s = Math.round((Date.now() - new Date(d).getTime()) / 1000);
@@ -165,6 +187,7 @@
   function unitCell(u, multi) {
     if (u.completed) return h('span', { class: 'st st-completed' }, '✓');
     if (u.grammarReady) return h('span', { class: 'st st-building', title: 'Built everything, grammar still to do' }, `✏️ ${u.grammarDone}/${u.grammarTotal}`);
+    if (u.quizReady) return h('span', { class: 'st st-building', title: 'Built everything, the quiz is still to do' }, '❓ quiz');
     if (u.learned) return h('span', { class: 'st st-building' }, `${u.solved}/${u.total}`);
     if (u.status === 'learning') return h('span', { class: 'st st-learning' }, `🃏 ${u.learnIndex + 1}/${u.total}`);
     return multi && u.locked ? '🔒' : '–';
@@ -209,7 +232,10 @@
       case 'cards_done': return ['🃏', e.data.unit ? `learned the cards of “${e.data.unit}” in ${L}` : `learned the cards in ${L}`];
       case 'unit_complete': return ['🎯', `finished unit “${e.data.unit}” in ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
       case 'sentence_solved': return [e.data.replay ? '🔁' : '✅', `${e.data.replay ? 'practised a sentence again' : 'built a sentence'} in ${L} ${'★'.repeat(e.data.stars || 0)}${e.data.extra ? ` (+${e.data.extra} extra)` : ''}`,
-        `${e.data.sentence || ''}${e.data.mistakes || e.data.hints ? ` · ${plural(e.data.mistakes || 0, 'mistake')}, ${plural(e.data.hints || 0, 'hint')}` : ''}`];
+        `${e.data.sentence || ''} · ${plural(e.data.mistakes || 0, 'mistake')}, ${plural(e.data.hints || 0, 'hint')}${e.data.seconds ? ` · ${fmtTime(e.data.seconds)}` : ''}`];
+      case 'quiz_attempt': return [e.data.passed ? '🎓' : '❓', `took ${e.data.unit ? `the quiz of unit “${e.data.unit}”` : 'the final quiz'} in ${L}: ${e.data.score}/${e.data.total} ${e.data.passed ? '✓ passed' : '✗ not passed'}`,
+        `Needs ${e.data.needed}/${e.data.total}${e.data.seconds ? ` · ${fmtTime(e.data.seconds)}` : ''}`];
+      case 'quiz_reset': return ['🔁', `quiz reset in ${L}: ${e.data.label || 'quiz'}`, 'The student takes it again'];
       case 'grammar_solved': return [e.data.replay ? '🔁' : '✏️', `${e.data.replay ? 'practised the grammar again' : 'chose the missing word'} in ${L}${e.data.mistakes ? ` (${plural(e.data.mistakes, 'wrong choice')})` : ''}`, e.data.sentence || ''];
       case 'restart': return ['🔄', e.data.unit ? `started unit “${e.data.unit}” over in ${L}` : `started ${L} over`, 'Saved progress was kept'];
       case 'lesson_complete': return ['🏆', `completed ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
@@ -228,6 +254,61 @@
           small ? h('small', null, small) : null),
         h('time', { datetime: e.at, title: new Date(e.at).toLocaleString() }, timeAgo(e.at)));
     }));
+  }
+
+  // A student's timeline: every step they took, grouped by day, with mistakes, hints and time spent. Filter by kind.
+  const KINDS = { all: null, sentences: ['sentence_solved', 'grammar_solved', 'cards_done'], quizzes: ['quiz_attempt', 'quiz_reset'] };
+  function timeline(events) {
+    if (!events.length) return h('p', { class: 'muted' }, 'No activity yet.');
+    const body = h('div', { class: 'timeline' });
+    let kind = 'all';
+    const chips = h('div', { class: 'chips-row' }, Object.entries({ all: 'Everything', sentences: 'Sentences & cards', quizzes: 'Quizzes' }).map(([k, label]) =>
+      h('button', { class: 'chip', type: 'button', 'aria-pressed': String(k === kind), 'data-k': k, onclick: () => { kind = k; draw(); } }, label)));
+    const draw = () => {
+      chips.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', String(c.dataset.k === kind)));
+      const list = events.filter(e => !KINDS[kind] || KINDS[kind].includes(e.type));
+      const days = new Map();
+      for (const e of list) { const k = new Date(e.at).toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }); if (!days.has(k)) days.set(k, []); days.get(k).push(e); }
+      body.replaceChildren(...(list.length ? [...days].map(([day, evs]) => h('section', { class: 'tl-day' },
+        h('h3', null, day, h('small', null, ` · ${plural(evs.length, 'step')}`)),
+        h('ul', { class: 'feed' }, evs.map(e => {
+          const [ico, text, small] = describeEvent(e);
+          return h('li', null, h('span', { class: 'ico', 'aria-hidden': 'true' }, ico),
+            h('div', { class: 'txt' }, text, small ? h('small', null, small) : null),
+            h('time', { datetime: e.at, title: new Date(e.at).toLocaleString() }, new Date(e.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })));
+        })))) : [h('p', { class: 'muted' }, 'Nothing of this kind yet.')]));
+    };
+    draw();
+    return h('div', null, chips, body);
+  }
+
+  // The quiz attempts of one student: each one opens to show every question, what the student chose and the right answer.
+  // "Reset" lets the student take that quiz again (the unit or lesson is open again until they pass).
+  function quizPanel(q, userId, reload) {
+    const KIND = { listen: '🔊 Listen', word: '✏️ Missing word', order: '🔀 Word order' };
+    const liveList = q.live.length ? h('ul', { class: 'admin-list' }, q.live.map(x => h('li', { class: 'admin-item' },
+      h('div', { class: 'info' },
+        h('div', { class: 'name' }, `${x.emoji || '📘'} ${x.lesson} · ${x.label}`),
+        h('div', { class: 'sub' }, x.passed ? (x.credit ? '✓ Passed (finished before quizzes existed)' : '✓ Passed') : 'Taken, not passed yet')),
+      h('div', { class: 'btns' }, h('button', { class: 'btn btn-ghost btn-sm', type: 'button', title: 'The student takes this quiz again', onclick: async () => {
+        if (!confirm(`Reset “${x.label}” in “${x.lesson}”?\n\nThe student has to pass it again before the ${x.scope === 'final' ? 'lesson' : 'unit'} counts as finished. The old attempts stay in the list.`)) return;
+        try { await api('POST', `/api/admin/users/${userId}/lessons/${x.lessonId}/quiz/reset`, { scope: x.scope }); toast('Quiz reset'); reload(); } catch (e) { toast(e.message); }
+      } }, '🔁 Reset quiz'))))) : h('p', { class: 'muted' }, 'No quiz taken yet.');
+    const attempts = q.attempts.length ? h('div', { class: 'attempts' }, q.attempts.map(a => h('details', { class: 'attempt' + (a.passed ? ' pass' : ' fail') + (a.voided ? ' voided' : '') },
+      h('summary', null,
+        h('span', { class: 'sc' }, `${a.score}/${a.total}`),
+        h('span', { class: 'what' }, `${a.emoji || '📘'} ${a.lesson} · ${a.label}`),
+        a.voided ? h('span', { class: 'tag tag-off' }, 'reset') : null,
+        h('span', { class: 'when' }, `${a.passed ? '✓ passed' : '✗ not passed'} · ${timeAgo(a.at)}${a.seconds ? ` · ${fmtTime(a.seconds)}` : ''}`)),
+      h('ol', { class: 'qa-list' }, (a.details || []).map(d => {
+        const picked = Number.isInteger(d.picked) && d.picked >= 0 ? d.options[d.picked] : '(no answer)';
+        return h('li', { class: d.correct ? 'ok' : 'bad' },
+          h('span', { class: 'mark' }, d.correct ? '✓' : '✗'),
+          h('div', null,
+            h('div', { class: 'qk' }, `${KIND[d.type] || d.type} · `, h('span', { lang: 'en' }, d.sentence)),
+            d.correct ? h('small', null, `Chose “${picked}”`) : h('small', null, 'Chose “', h('b', null, picked), '” · right answer “', h('b', null, d.options[d.answer]), '”')));
+      }))))) : null;
+    return h('div', { class: 'panel' }, h('h2', null, '❓ Quizzes'), liveList, attempts ? h('h3', { class: 'sub-h' }, 'Every attempt') : null, attempts);
   }
 
   function barChart(days, key, label) {
@@ -315,11 +396,19 @@
   window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
   /* ================= overview ================= */
+  // "No activity for 9 days" / "Failed “Unit 1 · …” 3 times"
+  const reasonText = r => (r.type === 'inactive' ? `No activity for ${plural(r.days, 'day')}` : `Failed the quiz “${r.quiz}” ${r.fails} times in “${r.lesson}”`);
+  function attentionList(list) {
+    return h('ul', { class: 'admin-list' }, list.map(a => h('a', { class: 'admin-item', href: `#/students/${a.userId}` },
+      avatar(a.name),
+      h('div', { class: 'info' }, h('div', { class: 'name' }, a.name), h('div', { class: 'sub' }, a.reasons.map(reasonText).join(' · '))))));
+  }
+
   async function showOverview() {
     const my = viewId;
     loading('tiles');
-    let d;
-    try { d = await get('/api/admin/overview'); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    let d, attention = [];
+    try { [d, attention] = await Promise.all([get('/api/admin/overview'), get('/api/admin/attention').then(a => a.students).catch(() => [])]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
@@ -333,6 +422,7 @@
         tile(s.solvedWeek, 'Sentences built this week'),
         tile(s.completedWeek, 'Lessons completed this week'),
         tile(s.signupsWeek, 'New students this week')),
+      attention.length ? h('div', { class: 'panel attention' }, h('h2', null, `⚠️ Needs attention (${attention.length})`), attentionList(attention)) : null,
       h('div', { class: 'panel' }, h('h2', null, 'Sentences built per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences built per day')),
       h('div', { class: 'panel' }, h('h2', null, 'Latest activity'), feed(d.recent))
     );
@@ -342,26 +432,35 @@
   async function showStudents() {
     const my = viewId;
     loading('list');
-    let users;
-    try { users = (await get('/api/admin/users')).users; } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    let users, attention = [];
+    try { [users, attention] = await Promise.all([get('/api/admin/users').then(r => r.users), get('/api/admin/attention').then(a => a.students).catch(() => [])]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
+    const needs = new Map(attention.map(a => [a.userId, a]));
+    let only = 'all'; // 'all' or 'attention'
 
     const search = h('input', { class: 'search', type: 'search', placeholder: 'Search by name or email…', 'aria-label': 'Search students' });
     const list = h('div', { class: 'admin-list' });
+    const filterRow = h('div', { class: 'chips-row' },
+      h('button', { class: 'chip', type: 'button', 'data-k': 'all', onclick: () => { only = 'all'; draw(); } }, `All (${users.length})`),
+      h('button', { class: 'chip', type: 'button', 'data-k': 'attention', onclick: () => { only = 'attention'; draw(); } }, `⚠️ Needs attention (${attention.length})`));
+    const quizText = u => (u.quiz.attempts ? `❓ ${u.quiz.passed} passed${u.quiz.last ? ` · last ${u.quiz.last.score}/${u.quiz.last.total} ${u.quiz.last.passed ? '✓' : '✗'}` : ''}` : '❓ no quiz yet');
     const draw = () => {
       const q = search.value.trim().toLowerCase();
-      const shown = users.filter(u => !q || u.name.toLowerCase().includes(q) || u.email.includes(q));
+      filterRow.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', String(c.dataset.k === only)));
+      const shown = users.filter(u => (only === 'all' || needs.has(u.id)) && (!q || u.name.toLowerCase().includes(q) || u.email.includes(q)));
       list.replaceChildren(...(shown.length ? shown.map(u => h('a', { class: 'admin-item', href: `#/students/${u.id}` },
         avatar(u.name),
         h('div', { class: 'info' },
-          h('div', { class: 'name' }, u.name, u.disabled ? h('span', { class: 'tag tag-off' }, 'Disabled') : null),
-          h('div', { class: 'sub' }, `${u.email} · last seen ${timeAgo(u.lastSeenAt)}`)),
+          h('div', { class: 'name' }, u.name, u.disabled ? h('span', { class: 'tag tag-off' }, 'Disabled') : null,
+            needs.has(u.id) ? h('span', { class: 'tag tag-warn', title: needs.get(u.id).reasons.map(reasonText).join('\n') }, '⚠️ Needs attention') : null),
+          h('div', { class: 'sub' }, `${u.email} · last active ${timeAgo(u.lastActiveAt || u.lastSeenAt)}`),
+          h('div', { class: 'sub' }, u.currentLesson ? `${u.currentLesson.emoji} ${u.currentLesson.title}${u.currentLesson.completed ? ' (done)' : ''} · ` : 'No lesson started · ', quizText(u))),
         h('div', { class: 'nums' },
           h('span', { title: 'Sentences built' }, `✅ ${u.stats.sentencesSolved}`),
           h('span', { title: 'Stars' }, `⭐ ${u.stats.stars}`),
           h('span', { title: 'Lessons completed' }, `🏆 ${u.stats.lessonsCompleted}`),
           h('span', { title: 'Time spent' }, `⏱️ ${fmtTime(u.stats.timeSpent)}`)))) :
-        [h('p', { class: 'state' }, users.length ? 'No students match your search.' : 'No students yet. Share the app link so they can sign up, or add one here.')]));
+        [h('p', { class: 'state' }, users.length ? (only === 'attention' ? 'Nobody needs attention right now. 🎉' : 'No students match your search.') : 'No students yet. Share the app link so they can sign up, or add one here.')]));
     };
     search.addEventListener('input', oncePerFrame(draw));
 
@@ -395,6 +494,7 @@
           h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: () => { addForm.hidden = false; f.name.focus(); } }, '+ Add student'))),
       addForm,
       h('div', { class: 'section' }, search),
+      h('div', { class: 'section' }, filterRow),
       h('div', { class: 'section' }, list)
     );
     draw();
@@ -403,8 +503,8 @@
   async function showStudent(id) {
     const my = viewId;
     loading('tiles');
-    let d;
-    try { d = await get(`/api/admin/users/${id}`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    let d, quiz = { attempts: [], live: [] };
+    try { [d, quiz] = await Promise.all([get(`/api/admin/users/${id}`), fetchFresh(`/api/admin/users/${id}/quiz`).catch(() => quiz)]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const u = d.user, s = d.stats;
     const tile = (v, l) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, l));
@@ -455,7 +555,7 @@
         const items = Array.isArray(json) ? json : json.lessons || (json.title ? [json] : null);
         if (!items) throw new Error('This file does not contain lessons.');
         if (!confirm(`Add ${plural(items.length, 'lesson')} for ${u.name} only?`)) return;
-        const r = await api('POST', '/api/admin/import', { lessons: items, assignTo: id });
+        const r = await api('POST', '/api/admin/import', { lessons: autoGapItems(items), assignTo: id });
         toast(`Added ${plural(r.created, 'lesson')} for ${first}`);
         showStudent(id);
       } catch (err) { toast(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message); }
@@ -524,7 +624,10 @@
           h('div', { class: 'muted' }, `${u.email} · joined ${new Date(u.createdAt).toLocaleDateString()} · last seen ${timeAgo(u.lastSeenAt)}`))),
       h('div', { class: 'section' }, actions),
       editForm,
-      h('div', { class: 'tiles section' },
+      // Two columns on a computer: the student's numbers and lessons on the left, the quizzes and the timeline on the right.
+      h('div', { class: 'cols section' },
+      h('div', { class: 'col' },
+      h('div', { class: 'tiles' },
         tile(s.sentencesSolved, 'Sentences built'),
         tile(`⭐ ${s.stars}`, 'Stars'),
         tile(`+${s.extraStars || 0}`, 'Extra stars (retries)'),
@@ -532,10 +635,12 @@
         tile(s.lessonsStarted, 'Lessons started'),
         tile(fmtTime(s.timeSpent), 'Learning time'),
         tile(`🔥 ${s.streak}`, 'Day streak')),
-      assignPanel,
       h('div', { class: 'panel' }, h('h2', null, 'All lessons this student can see'), table),
-      h('div', { class: 'panel' }, h('h2', null, 'Sentences practised per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences practised per day')),
-      h('div', { class: 'panel' }, h('h2', null, 'Activity'), feed(d.events, { showUser: false }))
+      assignPanel,
+      h('div', { class: 'panel' }, h('h2', null, 'Sentences practised per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences practised per day'))),
+      h('div', { class: 'col' },
+      quizPanel(quiz, id, () => showStudent(id)),
+      h('div', { class: 'panel' }, h('h2', null, 'Timeline'), h('p', { class: 'muted' }, 'Every step this student took, with mistakes, hints and the time it took.'), timeline(d.events))))
     );
   }
 
@@ -586,7 +691,7 @@
         const items = Array.isArray(json) ? json : json.lessons || (json.title ? [json] : null);
         if (!items) throw new Error('This file does not contain lessons.');
         if (!confirm(`Import ${plural(items.length, 'lesson')}? Lessons with the same link name will be updated (student progress is kept).`)) return;
-        const r = await api('POST', '/api/admin/import', { lessons: items });
+        const r = await api('POST', '/api/admin/import', { lessons: autoGapItems(items) });
         toast(`Imported: ${r.created} new, ${r.updated} updated`);
         showLessons();
       } catch (err) { toast(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message); }
@@ -754,6 +859,10 @@
       msg.textContent = '';
       checkSentences();
     };
+    // Grammar is part of every unit: when the lesson is saved, every sentence without a gap that has a safe word
+    // (am/is/are, was/were, have/has, do/does) gets one automatically. The teacher can turn this off.
+    const autoGaps = h('input', { id: 'f-autogaps', type: 'checkbox', checked: autoGapsOn() });
+    autoGaps.addEventListener('change', () => { try { localStorage.setItem('ws:admin-autogaps', autoGaps.checked ? '1' : '0'); } catch (e) { /* ignore */ } });
     const suggestBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => {
       let added = 0, total = 0;
       mapLines(line => {
@@ -769,7 +878,8 @@
     } }, '✨ Suggest grammar gaps');
     const clearGapsBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => {
       mapLines(line => { const parsed = GrammarCore.parseLine(line); return parsed.error ? line : parsed.en; });
-      toast('All grammar gaps removed.');
+      autoGaps.checked = false; autoGaps.dispatchEvent(new Event('change'));
+      toast('All grammar gaps removed, and automatic gaps are switched off for saving.');
     } }, 'Remove all gaps');
 
     f.title.addEventListener('input', () => { dirty = true; if (!slugTouched) f.slug.value = slugify(f.title.value); });
@@ -789,8 +899,9 @@
       h('div', null,
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
-        h('p', { class: 'muted help' }, 'Grammar step (optional): write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. After building, students choose the missing word, and then the unit ends.'),
+        h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
         h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
+        h('label', { class: 'switch' }, autoGaps, h('span', null, 'Add grammar gaps automatically when I save')),
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
         id ? h('p', { class: 'muted' }, 'Tip: renaming or moving units keeps student progress. Changing a sentence’s text means students build that sentence again.') : null),
@@ -821,7 +932,7 @@
       const body = {
         title: f.title.value, emoji: f.emoji.value, slug: ctx && id ? lesson.slug : slugify(f.slug.value || f.title.value), level: f.level.value,
         description: f.desc.value, published: f.published.checked,
-        units: units.map((u, i) => ({ ...(u.id ? { id: u.id } : {}), title: u.title.trim() || `Unit ${i + 1}`, sentences: lines(u.text).map(en => ({ en })) })),
+        units: units.map((u, i) => ({ ...(u.id ? { id: u.id } : {}), title: u.title.trim() || `Unit ${i + 1}`, sentences: lines(u.text).map(en => ({ en: autoGaps.checked ? withAutoGap(en) : en })) })),
         visibility: assigned ? 'assigned' : 'public',
         // From a student's card: new lessons go to that student; edits keep whoever already has it.
         ...(ctx ? (id ? {} : { assignedUserIds: [ctx.userId] }) : assigned ? { assignedUserIds: [...selected] } : {}),
@@ -847,8 +958,8 @@
   async function showLessonProgress(id) {
     const my = viewId;
     loading('tiles');
-    let d;
-    try { d = await get(`/api/admin/lessons/${id}/progress`); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    let d, hard = [];
+    try { [d, hard] = await Promise.all([get(`/api/admin/lessons/${id}/progress`), fetchFresh(`/api/admin/lessons/${id}/hard`).then(r => r.sentences).catch(() => [])]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const l = d.lesson;
     const st = d.students;
@@ -856,6 +967,7 @@
     const tile = (v, lab) => h('div', { class: 'tile-stat' }, h('div', { class: 'v' }, String(v)), h('div', { class: 'l' }, lab));
     const order = { completed: 0, building: 1, learning: 2, new: 3 };
     const unitHeads = l.units.map((u, i) => h('th', { title: u.title }, l.units.length > 1 ? `U${i + 1}` : 'Cards'));
+    if (l.units.length > 1) unitHeads.push(h('th', { title: 'Final quiz' }, 'Final'));
     st.sort((a, b) => order[a.progress.status] - order[b.progress.status] || b.progress.solved - a.progress.solved || a.name.localeCompare(b.name));
 
     setView(
@@ -876,11 +988,23 @@
           h('td', null, h('a', { href: `#/students/${s.id}` }, s.name)),
           h('td', null, statusChip(s.progress)),
           ...s.progress.units.map(u => h('td', { title: u.title }, unitCell(u, l.units.length > 1))),
+          l.units.length > 1 ? h('td', { title: 'Final quiz' }, s.progress.finalPassed ? h('span', { class: 'st st-completed' }, '✓') : s.progress.finalReady ? '❓' : '–') : null,
           h('td', null, progressBar(s.progress)),
           h('td', null, starsCell(s.progress)),
           h('td', null, fmtTime(s.progress.timeSpent)),
           h('td', null, timeAgo(s.progress.lastActivityAt)))))))
-        : h('p', { class: 'muted' }, 'No students can see this lesson yet.'))
+        : h('p', { class: 'muted' }, 'No students can see this lesson yet.')),
+      h('div', { class: 'panel' }, h('h2', null, '🔥 Hardest sentences'),
+        h('p', { class: 'muted' }, 'Ranked by wrong tries and hints while building, wrong grammar choices and wrong quiz answers, across all students. Practise these in class.'),
+        hard.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
+          h('thead', null, h('tr', null, ...['Sentence', 'Building: wrong tries / hints', 'Grammar wrong', 'Quiz wrong', 'Students'].map(t => h('th', null, t)))),
+          h('tbody', null, hard.map(x => h('tr', null,
+            h('td', { lang: 'en' }, x.unit ? h('small', { class: 'muted' }, x.unit + ' · ') : null, x.sentence),
+            h('td', null, `${x.mistakes} / ${x.hints}`),
+            h('td', null, x.grammar || '–'),
+            h('td', null, x.quizWrong ? `${x.quizWrong} of ${x.quizAsked}` : '–'),
+            h('td', null, x.students))))))
+          : h('p', { class: 'muted' }, 'Nothing is hard yet: no mistakes, hints or wrong quiz answers so far.'))
     );
   }
 

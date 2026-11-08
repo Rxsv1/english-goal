@@ -161,3 +161,55 @@ table.data a { color: inherit; }
   .admin-page { max-width: 87.5rem; }
   .tiles { grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); }
 }
+
+/* ---- v5: monitoring ---- */
+.tag-warn { background: #FFF1D6; color: #B35C00; }
+:root[data-theme="dark"] .tag-warn { background: #3A3016; color: #F6C768; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tag-warn { background: #3A3016; color: #F6C768; } }
+.chips-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.admin-item .sub + .sub { margin-top: 1px; }
+.panel.attention { border-color: #F4CE6A; }
+.panel.attention .admin-item { background: transparent; }
+
+.tl-day { margin-top: 14px; }
+.tl-day h3 { margin: 0 0 6px; font-size: .9375rem; }
+.tl-day h3 small { color: var(--muted); font-weight: 600; }
+
+.sub-h { margin: 18px 0 8px; font-size: .9375rem; }
+.attempts { display: flex; flex-direction: column; gap: 8px; }
+.attempt { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.attempt.pass { border-left: 4px solid var(--success-dark); }
+.attempt.fail { border-left: 4px solid #F59F00; }
+.attempt.voided { opacity: .6; }
+.attempt > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; cursor: pointer; padding: 10px 14px; list-style: none; }
+.attempt > summary::-webkit-details-marker { display: none; }
+.attempt .sc { font-weight: 800; font-variant-numeric: tabular-nums; min-width: 2.8em; }
+.attempt .what { font-weight: 600; flex: 1 1 200px; }
+.attempt .when { color: var(--muted); font-size: .875rem; }
+.qa-list { margin: 0; padding: 4px 14px 12px 14px; list-style: none; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); }
+.qa-list li { display: flex; gap: 10px; padding-top: 8px; }
+.qa-list .mark { font-weight: 800; width: 1.2em; flex: none; }
+.qa-list li.ok .mark { color: var(--success-dark); }
+.qa-list li.bad .mark { color: var(--danger); }
+.qa-list .qk { font-weight: 600; }
+.qa-list small { color: var(--muted); display: block; }
+.qa-list small b { color: var(--text); }
+
+/* ---- v6: computers ---- */
+.admin-page { max-width: 1280px; }
+.cols { display: block; }
+@media (min-width: 1100px) {
+  .cols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 0 20px; align-items: start; }
+  .cols .col { min-width: 0; }
+  .cols .tiles { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+}
+.admin-item:focus-visible, .chip:focus-visible, .attempt > summary:focus-visible, .tabs a:focus-visible { outline: none; box-shadow: var(--ring); }
+.attempt > summary:hover { background: var(--surface-2); border-radius: 14px; }
+.tabs a:hover { color: var(--text); }
+@media (min-width: 1100px) {
+  .cols .data { font-size: .875rem; }
+  .cols .data th, .cols .data td { padding-left: 6px; padding-right: 6px; }
+  .cols .data th:nth-child(6), .cols .data td:nth-child(6) { display: none; } /* the time column: it is on the student's tiles already */
+  .cols .data td:first-child { min-width: 9rem; }
+  .cols .data .mini-bar { width: 56px; }
+}

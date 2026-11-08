@@ -56,6 +56,17 @@ const lessonBody = (title, extra = {}) => ({
   ...extra,
 });
 
+const QuizCore = require('../public/quiz-core.js');
+// Takes a unit quiz ('unit:<id>') or the final quiz ('final') and answers every question right (or all wrong with right = false).
+async function takeQuiz(s, slug, scope, { right = true, seed = 11 } = {}) {
+  const lesson = (await s.as('GET', '/app')).data.lessons.find(l => l.slug === slug);
+  const everything = lesson.units.flatMap(u => u.sentences);
+  const unit = scope === 'final' ? null : lesson.units.find(u => 'unit:' + u.id === scope);
+  const qs = QuizCore.build({ sentences: unit ? unit.sentences : everything, context: everything, seed, noListen: false });
+  const picks = qs.map(q => (right ? q.answer : (q.answer + 1) % q.options.length));
+  return s.as('POST', `/lessons/${slug}/quiz`, { scope, seed, noListen: false, picks, seconds: 5, cid: Math.random().toString(36) });
+}
+
 const solve = (s, slug, sentence, mistakes = 0, hints = 0) =>
   s.as('POST', `/lessons/${slug}/solve`, { sentence, mistakes, hints, cid: Math.random().toString(36) });
 
@@ -140,7 +151,7 @@ test('importing JSON from a student card keeps the lessons private and never ove
   assert.equal(stillPublic.units[0].sentences[0].en, 'I like green apples');
 });
 
-test('retrying keeps progress, a better score is counted as extra, a worse one changes nothing', { skip }, async () => {
+test('building a sentence again is practice: the first stars stay exactly as they were', { skip }, async () => {
   const ana = await newStudent('Ana');
   const made = await admin('POST', `/users/${ana.id}/lessons`, lessonBody('Retry lesson'));
   const slug = made.data.lesson.slug;
@@ -158,49 +169,56 @@ test('retrying keeps progress, a better score is counted as extra, a worse one c
   await solve(ana, slug, 'She is reading a book', 1, 0);
 
   let p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(p.units[0].completed, false, 'the unit quiz is still to do');
+  assert.equal(p.units[0].quizReady, true);
+  assert.equal(p.units[1].locked, true);
+  assert.equal((await takeQuiz(ana, slug, 'unit:' + u1.id)).data.unitCompleted, true);
+  p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
   assert.equal(p.units[0].completed, true);
   assert.equal(p.units[0].stars, 3);
   assert.equal(p.units[0].extra, 0);
   assert.equal(p.units[1].locked, false);
 
-  // Practise again, perfectly: 1 -> 3 stars = +2 extra, 2 -> 3 stars = +1 extra
+  // Practise again, perfectly: it is practice only, so the saved stars (1 and 2) do not change and nothing is added
   const b = await solve(ana, slug, 'I like green apples', 0, 0);
   assert.equal(b.data.replay, true);
-  assert.equal(b.data.extra, 2);
-  assert.equal(b.data.best, 3);
-  assert.equal((await solve(ana, slug, 'She is reading a book', 0, 0)).data.extra, 1);
+  assert.equal(b.data.extra, 0);
+  assert.equal(b.data.best, 1);
+  assert.equal(b.data.stars, 3, 'the round itself still reports its own result');
+  assert.equal((await solve(ana, slug, 'She is reading a book', 0, 0)).data.best, 2);
 
   p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
-  assert.equal(p.units[0].stars, 6);
-  assert.equal(p.units[0].extra, 3);
+  assert.equal(p.units[0].stars, 3);
+  assert.equal(p.units[0].extra, 0);
   assert.equal(p.units[0].completed, true, 'progress is still there');
 
-  // A worse retry never lowers anything and gives no extra
+  // A worse retry never lowers anything either
   const worse = await solve(ana, slug, 'I like green apples', 9, 0);
   assert.equal(worse.data.extra, 0);
-  assert.equal(worse.data.best, 3);
-  // ...and a repeat of an equally good result gives no extra either
-  assert.equal((await solve(ana, slug, 'I like green apples', 0, 0)).data.extra, 0);
+  assert.equal(worse.data.best, 1);
 
   p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
-  assert.equal(p.units[0].stars, 6);
-  assert.equal(p.units[0].extra, 3);
+  assert.equal(p.units[0].stars, 3);
+  assert.equal(p.units[0].extra, 0);
   const sentences = (await ana.as('GET', `/lessons/${slug}`)).data.lesson.units[0].sentences;
-  assert.deepEqual(sentences.map(s => [s.stars, s.extra]), [[3, 2], [3, 1]]);
+  assert.deepEqual(sentences.map(s => [s.stars, s.extra]), [[1, 0], [2, 0]]);
 
   // Lesson finishes only once; extra from retries is reported in the profile and to the teacher.
   const done = await solve(ana, slug, 'We are going home now', 0, 0);
-  assert.equal(done.data.completed, true);
-  assert.equal(done.data.justCompleted, true);
+  assert.equal(done.data.completed, false, 'both quizzes are still to do');
+  assert.equal((await takeQuiz(ana, slug, 'unit:' + u2.id)).data.completed, false, 'the final quiz is still to do');
+  const fin = await takeQuiz(ana, slug, 'final');
+  assert.equal(fin.data.completed, true);
+  assert.equal(fin.data.justCompleted, true);
   assert.equal((await solve(ana, slug, 'We are going home now', 0, 0)).data.justCompleted, false);
 
   const me = (await ana.as('GET', '/me')).data;
-  assert.equal(me.stats.extraStars, 3);
-  assert.equal(me.stats.stars, 9);
+  assert.equal(me.stats.extraStars, 0);
+  assert.equal(me.stats.stars, 6);
 
   const card = (await admin('GET', `/users/${ana.id}`)).data;
-  assert.equal(card.stats.extraStars, 3);
-  assert.equal(card.lessons.find(l => l.slug === slug).progress.extra, 3);
+  assert.equal(card.stats.extraStars, 0);
+  assert.equal(card.lessons.find(l => l.slug === slug).progress.extra, 0);
   const csv = await fetch(BASE + '/api/admin/export/progress.csv', { headers: { Authorization: 'Bearer ' + adminToken } });
   assert.match(await csv.text(), /Of which extra/);
 
@@ -210,15 +228,15 @@ test('retrying keeps progress, a better score is counted as extra, a worse one c
   assert.equal((await ana.as('POST', `/lessons/${slug}/restart`, { unitId: 'nope' })).status, 404);
   p = (await ana.as('GET', `/lessons/${slug}`)).data.progress;
   assert.equal(p.completed, true);
-  assert.equal(p.stars, 9);
+  assert.equal(p.stars, 6);
   const events = (await admin('GET', `/activity?user=${ana.id}`)).data.events;
   assert.ok(events.some(e => e.type === 'restart'));
   // newest first, and events written at the same instant keep a stable order (higher id first)
   for (let i = 1; i < events.length; i++) {
     const a = events[i - 1], b = events[i];
-    assert.ok(new Date(a.at) > new Date(b.at) || (+new Date(a.at) === +new Date(b.at) && a.id > b.id), 'activity feed order is stable');
+    assert.ok(new Date(a.at) > new Date(b.at) || (+new Date(a.at) === +new Date(b.at) && Number(a.id) > Number(b.id)), 'activity feed order is stable');
   }
-  assert.ok(events.some(e => e.type === 'sentence_solved' && e.data.replay && e.data.extra === 2));
+  assert.ok(events.some(e => e.type === 'sentence_solved' && e.data.replay));
   assert.ok(u2.id);
 });
 
@@ -229,7 +247,9 @@ test('a unit the student already finished is never locked, even if a new unit is
   const lesson = (await bo.as('GET', `/lessons/${slug}`)).data.lesson;
   await solve(bo, slug, 'I like green apples');
   await solve(bo, slug, 'She is reading a book');
+  assert.equal((await takeQuiz(bo, slug, 'unit:' + lesson.units[0].id)).status, 200);
   await solve(bo, slug, 'We are going home now');
+  assert.equal((await takeQuiz(bo, slug, 'unit:' + lesson.units[1].id)).status, 200);
 
   // Teacher puts a brand-new unit first (existing units keep their ids, so progress is kept).
   const full = (await admin('GET', `/lessons/${made.data.lesson.id}`)).data.lesson;
@@ -260,14 +280,22 @@ test('the on-device progress rules give exactly the same result as the server', 
     ['learn', u1.id, 0, false], ['learn', u1.id, 1, true],
     ['solve', 'I like green apples', 0, 3],          // 1 star
     ['solve', 'She is reading a book', 0, 1],        // 2 stars
-    ['solve', 'I like green apples', 0, 0],          // retry, perfect: +2 extra
+    ['solve', 'I like green apples', 0, 0],          // retry, perfect: practice only, stars stay
     ['solve', 'She is reading a book', 5, 5],        // worse retry: nothing changes
+    ['quiz', u1.id],                                  // unit one is finished once its quiz is passed
     ['learn', u2.id, 0, true],
-    ['solve', 'We are going home now', 0, 0],        // finishes the lesson
+    ['solve', 'We are going home now', 0, 0],
     ['solve', 'We are going home now', 2, 0],
+    ['quiz', u2.id],
+    ['quiz', 'final'],                                // the lesson is finished
   ];
   for (const [kind, a, b, c] of steps) {
-    if (kind === 'learn') {
+    if (kind === 'quiz') {
+      const r = Core.applyQuiz(raw, local.stats, a, true, 5, new Date().toISOString()); // takeQuiz spends 5 seconds
+      const server = await takeQuiz(eva, slug, a === 'final' ? 'final' : 'unit:' + a);
+      assert.equal(server.status, 200, JSON.stringify(server.data));
+      assert.equal(r.completed, server.data.completed, `completed after quiz ${a}`);
+    } else if (kind === 'learn') {
       Core.applyLearn(raw, a, b, c, 0, new Date().toISOString());
       assert.equal((await eva.as('POST', `/lessons/${slug}/units/${a}/learn`, c ? { index: b, done: true } : { index: b })).status, 200);
     } else {
@@ -290,6 +318,17 @@ test('the on-device progress rules give exactly the same result as the server', 
   // ...and what the classic per-lesson endpoint reports.
   const classic = (await eva.as('GET', `/lessons/${slug}`)).data.progress;
   assert.deepEqual(plain(Core.modelOf(mine(remote))), plain(classic));
+});
+
+test('the streak counts days with a finished sentence, not just opening a lesson', { skip }, async () => {
+  const kai = await newStudent('Kai');
+  const made = await admin('POST', `/users/${kai.id}/lessons`, lessonBody('Streak lesson'));
+  const slug = made.data.lesson.slug;
+  const unitId = (await kai.as('GET', `/lessons/${slug}`)).data.lesson.units[0].id;
+  assert.equal((await kai.as('POST', `/lessons/${slug}/units/${unitId}/learn`, { index: 1, done: true })).status, 200);
+  assert.equal((await kai.as('GET', '/me')).data.stats.streak, 0, 'only looking at cards is not a streak day');
+  await solve(kai, slug, 'I like green apples', 0, 0);
+  assert.equal((await kai.as('GET', '/me')).data.stats.streak, 1, 'a finished sentence is');
 });
 
 test('GET /app returns only what the student may see, in one request', { skip }, async () => {
@@ -396,9 +435,15 @@ test('grammar gaps: a unit is finished only after reading, building AND choosing
   assert.equal(g1.status, 200);
   assert.equal(g1.data.unitCompleted, false);
   const g2 = await grammar('I have one small bag', 0);
-  assert.equal(g2.data.unitCompleted, true);
-  assert.equal(g2.data.unitJustCompleted, true);
-  assert.equal(g2.data.completed, false);
+  assert.equal(g2.data.unitCompleted, false, 'built and answered, but the quiz is still to do');
+  assert.equal(g2.data.unitJustCompleted, false);
+  model = Core.modelOf((await zoe.as('GET', '/app')).data.lessons.find(l => l.slug === slug));
+  assert.equal(model.units[0].quizReady, true);
+  assert.equal(model.units[1].locked, true, 'the next unit opens after the quiz');
+  const q1 = await takeQuiz(zoe, slug, 'unit:' + u1.id);
+  assert.equal(q1.data.unitCompleted, true);
+  assert.equal(q1.data.unitJustCompleted, true);
+  assert.equal(q1.data.completed, false);
   model = Core.modelOf((await zoe.as('GET', '/app')).data.lessons.find(l => l.slug === slug));
   assert.equal(model.units[0].completed, true);
   assert.equal(model.units[1].locked, false);
@@ -411,8 +456,11 @@ test('grammar gaps: a unit is finished only after reading, building AND choosing
   await zoe.as('POST', `/lessons/${slug}/units/${u2.id}/learn`, { index: 0, done: true });
   assert.equal((await solve(zoe, slug, 'They were very late')).data.completed, false, 'the last gap is still open');
   const last = await grammar('They were very late');
-  assert.equal(last.data.completed, true);
-  assert.equal(last.data.justCompleted, true);
+  assert.equal(last.data.completed, false, 'the quizzes are still to do');
+  assert.equal((await takeQuiz(zoe, slug, 'unit:' + u2.id)).data.completed, false);
+  const finalQ = await takeQuiz(zoe, slug, 'final');
+  assert.equal(finalQ.data.completed, true);
+  assert.equal(finalQ.data.justCompleted, true);
   assert.equal((await grammar('They were very late')).data.justCompleted, false);
 
   // the teacher sees it
@@ -441,8 +489,12 @@ test('grammar on the device follows the same rules as the server', { skip }, asy
   assert.equal(Core.modelOf(raw).completed, false, 'device: grammar still open');
   const device = Core.applyGrammar(raw, local.stats, 'He is here', 0, now);
   const server = await lia.as('POST', `/lessons/${slug}/grammar`, { sentence: 'He is here', mistakes: 0, cid: 'p1' });
-  assert.equal(device.completed, true);
+  assert.equal(device.completed, false, 'device: the quiz is still to do');
   assert.equal(device.completed, server.data.completed);
+  const dq = Core.applyQuiz(raw, local.stats, unit, true, 5, now);
+  const sq = await takeQuiz(lia, slug, 'unit:' + unit);
+  assert.equal(dq.completed, true);
+  assert.equal(dq.completed, sq.data.completed);
 
   const remote = (await lia.as('GET', '/app')).data;
   const plain = m => { const o = JSON.parse(JSON.stringify(m)); for (const k of ['startedAt', 'lastActivityAt', 'completedAt']) o[k] = o[k] ? 'set' : null; return o; };
@@ -472,4 +524,128 @@ test('lessons imported with grammar gaps (bracket lines or data) keep them', { s
 test('compressed responses are served', { skip }, async () => {
   const res = await fetch(BASE + '/app.js', { headers: { 'Accept-Encoding': 'gzip' } });
   assert.equal(res.headers.get('content-encoding'), 'gzip');
+});
+
+test('quizzes: marked on the server, required to finish a unit and the lesson, can be retried, and the teacher can reset them', { skip }, async () => {
+  const mo = await newStudent('Mo');
+  const made = await admin('POST', `/users/${mo.id}/lessons`, lessonBody('Quiz lesson'));
+  const slug = made.data.lesson.slug, lessonId = made.data.lesson.id;
+  const app = () => mo.as('GET', '/app').then(r => r.data.lessons.find(l => l.slug === slug));
+  const [u1, u2] = (await app()).units;
+
+  // the quiz is the last step: not before building, and the final quiz not before every unit
+  assert.equal((await takeQuiz(mo, slug, 'unit:' + u1.id)).status, 409, 'build first');
+  assert.equal((await takeQuiz(mo, slug, 'final')).status, 409, 'finish the units first');
+  assert.equal((await mo.as('POST', `/lessons/${slug}/quiz`, { scope: 'nope', seed: 1, picks: [] })).status, 400);
+  await solve(mo, slug, 'I like green apples');
+  await solve(mo, slug, 'She is reading a book');
+
+  // a wrong quiz is only a try: nothing is finished, and it can be taken again
+  const bad = await takeQuiz(mo, slug, 'unit:' + u1.id, { right: false, seed: 5 });
+  assert.equal(bad.status, 200);
+  assert.equal(bad.data.passed, false);
+  assert.equal(bad.data.score, 0);
+  assert.equal(bad.data.needed, 2);
+  assert.equal(bad.data.unitCompleted, false);
+  // the answers are marked by the server: a different number of answers is refused
+  assert.equal((await mo.as('POST', `/lessons/${slug}/quiz`, { scope: 'unit:' + u1.id, seed: 5, picks: [0] })).status, 400);
+  // the same try sent twice (a retry after a bad connection) counts once
+  const once = { scope: 'unit:' + u1.id, seed: 6, noListen: false, picks: [9, 9], cid: 'same-try' };
+  assert.equal((await mo.as('POST', `/lessons/${slug}/quiz`, once)).data.passed, false);
+  assert.equal((await mo.as('POST', `/lessons/${slug}/quiz`, once)).data.duplicate, true);
+
+  const good = await takeQuiz(mo, slug, 'unit:' + u1.id);
+  assert.equal(good.data.passed, true);
+  assert.equal(good.data.unitCompleted, true);
+  let model = (await mo.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(model.units[0].completed, true);
+  assert.equal(model.units[1].locked, false);
+
+  await solve(mo, slug, 'We are going home now');
+  assert.equal((await takeQuiz(mo, slug, 'final')).status, 409, 'unit two is not finished');
+  assert.equal((await takeQuiz(mo, slug, 'unit:' + u2.id)).data.completed, false);
+  model = (await mo.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(model.finalReady, true);
+  assert.equal(model.completed, false, 'the final quiz is still to do');
+  assert.equal((await takeQuiz(mo, slug, 'final', { right: false })).data.completed, false);
+  assert.equal((await takeQuiz(mo, slug, 'final')).data.justCompleted, true);
+  assert.equal((await mo.as('GET', `/lessons/${slug}`)).data.progress.completed, true);
+
+  // the teacher reviews every attempt, with the questions and the student's answers
+  const review = (await admin('GET', `/users/${mo.id}/quiz`)).data;
+  const mine = review.attempts.filter(a => a.lessonId === lessonId);
+  assert.equal(mine.length, 6);
+  const failed = mine.find(a => a.scope.startsWith('unit:') && a.score === 0 && !a.passed);
+  assert.ok(failed.details.length === 2 && failed.details.every(d => d.options.length >= 2 && d.correct === false && typeof d.picked === 'number'));
+  assert.ok(review.live.some(x => x.scope === 'final' && x.passed));
+
+  // ...and resets the final quiz: the lesson is open again until the student passes it once more
+  assert.equal((await admin('POST', `/users/${mo.id}/lessons/${lessonId}/quiz/reset`, { scope: 'nope' })).status, 400);
+  assert.equal((await admin('POST', `/users/${mo.id}/lessons/${lessonId}/quiz/reset`, { scope: 'final' })).status, 204);
+  assert.equal((await admin('POST', `/users/${mo.id}/lessons/${lessonId}/quiz/reset`, { scope: 'final' })).status, 404, 'nothing left to reset');
+  model = (await mo.as('GET', `/lessons/${slug}`)).data.progress;
+  assert.equal(model.completed, false);
+  assert.equal(model.finalReady, true);
+  assert.equal((await mo.as('GET', '/me')).data.stats.lessonsCompleted, 0);
+  assert.equal((await takeQuiz(mo, slug, 'final')).data.completed, true);
+  assert.equal((await mo.as('GET', '/me')).data.stats.lessonsCompleted, 1);
+  const events = (await admin('GET', `/activity?user=${mo.id}`)).data.events;
+  assert.ok(events.some(e => e.type === 'quiz_attempt' && e.data.passed === false));
+  assert.ok(events.some(e => e.type === 'quiz_reset'));
+});
+
+test('a lesson with one unit has no final quiz: its unit quiz finishes the lesson', { skip }, async () => {
+  const jo = await newStudent('Jo');
+  const made = await admin('POST', `/users/${jo.id}/lessons`, { title: 'Single unit', units: [{ title: 'Only', sentences: [{ en: 'She is reading a book' }, { en: 'We like green tea' }] }] });
+  const slug = made.data.lesson.slug;
+  const u = (await jo.as('GET', '/app')).data.lessons.find(l => l.slug === slug).units[0];
+  await solve(jo, slug, 'She is reading a book');
+  await solve(jo, slug, 'We like green tea');
+  assert.equal((await takeQuiz(jo, slug, 'final')).status, 400);
+  const r = await takeQuiz(jo, slug, 'unit:' + u.id);
+  assert.equal(r.data.completed, true);
+  assert.equal(r.data.justCompleted, true);
+});
+
+test('teacher: student list, needs-attention list, hardest sentences', { skip }, async () => {
+  const ivy = await newStudent('Ivy');
+  const made = await admin('POST', `/users/${ivy.id}/lessons`, lessonBody('Insight lesson'));
+  const slug = made.data.lesson.slug, lessonId = made.data.lesson.id;
+  const u1 = (await ivy.as('GET', '/app')).data.lessons.find(l => l.slug === slug).units[0];
+  await solve(ivy, slug, 'I like green apples', 4, 1);   // a hard one: 4 mistakes, 1 hint
+  await solve(ivy, slug, 'She is reading a book', 0, 0);
+  // three failed tries at the same quiz => needs attention
+  for (const seed of [21, 22, 23]) await takeQuiz(ivy, slug, 'unit:' + u1.id, { right: false, seed });
+
+  const list = (await admin('GET', '/users')).data.users.find(x => x.id === ivy.id);
+  assert.equal(list.quiz.attempts, 3);
+  assert.equal(list.quiz.passed, 0);
+  assert.equal(list.quiz.last.passed, false);
+  assert.equal(list.currentLesson.title, 'Insight lesson');
+  assert.ok(list.lastActiveAt);
+
+  const att = (await admin('GET', '/attention')).data.students.find(x => x.userId === ivy.id);
+  assert.ok(att, 'three failed tries put the student on the list');
+  assert.ok(att.reasons.some(x => x.type === 'quiz' && x.fails === 3 && x.quiz.includes('One')));
+  // a pass takes them off the quiz reason again
+  await takeQuiz(ivy, slug, 'unit:' + u1.id);
+  const after = (await admin('GET', '/attention')).data.students.find(x => x.userId === ivy.id);
+  assert.ok(!after || !after.reasons.some(x => x.type === 'quiz'));
+
+  // inactive: a student who started 8 days ago and did nothing since
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: DB });
+  try {
+    const old = await newStudent('Old');
+    await pool.query("UPDATE users SET created_at = now() - interval '8 days' WHERE id = $1", [old.id]);
+    await admin('POST', `/users/${old.id}/lessons`, lessonBody('Old lesson'));
+    const a2 = (await admin('GET', '/attention')).data.students.find(x => x.userId === old.id);
+    assert.ok(a2 && a2.reasons.some(x => x.type === 'inactive' && x.days >= 8));
+  } finally { await pool.end(); }
+
+  const hard = (await admin('GET', `/lessons/${lessonId}/hard`)).data.sentences;
+  assert.equal(hard[0].sentence, 'I like green apples');
+  assert.equal(hard[0].mistakes, 4);
+  assert.equal(hard[0].hints, 1);
+  assert.ok(hard.some(x => x.quizWrong > 0), 'wrong quiz answers count too');
 });

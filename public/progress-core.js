@@ -31,14 +31,21 @@
    * @param unitRows Map(unitId -> unit_progress row) for this lesson
    * @param extra    Map(sentenceText -> extra stars earned by practising again) for this lesson
    * @param grammar  Set(sentenceText) of sentences whose grammar gap the student has answered
+   * @param quiz     { units: Set|Array of unit ids whose quiz is passed, final: true when the final quiz is passed }
+   *
+   * A unit is finished when everything is built, every grammar gap is answered AND its quiz is passed.
+   * A lesson is finished when every unit is finished AND (for a lesson with more than one unit) the final quiz is passed.
    */
-  function summarize(lesson, lp, solved, unitRows, extra, grammar) {
+  function summarize(lesson, lp, solved, unitRows, extra, grammar, quiz) {
     solved = solved || new Map();
     unitRows = unitRows || new Map();
     extra = extra || new Map();
     grammar = grammar || new Set();
+    const quizUnits = new Set(quiz && quiz.units ? [...quiz.units] : []);
+    const unitList = unitsOf(lesson);
+    const hasFinal = unitList.length > 1; // one unit: its own quiz is the lesson's quiz
     let prevDone = true;
-    const units = unitsOf(lesson).map(u => {
+    const units = unitList.map(u => {
       const list = Array.isArray(u.sentences) ? u.sentences : [];
       const total = list.length;
       let done = 0, stars = 0, bonus = 0;
@@ -51,7 +58,9 @@
       // A unit is finished when every sentence is built AND every grammar gap (if the teacher added any) is answered.
       const grammarTotal = list.filter(x => x.gap).length;
       const grammarDone = list.filter(x => x.gap && grammar.has(x.en)).length;
-      const completed = total > 0 && done === total && grammarDone === grammarTotal;
+      const built = total > 0 && done === total && grammarDone === grammarTotal;
+      const quizPassed = quizUnits.has(u.id);
+      const completed = built && quizPassed;
       // A unit is only locked while it is brand new. Anything the student already started or finished
       // stays open (e.g. when a teacher adds a unit before it), so they can always go back.
       const locked = !prevDone && !completed && !row && done === 0;
@@ -68,6 +77,8 @@
         grammarTotal,
         grammarDone,
         grammarReady: total > 0 && done === total && grammarDone < grammarTotal, // everything built, the grammar step is next
+        quizPassed,
+        quizReady: built && !quizPassed, // built and grammar done: the unit quiz is next
         learnIndex: row ? Math.max(0, Math.min(num(row.learn_index), total - 1)) : 0,
         completed,
         locked,
@@ -79,7 +90,9 @@
     const done = units.reduce((a, u) => a + u.solved, 0);
     const stars = units.reduce((a, u) => a + u.stars, 0);
     const bonus = units.reduce((a, u) => a + u.extra, 0);
-    const completed = total > 0 && units.every(u => u.completed);
+    const unitsDone = total > 0 && units.every(u => u.completed);
+    const finalPassed = hasFinal ? Boolean(quiz && quiz.final) : unitsDone;
+    const completed = unitsDone && finalPassed;
     const anyLearned = units.some(u => u.learned);
     const current = units.findIndex(u => !u.completed);
     const status = completed ? 'completed' : done > 0 || anyLearned ? 'building' : lp || unitRows.size ? 'learning' : 'new';
@@ -91,6 +104,9 @@
       maxStars: total * 3,
       learned: units.every(u => u.learned),
       completed,
+      hasFinal,
+      finalPassed: hasFinal && finalPassed,
+      finalReady: hasFinal && unitsDone && !finalPassed, // every unit finished: the final quiz is next
       grammarTotal: units.reduce((a, u) => a + u.grammarTotal, 0),
       grammarDone: units.reduce((a, u) => a + u.grammarDone, 0),
       unitsTotal: units.length,
@@ -121,7 +137,8 @@
       if (s.gdone) grammar.add(s.en);
     }
     const rows = new Map((raw.unitRows || []).map(r => [r.unit_id, r]));
-    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra, grammar);
+    const quiz = { units: (raw.units || []).filter(u => u.quizPassed).map(u => u.id), final: Boolean(raw.finalPassed) };
+    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra, grammar, quiz);
   }
 
   function touchLesson(raw, seconds, now) {
@@ -140,8 +157,8 @@
   }
 
   /**
-   * A sentence was built. Same rules as the server: the best result is kept and can never go down;
-   * a better result than before is added as "extra" on top of what the student first achieved.
+   * A sentence was built. Same rules as the server: the stars from the first time are kept exactly as they were;
+   * building a sentence again is practice and never changes the stars (so "extra" is always 0).
    * Updates the lesson copy and the overall stats in place and returns what happened.
    */
   function applySolve(raw, stats, sentence, stars, seconds, now) {
@@ -151,9 +168,8 @@
     const lessonWasDone = modelOf(raw).completed;
     const before = num(found.stars);
     const replay = before > 0;
-    const extra = replay ? Math.max(0, stars - before) : 0;
-    found.stars = Math.max(before, stars);
-    found.extra = num(found.extra) + extra;
+    const extra = 0;
+    found.stars = replay ? before : stars;
     touchLesson(raw, seconds, now);
     const m = modelOf(raw);
     if (stats) {
@@ -181,10 +197,30 @@
     const m = modelOf(raw);
     if (stats) {
       stats.timeSpent = num(stats.timeSpent) + num(seconds);
+      if (!stats.streak) stats.streak = 1;
       if (m.completed && !lessonWasDone && !raw.lp.completed_at) { raw.lp.completed_at = now; stats.lessonsCompleted = num(stats.lessonsCompleted) + 1; }
     }
     return { completed: m.completed };
   }
 
-  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar };
+  /**
+   * A quiz was passed (scope = 'final' or a unit id). Only passing changes anything; a failed attempt is just a try.
+   * Returns { completed } for the whole lesson.
+   */
+  function applyQuiz(raw, stats, scope, passed, seconds, now) {
+    const lessonWasDone = modelOf(raw).completed;
+    touchLesson(raw, seconds, now);
+    if (passed) {
+      if (scope === 'final') raw.finalPassed = true;
+      else { const u = (raw.units || []).find(x => x.id === scope); if (u) u.quizPassed = true; }
+    }
+    const m = modelOf(raw);
+    if (stats) {
+      stats.timeSpent = num(stats.timeSpent) + num(seconds);
+      if (m.completed && !lessonWasDone && !raw.lp.completed_at) { raw.lp.completed_at = now; stats.lessonsCompleted = num(stats.lessonsCompleted) + 1; }
+    }
+    return { completed: m.completed, passed: Boolean(passed) };
+  }
+
+  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyQuiz };
 });

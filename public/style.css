@@ -845,3 +845,392 @@ details.start-over { margin: 12px 0 0; text-align: center; }
   .page[data-layout="game"] .actions { margin-top: 1.25rem; }
   .actions .btn { min-height: 3.25rem; }
 }
+
+/* ================================================================================================
+   v3 · One-screen lessons
+   While a student is playing a step (cards, build, grammar) the page is exactly one screen tall and never scrolls:
+   top bar, a stage that takes the space that is left, and a dock with the controls pinned at the bottom.
+   JavaScript adds the class "play" to #app only while a step is on screen (not on the results page).
+   ================================================================================================ */
+.page { --pad: 20px; }
+@media (max-width: 360px) { .page { --pad: 16px; } }
+@media (min-width: 640px) { .page { --pad: 24px; } }
+
+html:has(#app.play), html:has(#app.play) body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+.page.play {
+  height: 100vh; height: 100dvh; min-height: 0; overflow: hidden;
+  padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+}
+/* In a normal browser tab the phone's toolbar floats over the bottom edge, so keep a little more room there */
+@media (display-mode: browser) { .page.play { padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)); } }
+@media (max-width: 899px) { .play { --tile-h: 52px; } }
+
+.play > .game-top { flex: none; }
+.play > .progress-track { flex: none; }
+.play > .stage {
+  --k: 1; --th: calc(var(--tile-h) * var(--k)); --gap: calc(8px * var(--k));
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 0 12px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none;
+}
+.play > .stage::-webkit-scrollbar { display: none; }
+.play > .dock { flex: none; position: relative; display: flex; flex-direction: column; gap: 12px; padding-top: 2px; }
+
+/* Round icon buttons above the main button */
+.tools { display: flex; justify-content: center; align-items: flex-start; gap: 24px; min-height: 66px; }
+.rbtn {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 56px;
+  border: 0; background: none; padding: 0; cursor: pointer; font: inherit; font-size: .75rem; font-weight: 600; color: var(--muted);
+  -webkit-user-select: none; user-select: none;
+}
+.rbtn .ic {
+  width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  background: var(--surface); border: 1px solid var(--line); color: var(--text); box-shadow: var(--shadow-sm);
+  transition: transform .1s, border-color .15s, background-color .15s;
+}
+.rbtn .ic svg { width: 22px; height: 22px; }
+.rbtn .emoji-ic { font-size: 1.375rem; line-height: 1; }
+.rbtn:not(:disabled):active .ic { transform: scale(.92); }
+.rbtn:not(:disabled):hover .ic { border-color: var(--line-strong); }
+.rbtn:focus-visible { outline: none; }
+.rbtn:focus-visible .ic { box-shadow: var(--ring); }
+.rbtn:disabled { opacity: .35; cursor: default; }
+.rbtn[hidden] { display: none; }
+.btn-main { width: 100%; min-height: 56px; font-size: 1.0625rem; border-radius: 16px; }
+.btn-say { background: var(--accent); color: #fff; }
+:root[data-theme="dark"] .btn-say { color: #0E0E10; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn-say { color: #0E0E10; } }
+.btn-ok { background: var(--success-dark); color: #fff; }
+:root[data-theme="dark"] .btn-ok { color: #0E0E10; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn-ok { color: #0E0E10; } }
+
+/* The result sheet slides up over the dock (full width, like a bottom sheet) */
+.sheet {
+  position: absolute; z-index: 6; left: calc(var(--pad) * -1); right: calc(var(--pad) * -1);
+  bottom: calc(-14px - env(safe-area-inset-bottom, 0px));
+  padding: 16px var(--pad) calc(14px + env(safe-area-inset-bottom, 0px));
+  background: var(--success); color: var(--success-text);
+  border-radius: 24px 24px 0 0; box-shadow: 0 -10px 30px rgba(24, 24, 27, .10);
+  display: flex; flex-direction: column; gap: 12px;
+  animation: sheetUp .3s cubic-bezier(.2, .8, .2, 1) both;
+}
+@media (display-mode: browser) { .sheet { bottom: calc(-20px - env(safe-area-inset-bottom, 0px)); } }
+@keyframes sheetUp { from { transform: translateY(100%); } to { transform: none; } }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; }
+.sheet-msg { font-weight: 700; font-size: 1.1875rem; letter-spacing: -.01em; }
+.sheet .stars { margin: 0; font-size: 24px; letter-spacing: 3px; line-height: 1; }
+.sheet .stars .off { color: color-mix(in srgb, var(--success-text) 25%, transparent); }
+.sheet-extra { font-size: .8125rem; font-weight: 600; margin-top: -6px; }
+.sheet-row { display: flex; align-items: flex-start; gap: 14px; }
+.sheet-row .btn-main { flex: 1; }
+.sheet .rbtn { min-width: 0; color: var(--success-text); }
+.sheet .rbtn .ic { border-color: transparent; }
+
+/* ---------- Cards ---------- */
+.play .prompt { margin: 0; font-size: .9375rem; font-weight: 600; color: var(--muted); flex: none; }
+.play .learn-card { flex: 1 1 auto; min-height: 0; padding: 44px 20px 20px; overflow: hidden; }
+.play .card-sentence { font-size: clamp(1.5rem, 7vw, 2.25rem); }
+.play .card-tip { margin: 14px 0 0; }
+.jump-pop {
+  position: absolute; z-index: 20; left: var(--pad); right: var(--pad); top: calc(64px + env(safe-area-inset-top, 0px));
+  margin: 0; padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow-lift);
+}
+.skip-row { margin: 0; font-size: .875rem; }
+
+/* ---------- Build ---------- */
+.puzzle-stage { gap: 10px; }
+.puzzle-stage .zone { gap: var(--gap); }
+.puzzle-stage .answer-box { flex: 1 1 auto; min-height: 0; display: flex; padding: 12px; border-radius: 20px; }
+.puzzle-stage .answer-zone {
+  flex: 1; min-height: 0; padding: 0; align-content: flex-start;
+  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent calc(var(--th) + var(--gap) - 1px), var(--line) calc(var(--th) + var(--gap) - 1px), var(--line) calc(var(--th) + var(--gap)));
+  background-position: 0 0;
+}
+.puzzle-stage .answer-zone:empty::before { top: 0; height: var(--th); padding: 0; font-size: .9375rem; }
+.puzzle-stage .answer-zone .tile { margin-bottom: 0; }
+.puzzle-stage .answer-box.solved .answer-zone { background-image: none; }
+.puzzle-stage .feedback { flex: none; min-height: 1.5em; margin: 0; font-size: .9375rem; line-height: 1.5; }
+.puzzle-stage .feedback.bad { font-size: 1rem; }
+.tray { flex: none; position: relative; padding: 10px 12px; border: 1px solid transparent; border-radius: 20px; background: var(--surface-2); transition: opacity .25s; }
+.tray.done { opacity: 0; pointer-events: none; }
+.tray .pool-zone { padding: 0; min-height: 0; align-content: flex-start; }
+.tray .measure { position: absolute; left: 12px; right: 12px; width: auto; top: 10px; visibility: hidden; pointer-events: none; padding: 0; min-height: 0; }
+.play .tile { min-height: var(--th); padding: 0 calc(16px * var(--k, 1)); font-size: calc(1.375rem * var(--k, 1)); border-radius: calc(12px * var(--k, 1)); }
+.btn-status, .btn-status:disabled { font-size: 1rem; }
+
+/* ---------- Grammar ---------- */
+.play .gap-card { text-align: center; }
+.play .gap-options { grid-template-columns: 1fr; gap: 10px; margin: 0; width: 100%; max-width: none; }
+.play .gap-opt { min-height: 56px; font-size: 1.125rem; border-radius: 16px; box-shadow: 0 3px 0 var(--line-strong); }
+.play .gap-opt.wrong, .play .gap-opt.right { box-shadow: none; }
+.play .gap-options.away { visibility: hidden; }
+.dock > .feedback { margin: 0; min-height: 1.5em; font-size: 1rem; }
+.dock > .feedback.bad { font-size: 1rem; }
+
+/* ---------- Results: the list of sentences is tucked away so the page stays short ---------- */
+.result-details { margin: 16px 0 0; text-align: center; }
+.result-details > summary { cursor: pointer; list-style: none; font-weight: 600; font-size: .9375rem; color: var(--muted); padding: 6px 0; }
+.result-details > summary::-webkit-details-marker { display: none; }
+.result-details > summary::after { content: ' ▾'; }
+.result-details[open] > summary::after { content: ' ▴'; }
+.result-details .result-list { margin-top: 8px; }
+.celebration { width: 80px; height: 80px; margin: 20px auto 4px; font-size: 40px; }
+.results h1 { margin-top: 12px; }
+.result-actions { margin-top: 20px; }
+
+/* ================================================================================================
+   v3 · Lesson page (hub): the current unit is open, every other unit is one tidy row
+   ================================================================================================ */
+.hub-emoji { width: 56px; height: 56px; border-radius: 16px; margin-top: 8px; font-size: 1.75rem; }
+.hub h1 { margin-top: 12px; font-size: 1.5rem; }
+.hub .subtitle { margin-bottom: 16px; font-size: .9375rem; }
+.hub-progress { padding: 14px 16px; }
+.hub-progress .big-num { font-size: 1.25rem; }
+.hub-progress .progress-track { margin-top: 10px; }
+.hub-progress .muted { margin-top: 8px; }
+.units { margin: 20px 0 0; gap: 10px; text-align: left; }
+.u-item { list-style: none; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); overflow: hidden; }
+.u-item.current { border-color: var(--line-strong); box-shadow: var(--shadow); }
+.u-item.locked { background: transparent; box-shadow: none; }
+.u-head {
+  width: 100%; display: flex; align-items: center; gap: 14px; padding: 14px 16px; text-align: left;
+  background: none; border: 0; font: inherit; color: inherit; cursor: pointer;
+}
+.u-item.locked .u-head { cursor: default; }
+.u-head .step-num { flex: none; }
+.u-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.u-text .unit-label { margin: 0; }
+.u-text .step-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.u-sub { font-size: .8125rem; color: var(--muted); font-weight: 500; }
+.u-item.done .u-sub { color: var(--success-text); }
+.u-head .chev { width: 18px; height: 18px; color: var(--faint); flex: none; }
+.u-open { padding: 0 16px 16px; display: flex; flex-direction: column; gap: 12px; }
+.u-open .unit-steps { margin: 0; justify-content: flex-start; }
+.u-item.current .step-num { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+.u-item.done .step-num { background: var(--success-dark); border-color: var(--success-dark); color: #fff; }
+.u-item.locked .step-num { background: var(--surface-2); border-color: transparent; color: var(--faint); }
+.u-open .btn-play { min-height: 56px; font-size: 1.125rem; border-radius: 16px; }
+
+/* Bottom sheet that opens when a unit is tapped */
+.bsheet-wrap { position: fixed; inset: 0; z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
+.bsheet-bg { position: absolute; inset: 0; background: rgba(10, 10, 12, .45); animation: sk-in .2s ease-out both; }
+.bsheet {
+  position: relative; width: 100%; max-width: 640px; max-height: 85dvh; overflow-y: auto;
+  background: var(--bg); border-radius: 24px 24px 0 0; padding: 8px 20px calc(20px + env(safe-area-inset-bottom, 0px));
+  box-shadow: 0 -12px 40px rgba(0, 0, 0, .25); animation: sheetUp .28s cubic-bezier(.2, .8, .2, 1) both;
+}
+.bsheet-grab { width: 40px; height: 4px; border-radius: 4px; background: var(--line-strong); margin: 0 auto 12px; }
+.bsheet-title { margin: 0 0 12px; font-size: 1.125rem; font-weight: 700; letter-spacing: -.01em; text-align: center; }
+.bsheet-list { display: flex; flex-direction: column; gap: 8px; }
+.srow {
+  display: flex; align-items: center; gap: 14px; width: 100%; padding: 12px 14px; text-align: left; text-decoration: none;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); color: inherit; font: inherit; cursor: pointer;
+}
+.srow:active { transform: scale(.99); }
+.srow .ic { width: 40px; height: 40px; flex: none; border-radius: 12px; display: flex; align-items: center; justify-content: center; background: var(--surface-2); font-size: 1.25rem; }
+.srow .ic svg { width: 20px; height: 20px; }
+.srow .t { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.srow .t b { font-weight: 600; font-size: 1rem; }
+.srow .t small { color: var(--muted); font-size: .8125rem; font-weight: 500; }
+.srow .chev { width: 18px; height: 18px; color: var(--faint); flex: none; }
+.sn-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 36dvh; overflow-y: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); }
+.sn-list li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; padding: 10px 12px; text-align: left; font-size: .9375rem; }
+.sn-list li + li { border-top: 1px solid var(--line); }
+.sn-list .sn-text { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.sn-list .sn-stars { color: var(--gold); letter-spacing: 2px; font-size: .8125rem; }
+.sn-list .sn-btns { display: flex; gap: 2px; }
+.sn-list .icon-btn svg { width: 20px; height: 20px; }
+
+/* ---------- Home: two stats ---------- */
+.stat-row.two { grid-template-columns: repeat(2, 1fr); }
+.stat-row.two .stat { padding: 14px 12px; }
+
+/* Loading placeholders for the new step and unit layouts */
+.sk-stage-fill { flex: 1 1 auto; min-height: 0; margin: 14px 0 12px; border-radius: 24px; }
+.sk-round { width: 48px; height: 48px; border-radius: 50%; flex: none; }
+.dock .sk-btn-main { width: 100%; height: 56px; border-radius: 16px; }
+.sk-urow { height: 64px; border-radius: var(--r-lg); }
+.units .sk-urow + .sk-urow { margin-top: 0; }
+/* The stage clips its content, so cards inside it use a small shadow (a big one would show a hard edge at the bottom) */
+.play .learn-card, .puzzle-stage .answer-box { box-shadow: var(--shadow-sm); }
+.tray.empty { background: transparent; border-color: var(--line); border-style: dashed; }
+.sheet-row { align-items: center; }
+.sheet .rbtn > span:last-child { display: none; }
+
+/* Short phones (small iPhones with the browser bars showing): tighter controls so long sentences still fit */
+@media (max-height: 680px) {
+  .play > .stage { padding: 8px 0 8px; gap: 8px; }
+  .play > .dock { gap: 8px; }
+  .play > .game-top { min-height: 44px; }
+  .progress-track { margin-top: 4px; }
+  .tools { min-height: 44px; gap: 22px; }
+  .rbtn { gap: 0; }
+  .rbtn .ic { width: 44px; height: 44px; }
+  .rbtn > span:last-child { display: none; }
+  .btn-main { min-height: 52px; }
+  .play .learn-card { padding-top: 36px; }
+  .sheet { padding-top: 12px; gap: 10px; }
+}
+
+/* ================================================================================================
+   v4 · Progress dots, hint count, lesson-complete screen, iPhone tip, offline bar
+   ================================================================================================ */
+.dots { display: flex; justify-content: center; align-items: center; gap: 8px; min-height: 22px; padding-top: 8px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line-strong); transition: background-color .25s, box-shadow .25s, transform .25s; }
+.dot.on { background: var(--accent); }
+.dot.cur { background: var(--surface); box-shadow: 0 0 0 2.5px var(--accent); transform: scale(1.2); }
+.dots.many { gap: 3px; }
+.dots.many .dot { flex: 1; max-width: 26px; height: 6px; border-radius: 3px; }
+.dots.many .dot.cur { transform: none; box-shadow: none; background: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
+.play > .dots { flex: none; }
+
+.rbtn .ic { position: relative; }
+.rbtn .badge {
+  position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center; background: var(--ink); color: var(--on-ink);
+  font-size: .6875rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums;
+}
+
+.celeb { align-items: center; justify-content: center; text-align: center; gap: 8px; overflow: hidden; }
+.celeb h1 { margin: 12px 0 0; font-size: 2rem; }
+.celeb-badge {
+  width: 112px; height: 112px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 56px;
+  background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow-lift); animation: rise .6s cubic-bezier(.2, .8, .2, 1.2) both;
+}
+.celeb-title { margin: 0; color: var(--muted); font-size: 1.0625rem; font-weight: 600; }
+.celeb-stars { margin: 8px 0 0; font-size: 44px; letter-spacing: 6px; line-height: 1.1; animation: pop .5s .25s cubic-bezier(.2, .8, .2, 1.2) both; }
+.celeb-total { margin: 0; color: var(--muted); font-size: 1.0625rem; }
+.celeb-total b { color: var(--text); font-size: 1.375rem; }
+
+.tip-card { display: flex; align-items: center; gap: 12px; margin: 0 0 16px; padding: 12px 8px 12px 14px; background: var(--accent-soft); border-radius: var(--r-md); text-align: left; }
+.tip-ic { font-size: 1.5rem; line-height: 1; }
+.tip-text { flex: 1; min-width: 0; display: flex; flex-direction: column; font-size: .8125rem; color: var(--muted); line-height: 1.35; }
+.tip-text b { color: var(--text); font-size: .9375rem; }
+.tip-card .icon-btn { width: 36px; height: 36px; color: var(--muted); font-size: .9375rem; }
+
+.offline { background: var(--ink); color: var(--on-ink); text-align: center; font-size: .8125rem; font-weight: 600; padding: 6px 12px; line-height: 1.4; }
+.page.play { height: calc(100vh - var(--off, 0px)); height: calc(100dvh - var(--off, 0px)); }
+.jump-pop { top: calc(64px + env(safe-area-inset-top, 0px)); }
+@media (max-height: 680px) { .dots { min-height: 14px; padding-top: 4px; } .dot { width: 8px; height: 8px; } }
+
+/* ================================================================================================
+   v5 · Quiz
+   ================================================================================================ */
+.quiz-body { display: flex; flex-direction: column; align-items: center; gap: 14px; width: 100%; }
+.quiz-play {
+  width: 88px; height: 88px; border-radius: 50%; border: 0; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  background: var(--accent); color: #fff; box-shadow: var(--shadow-lift); transition: transform .1s;
+}
+:root[data-theme="dark"] .quiz-play { color: #0E0E10; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .quiz-play { color: #0E0E10; } }
+.quiz-play svg { width: 40px; height: 40px; }
+.quiz-play:active { transform: scale(.94); }
+.quiz-prompt { margin: 0; color: var(--muted); font-size: 1rem; font-weight: 600; text-align: center; }
+.quiz-prompt.big { color: var(--text); font-size: 1.5rem; letter-spacing: -.01em; }
+.quiz-sub { margin: -6px 0 0; color: var(--faint); font-size: .9375rem; text-align: center; }
+.quiz-opt { white-space: normal; line-height: 1.3; padding: 10px 14px; font-size: 1rem; min-height: 56px; text-wrap: balance; }
+.play .quiz-options { gap: 8px; }
+.play .quiz-card .card-sentence { font-size: clamp(1.5rem, 6.4vw, 2.125rem); }
+.sheet.bad { background: var(--hint); color: #B35C00; }
+:root[data-theme="dark"] .sheet.bad, :root[data-theme="dark"] .sheet.bad .sheet-answer b { color: #F6C768; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .sheet.bad, :root:not([data-theme="light"]) .sheet.bad .sheet-answer b { color: #F6C768; } }
+.sheet.bad .rbtn { color: inherit; }
+.sheet-answer { font-size: .9375rem; line-height: 1.35; margin-top: -4px; }
+.sheet-answer b { color: var(--text); font-weight: 700; }
+.tip-text svg { vertical-align: -3px; }
+
+/* ================================================================================================
+   v6 · Computers (windows 900 px and wider)
+   - one smooth text size instead of steps, content capped at about 1200 px
+   - lesson steps: a centred column of about 900 px; buttons keep a sensible width (they never stretch across the screen)
+   - the result sheet is a card as wide as the puzzle; bigger round buttons; hover and focus feedback
+   ================================================================================================ */
+@media (min-width: 900px) {
+  html.student-app { font-size: clamp(16px, calc(10px + .55vw), 21px); }
+  .page[data-layout] { max-width: min(75rem, 1200px); }
+  .page[data-layout="game"] { max-width: min(54rem, 920px); }
+  .page[data-layout="narrow"] { max-width: min(46rem, 760px); }
+
+  /* The controls of a lesson step: bigger, centred, never full width */
+  .play .btn-main { max-width: 26rem; margin-inline: auto; min-height: 3.5rem; font-size: 1.125rem; border-radius: 1.125rem; }
+  .play .tools { min-height: 5.5rem; gap: 2.25rem; }
+  .play .rbtn { font-size: .8125rem; min-width: 4rem; }
+  .play .rbtn .ic { width: 3.5rem; height: 3.5rem; }
+  .play .rbtn .ic svg { width: 1.5rem; height: 1.5rem; }
+  .play .rbtn .emoji-ic { font-size: 1.625rem; }
+  .play .rbtn .badge { min-width: 1.25rem; height: 1.25rem; font-size: .75rem; }
+  .play > .dock { gap: 1rem; }
+  .play .gap-options { max-width: 40rem; margin-inline: auto; gap: .75rem; }
+  .play .gap-opt, .play .quiz-opt { min-height: 3.5rem; font-size: 1.1875rem; }
+  .play .quiz-opt { font-size: 1.125rem; }
+  .play .quiz-play { width: 6rem; height: 6rem; }
+  .play .quiz-play svg { width: 2.75rem; height: 2.75rem; }
+  .play .quiz-prompt.big { font-size: 1.875rem; }
+  .play > .dots { padding-top: .75rem; }
+  .dot { width: .75rem; height: .75rem; }
+
+  /* Tiles of the building puzzle */
+  .play .tile { font-size: calc(1.75rem * var(--k, 1)); padding: 0 calc(1.4rem * var(--k, 1)); border-radius: calc(.875rem * var(--k, 1)); }
+  .puzzle-stage .answer-box { padding: 1rem 1.25rem; border-radius: 1.5rem; }
+  .tray { padding: .75rem 1.25rem; border-radius: 1.5rem; }
+  .tray .measure { left: 1.25rem; right: 1.25rem; top: .75rem; }
+  .puzzle-stage .answer-zone:empty::before { font-size: 1.125rem; }
+  .play .card-tip { font-size: .9375rem; }
+  .play .prompt { font-size: 1.0625rem; }
+  .play .learn-card { border-radius: 1.75rem; }
+
+  /* The result sheet: a card exactly as wide as the puzzle, sitting on the dock */
+  .sheet {
+    left: 0; right: 0; bottom: 0; width: min(100%, 46rem); margin-inline: auto;
+    border-radius: 1.5rem; padding: 1.125rem 1.5rem 1.25rem; box-shadow: var(--shadow-lift);
+  }
+  .sheet-msg { font-size: 1.5rem; }
+  .sheet .stars { font-size: 1.875rem; }
+  .sheet-answer { font-size: 1.0625rem; }
+  .sheet .rbtn .ic { width: 3.25rem; height: 3.25rem; }
+
+  /* Lesson page (two columns, a little bigger) */
+  .hub { column-gap: 3.5rem; }
+  .hub-emoji { width: 4.5rem; height: 4.5rem; font-size: 2.25rem; border-radius: 1.25rem; }
+  .hub h1 { font-size: 2.25rem; }
+  .u-head { padding: 1.125rem 1.375rem; gap: 1.125rem; }
+  .u-head .step-num { width: 2.5rem; height: 2.5rem; }
+  .u-text .step-title { font-size: 1.25rem; }
+  .u-sub, .u-open .unit-steps { font-size: .9375rem; }
+  .u-open { padding: 0 1.375rem 1.375rem; }
+  .u-open .btn-play { min-height: 3.75rem; font-size: 1.25rem; max-width: 26rem; }
+  .hub-progress { padding: 1.25rem 1.5rem; }
+  .hub-progress .big-num { font-size: 1.5rem; }
+  .units { gap: .875rem; }
+
+  /* Home */
+  .stat-row.two .stat { padding: 1.25rem 1rem; }
+  .stat-row.two .stat .v { font-size: 2rem; }
+  .lesson-card { padding: 1.25rem; }
+  .tip-card { max-width: 40rem; }
+
+  /* Results and the lesson-complete screen */
+  .results { max-width: 38rem; }
+  .celeb h1 { font-size: 2.75rem; }
+  .celeb-badge { width: 8rem; height: 8rem; font-size: 4rem; }
+  .celeb-stars { font-size: 3.25rem; }
+  .play .celeb ~ .dock .btn-main { max-width: 22rem; }
+  .bsheet { max-width: 40rem; border-radius: 1.75rem; margin-bottom: 1.5rem; }
+  .bsheet-wrap { align-items: center; }
+}
+
+/* Hover and keyboard focus (mouse and keyboard users) */
+@media (hover: hover) {
+  .rbtn:not(:disabled):hover .ic { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow); }
+  .quiz-play:hover { transform: scale(1.05); }
+  .gap-opt:not(:disabled):hover { border-color: var(--accent); }
+  .u-head:hover { background: var(--surface-2); }
+  .u-item.locked .u-head:hover { background: none; }
+  .srow:hover { border-color: var(--line-strong); background: var(--surface-2); }
+  .btn-main:not(:disabled):hover { filter: brightness(1.06); }
+  .pill-btn:hover, .jump-n:not(:disabled):hover { border-color: var(--accent); }
+  .tile:hover { border-color: var(--accent); }
+}
+.gap-opt:focus-visible, .quiz-play:focus-visible, .u-head:focus-visible, .srow:focus-visible, .pill-btn:focus-visible, .jump-n:focus-visible, .chip:focus-visible, .word:focus-visible {
+  outline: none; box-shadow: var(--ring);
+}
+.u-head:focus-visible { border-radius: var(--r-lg); }

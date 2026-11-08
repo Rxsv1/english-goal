@@ -15,6 +15,25 @@ function groupUnits(rows, key = 'lesson_id') {
 }
 
 /**
+ * Groups passed quiz attempts (lesson_id, scope; user_id when `key` is 'user_id') into
+ * Map(key -> { units: Set(unitId), final: boolean }). Voided attempts must be left out by the query.
+ */
+function groupQuiz(rows, key = 'lesson_id') {
+  const out = new Map();
+  for (const r of rows) {
+    if (!r.passed) continue;
+    if (!out.has(r[key])) out.set(r[key], { units: new Set(), final: false });
+    const q = out.get(r[key]);
+    if (r.scope === 'final') q.final = true;
+    else if (typeof r.scope === 'string' && r.scope.startsWith('unit:')) q.units.add(r.scope.slice(5));
+  }
+  return out;
+}
+
+/** SQL for the passed, not-voided quiz attempts. */
+const PASSED_QUIZ_SQL = 'passed AND NOT voided';
+
+/**
  * Groups sentence_progress rows (needs sentence, stars, extra; plus lesson_id or user_id) into
  * Map(key -> Map(sentence -> value)). `field` is 'stars' (best result) or 'extra' (earned by retrying).
  */
@@ -61,4 +80,4 @@ function streak(days) {
 const VISIBLE_SQL = `l.published AND (l.visibility = 'public' OR EXISTS (
   SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = l.id AND a.user_id = $1))`;
 
-module.exports = { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, streak, EXTRA_SQL, VISIBLE_SQL };
+module.exports = { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL, VISIBLE_SQL };
