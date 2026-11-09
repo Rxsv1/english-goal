@@ -1507,6 +1507,7 @@
       tipLine.classList.remove('good', 'bad');
       if (!micOn() || !st || !st.last) { tipLine.textContent = defaultTip; return; }
       const left = Speak.MAX_TRIES - st.heard.length;
+      if (st.last.unclear) { tipLine.textContent = left > 0 ? 'I heard you, but could not understand. Try again, clearly!' : "I could not understand. Let's move on, you can practise this one again later."; tipLine.classList.add('bad'); fitText(card, text); return; }
       if (st.last.pass) { tipLine.textContent = `✅ ${st.last.percent}% heard. Well said!`; tipLine.classList.add('good'); }
       else if (left > 0) { tipLine.textContent = `${st.last.percent}% heard. The orange words were missed. Try again!`; tipLine.classList.add('bad'); }
       else { tipLine.textContent = `${st.last.percent}% heard. Let's move on, you can practise this one again later.`; tipLine.classList.add('bad'); }
@@ -1539,7 +1540,7 @@
       try { r = new SpeechRec(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
       rec = r; r.lang = 'en-US'; r.continuous = false; r.maxAlternatives = 3;
       r.interimResults = true; // iPhones often end the recording with only a "partial" result: it is used when no final one arrives
-      let got = false, spoke = false, error = '', partial = null;
+      let got = false, spoke = false, sound = false, nomatch = false, error = '', partial = null;
       const altsOf = res => { const out = []; for (let k = 0; res && k < res.length; k++) if (res[k] && typeof res[k].transcript === 'string') out.push(res[k].transcript); return out; };
       // One try is scored once: from the final result, or else from the last partial result when the browser ends without one.
       function takeTry(alts) {
@@ -1561,8 +1562,10 @@
           micTimer = setTimeout(() => { if (rec === r) { stopListening(); drawText(); render(false); } }, 1500);
         } else partial = altsOf(last);
       };
+      r.onsoundstart = () => { sound = true; };
+      r.onnomatch = () => { nomatch = true; };
       r.onspeechstart = () => { // the student is speaking: allow up to 15 seconds for the whole sentence
-        spoke = true; clearTimeout(micTimer);
+        spoke = true; sound = true; clearTimeout(micTimer);
         micTimer = setTimeout(() => { if (rec === r) { try { r.stop(); } catch (e) { stopListening(); render(false); } } }, 15000);
       };
       r.onerror = ev => { error = (ev && ev.error) || 'error'; };
@@ -1572,7 +1575,13 @@
         if (!got) takeTry(partial);
         if (!got) {
           if (/^(not-allowed|service-not-allowed|audio-capture|network|language-not-supported)$/.test(error)) return micFailed('The microphone does not work here. Use the button instead.');
-          toast(`I did not hear anything. Tap the microphone and try again.${error && error !== 'no-speech' ? ` (${error})` : ''}`);
+          if (spoke || sound || nomatch) {
+            // The phone detected speech but understood nothing (for example a wrong or unclear sentence): that is a failed try, every word is marked.
+            got = true;
+            if (!st.startedAt) st.startedAt = Date.now();
+            st.heard.push(''); st.last = { ...Speak.check(sentences[i].en, ''), unclear: true };
+            sfx.wrong(); if (st.heard.length >= Speak.MAX_TRIES) sendSpeak();
+          } else toast(`I did not hear any sound. Tap the microphone and try again.${error && error !== 'no-speech' ? ` (${error})` : ''}`);
         }
         drawText(); render(false);
       };
