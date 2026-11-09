@@ -652,6 +652,7 @@ module.exports = function adminRoutes(pool) {
       checked.push(lesson);
     }
     let created = 0, updated = 0;
+    const fileOrder = []; // the lessons of the file, in the order of the file
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -671,6 +672,7 @@ module.exports = function adminRoutes(pool) {
                units=$9::jsonb, updated_at=now() WHERE id=$1`,
             [existing.id, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
           updated++;
+          fileOrder.push(existing.id);
           continue;
         }
         const id = crypto.randomUUID();
@@ -680,6 +682,18 @@ module.exports = function adminRoutes(pool) {
           [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
         if (assignTo) await client.query('INSERT INTO lesson_assignments (lesson_id, user_id) VALUES ($1,$2)', [id, assignTo]);
         created++;
+        fileOrder.push(id);
+      }
+      // The order of the lessons in the file is the order in the app. The lessons of the file are put in file order in the places they
+      // already take (lessons that are not in the file stay exactly where they are; new lessons come after the others). Not for a
+      // student's private import.
+      if (!assignTo) {
+        const wanted = [...new Set(fileOrder)];
+        const inFile = new Set(wanted);
+        const { rows: now } = await client.query('SELECT id FROM lessons ORDER BY position, title');
+        let next = 0;
+        const sequence = now.map(x => (inFile.has(x.id) ? wanted[next++] : x.id));
+        await client.query('UPDATE lessons l SET position = t.pos - 1 FROM unnest($1::text[]) WITH ORDINALITY AS t(id, pos) WHERE l.id = t.id', [sequence]);
       }
       await client.query('COMMIT');
     } catch (e) {

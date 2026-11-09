@@ -734,3 +734,38 @@ test('Arabic on the cards: the teacher adds it from an AI answer, and switches i
   const impLesson = (await admin('GET', '/lessons')).data.lessons.find(l => l.slug === 'imported-arabic');
   assert.deepEqual((await admin('GET', `/lessons/${impLesson.id}`)).data.lesson.units[0].sentences.map(x => x.ar), ['نحب الشاي', undefined]);
 });
+
+test('importing a lessons file puts the lessons in the order of the file; lessons that are not in the file stay where they are', { skip }, async () => {
+  const mk = (title, slug) => ({ title, slug, units: [{ title: 'U', sentences: [{ en: `${title} sentence one` }, { en: `${title} sentence two` }] }] });
+  const slugs = ['ord-a', 'ord-b', 'ord-c', 'ord-d'];
+  for (const sl of slugs) assert.equal((await admin('POST', '/lessons', mk(sl.toUpperCase(), sl))).status, 201);
+  const orderNow = async () => (await admin('GET', '/lessons')).data.lessons.map(l => l.slug).filter(x => x.startsWith('ord-') || x === 'ord-new');
+  assert.deepEqual(await orderNow(), slugs);
+  const all = (await admin('GET', '/export')).data.lessons;
+  const byslug = Object.fromEntries(all.map(l => [l.slug, l]));
+
+  // the whole file reversed (plus a new lesson in the middle): exactly that order
+  const reversed = ['ord-d', 'ord-c', 'ord-new', 'ord-b', 'ord-a'].map(sl => byslug[sl] || mk('ORD-NEW', sl));
+  const r1 = await admin('POST', '/import', { lessons: reversed });
+  assert.equal(r1.status, 200, JSON.stringify(r1.data));
+  assert.deepEqual([r1.data.created, r1.data.updated], [1, 4]);
+  assert.deepEqual(await orderNow(), ['ord-d', 'ord-c', 'ord-new', 'ord-b', 'ord-a']);
+
+  // a partial file: only A and C, in the order A, C (they are C ... A now): they trade places, D, the new one and B stay where they are
+  const before = (await admin('GET', '/lessons')).data.lessons.map(l => l.slug);
+  const r2 = await admin('POST', '/import', { lessons: [byslug['ord-a'], byslug['ord-c']] });
+  assert.equal(r2.status, 200);
+  const after = (await admin('GET', '/lessons')).data.lessons.map(l => l.slug);
+  const swap = x => (x === 'ord-c' ? 'ord-a' : x === 'ord-a' ? 'ord-c' : x);
+  assert.deepEqual(after, before.map(swap), 'only the two lessons of the file traded places');
+  // the order of the units and the sentences in a lesson follows the file too, and student progress stays (units are matched by title)
+  const flipped = { ...byslug['ord-b'], units: [{ title: 'U2', sentences: [{ en: 'Brand new sentence here' }] }, ...byslug['ord-b'].units] };
+  assert.equal((await admin('POST', '/import', { lessons: [flipped] })).status, 200);
+  const bId = (await admin('GET', '/lessons')).data.lessons.find(l => l.slug === 'ord-b').id;
+  assert.deepEqual((await admin('GET', `/lessons/${bId}`)).data.lesson.units.map(u => u.title), ['U2', 'U']);
+  // a private import for a student never moves the other lessons
+  const kay = await newStudent('Kay');
+  const frozen = (await admin('GET', '/lessons')).data.lessons.map(l => l.slug).join();
+  assert.equal((await admin('POST', '/import', { assignTo: kay.id, lessons: [mk('Kays', 'ord-kays')] })).status, 200);
+  assert.equal((await admin('GET', '/lessons')).data.lessons.map(l => l.slug).filter(x => x !== 'ord-kays').join(), frozen);
+});

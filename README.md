@@ -176,6 +176,15 @@ When a teacher saves a lesson (or imports a JSON file), every sentence without a
 do/does gets a grammar gap automatically (switch in the lesson editor; it can be turned off). Sentences without one of those words
 get no gap, because a safe wrong choice cannot be made for them. Existing lessons are not changed until they are saved again.
 
+## Importing and ordering lessons (JSON)
+
+**Export all** writes every lesson in the order of the Lessons page; **Import JSON** reads a file like that (edit it by hand or with an AI).
+- A lesson with the same `slug` is updated (student progress is kept; units are matched by their title), a new `slug` creates a new lesson.
+- **The order of the file is the order in the app.** The lessons of the file are put in file order in the places they already take; lessons that
+  are not in the file stay exactly where they are; new lessons come after the others. (A file with every lesson gives exactly its order.)
+  The order of the units and of the sentences inside a lesson also follows the file. You can still drag ☰ on the Lessons page.
+- An import made from a student's card (private lessons) never changes the order of the other lessons.
+
 ## Quizzes (required)
 
 Every unit ends with a **quiz** (step 4, after Cards, Build and Grammar), and a lesson with more than one unit ends with a **final quiz** of

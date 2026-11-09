@@ -730,9 +730,9 @@
         const json = JSON.parse(await file.text());
         const items = Array.isArray(json) ? json : json.lessons || (json.title ? [json] : null);
         if (!items) throw new Error('This file does not contain lessons.');
-        if (!confirm(`Import ${plural(items.length, 'lesson')}? Lessons with the same link name will be updated (student progress is kept).`)) return;
+        if (!confirm(`Import ${plural(items.length, 'lesson')}? Lessons with the same link name will be updated (student progress is kept), and the lessons will be put in the order of the file.`)) return;
         const r = await api('POST', '/api/admin/import', { lessons: autoGapItems(items) });
-        toast(`Imported: ${r.created} new, ${r.updated} updated`);
+        toast(`Imported: ${r.created} new, ${r.updated} updated. The order of the file was applied.`);
         showLessons();
       } catch (err) { toast(err instanceof SyntaxError ? 'That file is not valid JSON.' : err.message); }
     });
