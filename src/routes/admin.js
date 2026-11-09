@@ -453,38 +453,8 @@ module.exports = function adminRoutes(pool, translator) {
    * Creates or updates a lesson. With { forUser } the lesson is created as private to that one
    * student (link name made unique automatically).
    */
-  // Fills in the Arabic of every sentence that has none, with the translation service (if it is set up). A problem with the
-  // service never stops a lesson from being saved: the sentences just stay without Arabic.
-  async function fillArabic(units) {
-    if (!translator || !translator.enabled) return { filled: 0, error: null };
-    const missing = units.flatMap(u => u.sentences).filter(sn => !sn.ar);
-    if (!missing.length) return { filled: 0, error: null };
-    try {
-      const out = await translator.translate(missing.map(sn => sn.en));
-      let filled = 0;
-      missing.forEach((sn, i) => { if (out[i]) { sn.ar = out[i]; filled++; } });
-      return { filled, error: null };
-    } catch (e) {
-      console.error('[translate]', e.message);
-      return { filled: 0, error: e.message };
-    }
-  }
-
-  // Is automatic translation set up? (The lesson editor shows or greys its button.)
+  // Is translation available? (Shown on the Students page next to the Arabic switches.)
   r.get('/translate/status', (req, res) => res.json({ enabled: Boolean(translator && translator.enabled), provider: translator ? translator.provider : null }));
-
-  // Translates sentences for the lesson editor (the teacher checks and corrects the result before saving).
-  r.post('/translate', wrap(async (req, res) => {
-    if (!translator || !translator.enabled) return res.status(503).json({ error: 'Automatic translation is not set up on the server (see the README).' });
-    const texts = req.body && req.body.texts;
-    if (!Array.isArray(texts) || !texts.length || texts.length > 200 || !texts.every(t => typeof t === 'string' && t.trim() && t.length <= 400))
-      return res.status(400).json({ error: 'Nothing to translate.' });
-    try {
-      res.json({ translations: await translator.translate(texts) });
-    } catch (e) {
-      res.status(502).json({ error: e.message });
-    }
-  }));
 
   // Arabic on the cards: switched on for one student, or for everyone at once.
   r.put('/users/:id/arabic', wrap(async (req, res) => {
@@ -498,12 +468,10 @@ module.exports = function adminRoutes(pool, translator) {
     const { rowCount } = await pool.query('UPDATE users SET arabic_enabled = $1', [enabled]);
     res.json({ enabled, count: rowCount });
   }));
-
   async function saveLesson(req, res, id, { forUser = null } = {}) {
     const input = forUser && req.body && typeof req.body === 'object' ? { ...req.body, visibility: 'assigned', assignedUserIds: [forUser] } : req.body;
     const { lesson: d, assignedUserIds, errors } = validateLesson(input);
     if (errors) return res.status(400).json({ error: errors[0], errors });
-    const translation = await fillArabic(d.units); // d.sentences holds the same sentence objects, so it gets the Arabic too
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -527,7 +495,7 @@ module.exports = function adminRoutes(pool, translator) {
       }
       await saveAssignments(client, row.id, assignedUserIds);
       await client.query('COMMIT');
-      res.status(id ? 200 : 201).json({ lesson: lessonOut(row, { units: unitsOf(row) }), translation });
+      res.status(id ? 200 : 201).json({ lesson: lessonOut(row, { units: unitsOf(row) }) });
     } catch (e) {
       await client.query('ROLLBACK');
       if (e.code === '23505') return res.status(409).json({ error: `The link name "${d.slug}" is already used by another lesson.` });
@@ -581,7 +549,6 @@ module.exports = function adminRoutes(pool, translator) {
       if (errors) return res.status(400).json({ error: `Lesson ${i + 1} (${(item && item.title) || 'untitled'}): ${errors[0]}` });
       checked.push(lesson);
     }
-    for (const d of checked) await fillArabic(d.units);
     let created = 0, updated = 0;
     const client = await pool.connect();
     try {

@@ -237,3 +237,5 @@ table.data a { color: inherit; }
 .ar-toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .ar-toggle:hover { border-color: var(--accent); }
 .ar-toggle:focus-visible { outline: none; box-shadow: var(--ring); }
+.ar-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 260px; }
+.ar-note { color: var(--muted); font-weight: 500; }

@@ -457,8 +457,14 @@
       try { await api('PUT', '/api/admin/arabic', { enabled: on }); users.forEach(u => { u.arabic = on; cache.delete(`/api/admin/users/${u.id}`); }); draw(); toast(on ? 'Arabic is on for everyone' : 'Arabic is off for everyone'); }
       catch (e) { toast(e.message); }
     };
+    const arNote = h('small', { class: 'ar-note' }, 'Students translate a sentence themselves by tapping the ع button on a card. Nothing to translate for you.');
+    api('GET', '/api/admin/translate/status').then(st => {
+      arNote.textContent = st.enabled
+        ? `Students translate a sentence themselves by tapping the ع button on a card (service: ${st.provider === 'mymemory' ? 'MyMemory, free' : st.provider}). Nothing to translate for you.`
+        : 'Translation is not set up on the server, so the ع button will say it is not available (see the README).';
+    }).catch(() => {});
     const arabicBar = h('div', { class: 'ar-bar' },
-      h('span', { class: 'ar-ic', 'aria-hidden': 'true' }, 'ع'), arCount, h('span', { class: 'spacer' }),
+      h('span', { class: 'ar-ic', 'aria-hidden': 'true' }, 'ع'), h('div', { class: 'ar-text' }, arCount, arNote), h('span', { class: 'spacer' }),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setArabicAll(true) }, 'Enable for all'),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setArabicAll(false) }, 'Disable for all'));
     const quizText = u => (u.quiz.attempts ? `❓ ${u.quiz.passed} passed${u.quiz.last ? ` · last ${u.quiz.last.score}/${u.quiz.last.total} ${u.quiz.last.passed ? '✓' : '✗'}` : ''}` : '❓ no quiz yet');
@@ -917,32 +923,6 @@
       toast('All grammar gaps removed, and automatic gaps are switched off for saving.');
     } }, 'Remove all gaps');
 
-    // Arabic translations: "Translate missing" asks the translation service for every line that has no " // Arabic" yet. The teacher
-    // reads the result in the box, changes anything they do not like, and saves.
-    const trBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', disabled: true, title: 'Checking…' }, '🌐 Translate missing to Arabic');
-    api('GET', '/api/admin/translate/status').then(st => {
-      trBtn.disabled = !st.enabled;
-      trBtn.title = st.enabled ? 'Adds an Arabic translation to every sentence that has none' : 'Not set up on the server (see the README)';
-    }).catch(() => { trBtn.title = 'Could not check'; });
-    trBtn.addEventListener('click', async () => {
-      const per = new Map(units.map(u => [u, lines(u.text)]));
-      const targets = [];
-      per.forEach((ls, u) => ls.forEach((line, idx) => {
-        const { text, ar } = GrammarCore.splitAr(line);
-        const p = GrammarCore.parseLine(text);
-        if (!ar && !p.error && p.en) targets.push({ u, idx, en: p.en });
-      }));
-      if (!targets.length) return toast('Every sentence already has an Arabic translation.');
-      trBtn.disabled = true; trBtn.textContent = '🌐 Translating…';
-      try {
-        const r = await api('POST', '/api/admin/translate', { texts: targets.map(t => t.en) });
-        targets.forEach((t, k) => { if (r.translations[k]) per.get(t.u)[t.idx] += ` // ${r.translations[k]}`; });
-        units.forEach(u => { u.text = per.get(u).join('\n'); if (u.ta) u.ta.value = u.text; });
-        dirty = true; msg.textContent = ''; checkSentences();
-        toast(`Translated ${plural(targets.length, 'sentence')}. Read them, change any you do not like, then save.`);
-      } catch (e) { toast(e.message); } finally { trBtn.disabled = false; trBtn.textContent = '🌐 Translate missing to Arabic'; }
-    });
-
     f.title.addEventListener('input', () => { dirty = true; if (!slugTouched) f.slug.value = slugify(f.title.value); });
     f.slug.addEventListener('input', () => { dirty = true; slugTouched = true; });
     f.slug.addEventListener('blur', () => { f.slug.value = slugify(f.slug.value); });
@@ -961,8 +941,8 @@
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
         h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
-        h('p', { class: 'muted help' }, 'Arabic (optional): the cards can show an Arabic translation. Write it after // on the same line, like  She is reading a book // هي تقرأ كتاباً.  “Translate missing to Arabic” fills in every line that has none (read them and change what you do not like). When you save, any sentence still without Arabic is translated automatically. Students only see it once you switch it on for them on the Students page.'),
-        h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn, trBtn),
+        h('p', { class: 'muted help' }, 'Arabic: you do not need to translate anything. When a student you switched Arabic on for taps the Arabic button on a card, that one sentence is translated automatically and remembered. To use your own wording, write it after // on the same line, like  She is reading a book // هي تقرأ كتاباً.'),
+        h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
         h('label', { class: 'switch' }, autoGaps, h('span', null, 'Add grammar gaps automatically when I save')),
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
