@@ -1532,44 +1532,58 @@
     }
     function micTap() {
       const st = spokenOf(i);
-      if (listening) { try { rec.stop(); } catch (e) { stopListening(); render(false); } return; } // stop early: the result still arrives
+      if (listening) { try { rec.stop(); } catch (e) { stopListening(); render(false); } return; } // stop early: what was heard so far is still used
       if (st.heard.length >= Speak.MAX_TRIES) { sendSpeak(); saidOut.add(i); sfx.card(); render(false); return; } // 3 tries used: continue anyway
       stopSpeech(); clearScreenTimers(); // never listen to our own voice
       let r;
       try { r = new SpeechRec(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
-      rec = r; r.lang = 'en-US'; r.interimResults = false; r.continuous = false; r.maxAlternatives = 3;
-      let got = false, error = '';
-      r.onresult = ev => {
+      rec = r; r.lang = 'en-US'; r.continuous = false; r.maxAlternatives = 3;
+      r.interimResults = true; // iPhones often end the recording with only a "partial" result: it is used when no final one arrives
+      let got = false, spoke = false, error = '', partial = null;
+      const altsOf = res => { const out = []; for (let k = 0; res && k < res.length; k++) if (res[k] && typeof res[k].transcript === 'string') out.push(res[k].transcript); return out; };
+      // One try is scored once: from the final result, or else from the last partial result when the browser ends without one.
+      function takeTry(alts) {
+        if (got || !alts || !alts.length) return;
         got = true;
-        const alts = [];
-        const first = ev.results && ev.results[0];
-        for (let k = 0; first && k < first.length; k++) alts.push(first[k].transcript);
         const best = Speak.best(sentences[i].en, alts);
         if (!st.startedAt) st.startedAt = Date.now();
         st.heard.push(best.text); st.last = best.result;
         if (best.result.pass) { sendSpeak(); saidOut.add(i); sfx.win(); } else { sfx.wrong(); if (st.heard.length >= Speak.MAX_TRIES) sendSpeak(); }
-        try { r.stop(); } catch (e) { /* already stopped */ }
+      }
+      r.onresult = ev => {
+        const list = ev.results || [];
+        const last = list[list.length - 1];
+        if (!last) return;
+        if (last.isFinal) {
+          takeTry(altsOf(last));
+          // the browser closes the microphone by itself; if it does not within 1.5 seconds it is switched off by force
+          clearTimeout(micTimer);
+          micTimer = setTimeout(() => { if (rec === r) { stopListening(); drawText(); render(false); } }, 1500);
+        } else partial = altsOf(last);
+      };
+      r.onspeechstart = () => { // the student is speaking: allow up to 15 seconds for the whole sentence
+        spoke = true; clearTimeout(micTimer);
+        micTimer = setTimeout(() => { if (rec === r) { try { r.stop(); } catch (e) { stopListening(); render(false); } } }, 15000);
       };
       r.onerror = ev => { error = (ev && ev.error) || 'error'; };
-      // The microphone is only on while the student is speaking: it closes the moment speech stops, and straight after a result.
-      r.onspeechend = () => { try { r.stop(); } catch (e) { /* already stopped */ } };
       r.onend = () => {
         if (rec !== r) return;
         stopListening();
+        if (!got) takeTry(partial);
         if (!got) {
           if (/^(not-allowed|service-not-allowed|audio-capture|network|language-not-supported)$/.test(error)) return micFailed('The microphone does not work here. Use the button instead.');
-          toast('I did not hear anything. Tap the microphone and try again.');
+          toast(`I did not hear anything. Tap the microphone and try again.${error && error !== 'no-speech' ? ` (${error})` : ''}`);
         }
         drawText(); render(false);
       };
       try { st.startedAt = st.startedAt || Date.now(); r.start(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
       listening = true; render(false);
-      // Never listens for long: after 6 seconds it is asked to stop, and if it still has not closed 1.5 seconds later it is switched off by force.
+      // Never listens for long: if nobody speaks within 8 seconds it is asked to stop, and if it has not closed 1.5 seconds later it is switched off by force.
       micTimer = setTimeout(() => {
-        if (rec !== r) return;
+        if (rec !== r || spoke) return;
         try { r.stop(); } catch (e) { stopListening(); render(false); return; }
-        micTimer = setTimeout(() => { if (rec === r) { stopListening(); render(false); } }, 1500);
-      }, 6000);
+        micTimer = setTimeout(() => { if (rec === r) { stopListening(); drawText(); render(false); } }, 1500);
+      }, 8000);
     }
 
     async function go(delta) {
