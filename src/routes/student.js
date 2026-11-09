@@ -22,7 +22,7 @@ module.exports = function studentRoutes(pool) {
   // The activity log is for the teacher. If writing to it fails, the student must still be able to log in or sign up.
   const logQuietly = (...args) => logEvent(...args).catch(e => console.error('[events] could not log:', e.message));
 
-  const publicUser = u => ({ id: u.id, name: u.name, email: u.email, createdAt: u.created_at });
+  const publicUser = u => ({ id: u.id, name: u.name, email: u.email, createdAt: u.created_at, arabic: Boolean(u.arabic_enabled) });
 
   /* ================= Auth ================= */
   r.get('/config', (req, res) => res.json({ appName: process.env.APP_NAME || 'WordStack', allowSignup }));
@@ -133,7 +133,8 @@ module.exports = function studentRoutes(pool) {
             id: u.id,
             title: u.title,
             quizPassed: qz.units.has(u.id),
-            sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}) })),
+            // the Arabic is only sent to students the teacher switched it on for
+            sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}), ...(req.user.arabic_enabled && sn.ar ? { ar: sn.ar } : {}) })),
           })),
           lp: p ? { started_at: iso(p.started_at), last_activity_at: iso(p.last_activity_at), completed_at: iso(p.completed_at), time_spent_sec: p.time_spent_sec } : null,
           unitRows: [...(unitMap.get(l.id) || new Map()).values()].map(r => ({ unit_id: r.unit_id, learn_index: r.learn_index, learned_at: iso(r.learned_at) })),

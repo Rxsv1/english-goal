@@ -94,8 +94,12 @@ function validateLesson(input) {
       list.forEach((sn, i) => {
         const where = rawUnits.length > 1 ? `Unit ${un}, sentence ${i + 1}` : `Sentence ${i + 1}`;
         // A line may carry one grammar gap, written like: She [is|are|am] reading a book.
-        const parsed = Grammar.parseLine(typeof sn === 'string' ? sn : sn && typeof sn.en === 'string' ? sn.en : '');
+        // ...and its Arabic translation after " // " (or in an "ar" field when the lesson comes from a file)
+        const { text: lineText, ar: lineAr } = Grammar.splitAr(typeof sn === 'string' ? sn : sn && typeof sn.en === 'string' ? sn.en : '');
+        const parsed = Grammar.parseLine(lineText);
         if (parsed.error) return errors.push(`${where}: ${parsed.error}`);
+        const ar = str(lineAr || (sn && typeof sn === 'object' && typeof sn.ar === 'string' ? sn.ar : ''));
+        if (ar.length > 300) return errors.push(`${where}: the Arabic translation must be 300 characters or fewer.`);
         const en = str(parsed.en);
         let gap = parsed.gap;
         if (!gap && sn && typeof sn === 'object' && sn.gap !== undefined && sn.gap !== null) {
@@ -110,7 +114,7 @@ function validateLesson(input) {
         if (countWords(en) > 20) return errors.push(`${where}: has more than 20 words - split it up.`);
         if (seenText.has(en)) return errors.push(`${where}: this sentence is already used (${seenText.get(en)}).`);
         seenText.set(en, where);
-        out.push(gap ? { en, gap } : { en });
+        out.push({ en, ...(gap ? { gap } : {}), ...(ar ? { ar } : {}) });
       });
       total += out.length;
       units.push({ id, title: utitle, sentences: out });

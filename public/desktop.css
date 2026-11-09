@@ -253,6 +253,47 @@
   .home-main .lesson-grid { grid-template-columns: repeat(auto-fill, minmax(min(16rem, 300px), 1fr)); gap: .875rem; }
 }
 @media (min-width: 900px) {
-  .home-main .lesson-card .title-row { flex-wrap: wrap; row-gap: .125rem; }
+  .home-main .lesson-card .title-row { flex-direction: column; align-items: flex-start; gap: .125rem; }
   .home-main .lesson-card .title { white-space: normal; overflow: visible; }
+}
+
+/* ---- Home on a computer: a compact sidebar that fits on one screen, and the level filter above the grid ---- */
+@media (min-width: 900px) {
+  .home-head { margin: .5rem 0 1rem; }
+  .home-head h1 { font-size: 1.5rem; }
+  .home-head .subtitle { font-size: .9375rem; margin-top: .125rem; }
+  .home-grid { grid-template-columns: 17rem minmax(0, 1fr); gap: 2rem; }
+  .home-side { gap: .75rem; max-height: calc(100vh - 2rem); overflow-y: auto; scrollbar-width: thin; align-self: start; }
+
+  /* the numbers: one slim row */
+  .home-side .stat-row.two { border-radius: var(--r-md); }
+  .home-side .stat-row.two .stat { padding: .625rem .5rem; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: center; gap: 0 .375rem; }
+  .home-side .stat-row.two .stat::before { top: .625rem; bottom: .625rem; }
+  .home-side .stat-row.two .stat .v { font-size: 1.375rem; }
+  .home-side .stat-row.two .stat .sub { margin: 0; font-size: .6875rem; }
+  .home-side .stat-row.two .stat .l { margin: 0; font-size: .75rem; }
+
+  /* Continue: a slim card */
+  .home-side .continue-card { padding: .75rem .875rem; gap: .75rem; border-radius: var(--r-md); box-shadow: var(--shadow); }
+  .home-side .continue-card .emoji { width: 2.5rem; height: 2.5rem; font-size: 1.25rem; border-radius: .625rem; }
+  .home-side .continue-card .label { font-size: .6875rem; }
+  .home-side .continue-card .title { font-size: .9375rem; margin-top: 0; }
+  .home-side .continue-card .muted { font-size: .75rem; margin-top: 0; }
+  .home-side .continue-card .cc-track { margin-top: .5rem; }
+  .home-side .continue-card .go { width: 2rem; height: 2rem; }
+  .home-side .continue-card .go svg { width: 1rem; height: 1rem; }
+
+  /* Completed lessons: a one-line row */
+  .home-side .card-done { padding: .5rem .75rem; gap: .625rem; border-radius: var(--r-md); }
+  .home-side .card-done .emoji { width: 2.25rem; height: 2.25rem; border-radius: .625rem; }
+  .home-side .card-done .emoji svg { width: 1.125rem; height: 1.125rem; }
+  .home-side .card-done .title { font-size: .9375rem; }
+  .home-side .card-done .desc { font-size: .75rem; }
+  .home-side .tip-card { padding: .625rem .5rem .625rem .75rem; }
+
+  /* the title of the grid with the level chips on its right */
+  .home-main .section-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .875rem; }
+  .home-main .section-head h2 { margin: 0; text-align: left; }
+  .home-main .section-head .chips { margin: 0; padding: 0; overflow: visible; flex-wrap: wrap; justify-content: flex-end; }
+  .home-main .section-head .chips > .chip:first-child, .home-main .section-head .chips > .chip:last-child { margin: 0; }
 }

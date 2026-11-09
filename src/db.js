@@ -149,6 +149,9 @@ async function migrate(pool) {
       CREATE INDEX IF NOT EXISTS quiz_attempts_lesson ON quiz_attempts(lesson_id);
       CREATE UNIQUE INDEX IF NOT EXISTS quiz_attempts_cid ON quiz_attempts(user_id, cid) WHERE cid IS NOT NULL;
       CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, set_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+      -- Arabic translation on the cards: the teacher switches it on for each student (off for everyone by default).
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS arabic_enabled BOOLEAN NOT NULL DEFAULT FALSE;
     `);
 
     // Upgrade (once): quizzes became a required step. Whatever a student had already finished before that keeps its credit,

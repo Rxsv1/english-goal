@@ -18,6 +18,7 @@ const skip = DB ? false : 'set TEST_DATABASE_URL to run the API tests';
 
 let server;
 let adminToken;
+let translationServer;
 
 async function call(method, url, body, { token, cookie } = {}) {
   const res = await fetch(BASE + url, {
@@ -76,8 +77,22 @@ before(async () => {
   const pool = new Pool({ connectionString: DB });
   await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
   await pool.end();
+  // A pretend translation service (Google's format): "Hello" comes back as "AR(Hello)".
+  const http = require('node:http');
+  translationServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      const q = JSON.parse(body || '{}').q || [];
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ data: { translations: q.map(x => ({ translatedText: `AR(${x})` })) } }));
+    });
+  });
+  await new Promise(r => translationServer.listen(0, '127.0.0.1', r));
+  const trUrl = `http://127.0.0.1:${translationServer.address().port}/translate`;
   server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, DATABASE_URL: DB, PORT: String(PORT), ADMIN_PASSWORD: 'admin-pass', SESSION_SECRET: 'test-secret', ALLOW_SIGNUP: 'true' },
+    env: { ...process.env, DATABASE_URL: DB, PORT: String(PORT), ADMIN_PASSWORD: 'admin-pass', SESSION_SECRET: 'test-secret', ALLOW_SIGNUP: 'true',
+      TRANSLATE_PROVIDER: 'google', TRANSLATE_API_KEY: 'test-key', TRANSLATE_API_URL: trUrl },
     stdio: 'ignore',
   });
   for (let i = 0; i < 60; i++) {
@@ -87,7 +102,7 @@ before(async () => {
   adminToken = (await call('POST', '/api/admin/login', { password: 'admin-pass' })).data.token;
 });
 
-after(() => { if (server) server.kill(); });
+after(() => { if (server) server.kill(); if (translationServer) translationServer.close(); });
 
 test('admin can create a lesson inside a student card, private to that student', { skip }, async () => {
   const sara = await newStudent('Sara');
@@ -514,7 +529,9 @@ test('lessons imported with grammar gaps (bracket lines or data) keep them', { s
   const lessons = (await admin('GET', '/lessons')).data.lessons;
   const full = (await admin('GET', `/lessons/${lessons.find(l => l.slug === 'imported-gaps').id}`)).data.lesson;
   const [a, b, c] = full.units[0].sentences;
-  assert.deepEqual(a, { en: 'Where is the desk?', gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'] } });
+  const { ar: arOfA, ...aPlain } = a; // (the test server has translation switched on, so an Arabic text is added)
+  assert.equal(arOfA, 'AR(Where is the desk?)');
+  assert.deepEqual(aPlain, { en: 'Where is the desk?', gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'] } });
   assert.deepEqual(b.gap, { index: 2, answer: 'in', options: ['in', 'on', 'at'] });
   assert.equal(c.gap, undefined);
   const wrong = await admin('POST', '/import', { lessons: [{ title: 'X', slug: 'x-bad', units: [{ title: 'U', sentences: [{ en: 'I live in Cairo', gap: { index: 0, answer: 'in', options: ['in', 'on', 'at'] } }] }] }] });
@@ -648,4 +665,63 @@ test('teacher: student list, needs-attention list, hardest sentences', { skip },
   assert.equal(hard[0].mistakes, 4);
   assert.equal(hard[0].hints, 1);
   assert.ok(hard.some(x => x.quizWrong > 0), 'wrong quiz answers count too');
+});
+
+test('Arabic on the cards: translated when a lesson is saved, shown only to students the teacher switched it on for', { skip }, async () => {
+  assert.equal((await admin('GET', '/translate/status')).data.enabled, true);
+  const tr = await admin('POST', '/translate', { texts: ['Hello world', 'We like tea'] });
+  assert.deepEqual(tr.data.translations, ['AR(Hello world)', 'AR(We like tea)']);
+  assert.equal((await admin('POST', '/translate', { texts: [] })).status, 400);
+
+  const nia = await newStudent('Nia');
+  const sam = await newStudent('Sam');
+  // the teacher wrote one translation herself; the other sentence gets one automatically
+  const made = await admin('POST', '/lessons', { title: 'Arabic lesson', units: [{ title: 'U', sentences: [
+    { en: 'She is reading a book // هي تقرأ كتاباً' }, { en: 'We like green tea' },
+  ] }] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  assert.equal(made.data.translation.filled, 1);
+  const slug = made.data.lesson.slug, lessonId = made.data.lesson.id;
+  const stored = (await admin('GET', `/lessons/${lessonId}`)).data.lesson.units[0].sentences;
+  assert.deepEqual(stored.map(x => x.ar), ['هي تقرأ كتاباً', 'AR(We like green tea)']);
+
+  // off for everybody by default: students never receive the Arabic
+  const sentencesOf = async st => (await st.as('GET', '/app')).data.lessons.find(l => l.slug === slug).units[0].sentences;
+  assert.ok((await sentencesOf(nia)).every(x => x.ar === undefined));
+  assert.equal((await nia.as('GET', '/app')).data.user.arabic, false);
+
+  // switched on for one student only
+  assert.equal((await admin('PUT', `/users/${nia.id}/arabic`, { enabled: true })).status, 200);
+  assert.deepEqual((await sentencesOf(nia)).map(x => x.ar), ['هي تقرأ كتاباً', 'AR(We like green tea)']);
+  assert.ok((await sentencesOf(sam)).every(x => x.ar === undefined), 'another student still does not get it');
+  const list = (await admin('GET', '/users')).data.users;
+  assert.equal(list.find(u => u.id === nia.id).arabic, true);
+  assert.equal(list.find(u => u.id === sam.id).arabic, false);
+  assert.equal((await admin('PUT', '/users/nope/arabic', { enabled: true })).status, 404);
+
+  // the teacher's button for everybody
+  const all = await admin('PUT', '/arabic', { enabled: true });
+  assert.equal(all.data.enabled, true);
+  assert.ok((await sentencesOf(sam)).every(x => typeof x.ar === 'string'));
+  await admin('PUT', '/arabic', { enabled: false });
+  assert.ok((await sentencesOf(nia)).every(x => x.ar === undefined), 'switching everybody off also switches Nia off');
+
+  // students who sign up later start with it off
+  const late = await newStudent('Late');
+  assert.equal((await late.as('GET', '/app')).data.user.arabic, false);
+
+  // the editor shows the Arabic after //, and saving the same lines again changes nothing
+  const lines = stored.map(x => `${x.en} // ${x.ar}`);
+  const again = await admin('PUT', `/lessons/${lessonId}`, { title: 'Arabic lesson', slug, units: [{ title: 'U', sentences: lines.map(en => ({ en })) }] });
+  assert.equal(again.status, 200, JSON.stringify(again.data));
+  assert.equal(again.data.translation.filled, 0);
+  // an Arabic text that is too long is refused with a clear message
+  const long = await admin('POST', '/lessons', { title: 'Too long', units: [{ title: 'U', sentences: [{ en: 'We like tea', ar: 'ا'.repeat(301) }] }] });
+  assert.equal(long.status, 400);
+  assert.match(long.data.error, /300 characters/);
+  // an import keeps the Arabic that is in the file
+  const imp = await admin('POST', '/import', { lessons: [{ title: 'Imported arabic', slug: 'imported-arabic', units: [{ title: 'U', sentences: [{ en: 'We like tea', ar: 'نحب الشاي' }, { en: 'They were late' }] }] }] });
+  assert.equal(imp.status, 200, JSON.stringify(imp.data));
+  const impLesson = (await admin('GET', '/lessons')).data.lessons.find(l => l.slug === 'imported-arabic');
+  assert.deepEqual((await admin('GET', `/lessons/${impLesson.id}`)).data.lesson.units[0].sentences.map(x => x.ar), ['نحب الشاي', 'AR(They were late)']);
 });

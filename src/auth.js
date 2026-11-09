@@ -136,7 +136,7 @@ function userMiddleware(pool) {
       const payload = unsign(readCookie(req, USER_COOKIE));
       if (!payload || !payload.u) return res.status(401).json({ error: 'Please log in.' });
       const { rows } = await pool.query(
-        'SELECT id, email, name, disabled, created_at, last_seen_at FROM users WHERE id = $1',
+        'SELECT id, email, name, disabled, created_at, last_seen_at, arabic_enabled FROM users WHERE id = $1',
         [payload.u]
       );
       const user = rows[0];

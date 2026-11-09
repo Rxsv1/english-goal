@@ -211,11 +211,42 @@ Windows 900 px wide and up get their own stylesheet, `public/desktop.css` (linke
   tiles are smaller; the buttons and the result card keep a sensible width instead of stretching.
 - **Lesson page:** left, the summary; right, the units. The steps of a unit open inside its card instead of in a pop-up (the unit you are on
   is open from the start). On a phone they still open in a bottom sheet.
-- **Home:** a sidebar (stats, Continue, level filter) and a grid of lessons (3 columns on wide windows).
+- **Home:** a compact sidebar that fits on one screen (stats in one slim row, a slim Continue card, a one-line Completed row) and a grid of
+  lessons (3 columns on wide windows) with the level filter on the "All lessons" line above it.
 - **Teacher pages:** Overview / Students / Lessons are a sidebar on the left; a student's card has two columns (numbers and lessons on the
   left, quizzes and the timeline on the right).
 
 `app.js` builds a different Home and opens unit steps differently when `isPc()` is true, and redraws when the window crosses 900 px.
+
+## Arabic translation on the cards
+
+A student can flip a card to see its Arabic translation (the **ع Arabic** button; **EN** flips back). It is **off for everybody by default**:
+the teacher switches it on for each student (the **ع** switch on the Students page, or the switch on the student's own card), or for all
+students at once with **Enable for all / Disable for all**. The server only sends the Arabic to students it is switched on for. Cards only.
+
+**Where the Arabic comes from:** an online translation service, used from the server. The default is **MyMemory**: it is free and needs **no
+account and no key**, so it works as soon as the app is deployed. A translation is made once, when a teacher saves a lesson (every sentence
+that has none) or presses **🌐 Translate missing to Arabic** in the lesson editor, and is stored with the sentence. In the editor the Arabic
+is written after `//` on the same line (`She is reading a book // هي تقرأ كتاباً`), so the teacher can read it and change any sentence.
+Students never trigger a translation. Only the English sentences are sent to the service.
+
+Machine translation can be wrong (MyMemory is free and not as good as the paid services): read each lesson once and correct what you need.
+A sentence it cannot translate is simply left without Arabic (type it yourself after `//`).
+
+### Settings (all optional; on CranL they are environment variables, the same place as `DATABASE_URL`)
+
+| Variable | Meaning |
+|---|---|
+| `TRANSLATE_EMAIL` | **Recommended.** Any email address of yours. MyMemory then allows 50,000 characters a day instead of 5,000 (about 1,000 sentences instead of about 100). No sign-up. |
+| `TRANSLATE_PROVIDER` | `mymemory` (default, free) · `libretranslate` (free software you run yourself) · `google` · `deepl` |
+| `TRANSLATE_API_URL` | LibreTranslate: the address of your server, e.g. `https://translate.example.com` |
+| `TRANSLATE_API_KEY` | google / deepl: the key. LibreTranslate: only if your server asks for one |
+
+If the daily limit is used up, the editor says so and the sentences stay without Arabic until the next day (or until you type them).
+
+**LibreTranslate (free, unlimited, better control):** it needs a small server of your own (about 2 GB of memory), e.g. with Docker:
+`docker run -p 5000:5000 libretranslate/libretranslate --load-only en,ar`. Then set `TRANSLATE_PROVIDER=libretranslate` and
+`TRANSLATE_API_URL` to its address. Google Cloud Translation and DeepL are also supported (`TRANSLATE_PROVIDER` + `TRANSLATE_API_KEY`).
 
 ## Run locally
 

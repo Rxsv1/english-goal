@@ -285,7 +285,7 @@
             title: text(u.title),
             quizPassed: Boolean(u.quizPassed),
             sentences: u.sentences.filter(x => isObj(x) && typeof x.en === 'string' && x.en.trim())
-              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3), ...cleanGap(x) })),
+              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3), ...cleanGap(x), ...(typeof x.ar === 'string' && x.ar.trim() ? { ar: x.ar.slice(0, 300) } : {}) })),
           });
         }
         if (!units.length) continue;
@@ -893,12 +893,12 @@
             showInstallTip ? installTip() : null,
             statRow(),
             cont ? continueCard(cont) : null,
-            finished.length ? completedLink(finished) : null,
-            lessons.length && levels.length > 2 ? h('div', { class: 'side-filter' }, h('h2', null, 'Level'), chips) : null),
+            finished.length ? completedLink(finished) : null),
           h('div', { class: 'home-main' },
             assigned.length ? h('section', { class: 'section' }, h('h2', null, 'For you'), h('div', { class: 'lesson-grid' }, assigned.map(lessonCard))) : null,
             h('section', { class: 'section' },
-              h('h2', null, 'All lessons'),
+              // the level filter sits right above the grid, on the same line as the title
+              h('div', { class: 'section-head' }, h('h2', null, 'All lessons'), lessons.length ? chips : null),
               lessons.length ? null : h('p', { class: 'empty' }, emptyText),
               grid))));
     }
@@ -1248,6 +1248,10 @@
     const listen = rbtn(ICON.sound, 'Listen');
     const slow = rbtn('🐢', 'Slowly');
     const prev = rbtn(ICON.back, 'Back', { 'aria-label': 'Previous sentence' });
+    // Arabic translation: only there when the teacher switched it on for this student (the server then sends the Arabic)
+    const hasAr = sentences.some(sn => sn.ar);
+    let showAr = false;
+    const arBtn = hasAr ? rbtn('ع', 'Arabic', { 'aria-label': 'Show the Arabic translation' }) : null;
     // One main button: first "I said it out loud", then "Next".
     const next = h('button', { class: 'btn btn-main btn-primary', type: 'button' });
     // The first time through (and when starting over) every sentence must be said out loud before moving on.
@@ -1266,10 +1270,10 @@
         h('p', { class: 'prompt' }, needSay ? '👀 Read  ·  🔊 Listen  ·  🗣️ Say it out loud' : '👀 Look and listen'),
         card),
       h('div', { class: 'dock' },
-        h('div', { class: 'tools' }, prev, listen, slow),
+        h('div', { class: 'tools' }, prev, listen, slow, arBtn),
         next,
         restart ? h('p', { class: 'skip-row' }, h('a', { href: reviewPath, 'data-link': true }, 'Already know them? Skip to building ›')) : null),
-      h('p', { class: 'kbd-hint' }, needSay ? '←  →  next / previous  ·  Space listen  ·  S I said it' : '←  →  next / previous  ·  Space listen') // shown on computers only
+      h('p', { class: 'kbd-hint' }, (needSay ? '←  →  next / previous  ·  Space listen  ·  S I said it' : '←  →  next / previous  ·  Space listen') + (hasAr ? '  ·  A Arabic' : '')) // shown on computers only
     );
     app.classList.add('play');
 
@@ -1291,17 +1295,44 @@
       speak(sentences[i].en, s, () => card.classList.remove('speaking'));
     }
 
+    // The sentence on the card: in English (each word can be tapped to hear it) or, after the Arabic button, its Arabic translation.
+    function drawText() {
+      const cur = sentences[i];
+      if (showAr && cur.ar) {
+        text.replaceChildren(cur.ar);
+        text.setAttribute('dir', 'rtl'); text.lang = 'ar'; text.classList.add('is-ar');
+        num.textContent = 'العربية · Arabic';
+      } else {
+        showAr = false;
+        text.removeAttribute('dir'); text.lang = 'en'; text.classList.remove('is-ar');
+        num.textContent = `Sentence ${i + 1}`;
+        text.replaceChildren(...cur.en.split(/\s+/).flatMap((w, k) => [
+          k ? ' ' : '',
+          h('span', { class: 'word', role: 'button', tabindex: '0', onclick: () => speak(stripEdges(w) || w, true),
+            onkeydown: e => { if (e.key === 'Enter') speak(stripEdges(w) || w, true); } }, w),
+        ]));
+      }
+      if (arBtn) {
+        arBtn.disabled = !cur.ar;
+        arBtn.querySelector('.ic').textContent = showAr ? 'EN' : 'ع';
+        arBtn.querySelector('span:last-child').textContent = showAr ? 'English' : 'Arabic';
+        arBtn.setAttribute('aria-label', showAr ? 'Show the English sentence' : 'Show the Arabic translation');
+      }
+      fitText(card, text);
+    }
+    function flipArabic() {
+      if (!arBtn || !sentences[i].ar) return;
+      showAr = !showAr;
+      drawText();
+      restartAnimation(card, 'flip-card');
+    }
+
     function render(autoSpeak) {
       const s = sentences[i].en;
       pill.textContent = `${i + 1} / ${total}`;
       dots.set(i, i);
-      num.textContent = `Sentence ${i + 1}`;
-      text.replaceChildren(...s.split(/\s+/).flatMap((w, k) => [
-        k ? ' ' : '',
-        h('span', { class: 'word', role: 'button', tabindex: '0', onclick: () => speak(stripEdges(w) || w, true),
-          onkeydown: e => { if (e.key === 'Enter') speak(stripEdges(w) || w, true); } }, w),
-      ]));
-      fitText(card, text);
+      showAr = false; // every new card starts in English
+      drawText();
       restartAnimation(card, 'flip-in');
       prev.disabled = i === 0;
       const said = !needSay || saidOut.has(i);
@@ -1348,6 +1379,7 @@
     listen.addEventListener('click', () => speakCard(false));
     slow.addEventListener('click', () => speakCard(true));
     prev.addEventListener('click', () => go(-1));
+    if (arBtn) arBtn.addEventListener('click', flipArabic);
     next.addEventListener('click', () => { if (!markSaid()) go(1); });
 
     // Swipe left/right on the card
@@ -1366,6 +1398,7 @@
       else if (e.key === ' ' && !e.target.closest('button, [role="button"]')) { e.preventDefault(); speakCard(false); }
       else if (e.key === 'Enter' && !e.target.closest('button, a, [role="button"]')) next.click(); // Enter works as the main button
       else if ((e.key === 's' || e.key === 'S') && needSay && !e.ctrlKey && !e.metaKey && !e.altKey) markSaid();
+      else if ((e.key === 'a' || e.key === 'A') && !e.ctrlKey && !e.metaKey && !e.altKey) flipArabic();
     };
     document.addEventListener('keydown', onKey);
     const stopRelayout = onRelayout(() => fitText(card, text));
@@ -1440,8 +1473,9 @@
     // get a fixed height (they never grow or shrink while words move between them). How many lines a set of words needs
     // depends on their order, so the tray is sized for the shuffled order it really shows, and the answer box for the
     // right order or the tray's order (whichever needs more lines).
+    let holding = false; // true while a word is being dragged
     function fit() {
-      if (!round) return;
+      if (!round || holding) return;
       const cs = el => getComputedStyle(el);
       const vPad = el => ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth'].reduce((a, p) => a + (parseFloat(cs(el)[p]) || 0), 0);
       const heightOf = order => { measure.replaceChildren(...order.map(makeTile)); return measure.offsetHeight; };
@@ -1597,11 +1631,14 @@
     pool.addEventListener('click', onTap);
 
     if (window.Sortable) {
+      // The dragged copy stays inside the puzzle (fallbackOnBody: false), so it keeps the exact size and look of the tile; the
+      // copy follows the finger with no animation (see .dragging in style.css); nothing is re-measured while a word is held.
       const opts = {
-        group: 'words', animation: 150, easing: 'cubic-bezier(0.2, 0, 0, 1)',
-        forceFallback: true, fallbackOnBody: true, fallbackTolerance: 6,
-        fallbackClass: 'dragging', ghostClass: 'ghost', swapThreshold: 0.6,
-        onEnd: () => { lastDragEnd = Date.now(); afterChange(false); },
+        group: 'words', animation: 120, easing: 'cubic-bezier(0.2, 0, 0, 1)',
+        forceFallback: true, fallbackOnBody: false, fallbackTolerance: 4, emptyInsertThreshold: 28,
+        fallbackClass: 'dragging', ghostClass: 'ghost', chosenClass: 'chosen', swapThreshold: 0.55,
+        onStart: () => { holding = true; document.body.classList.add('is-dragging'); },
+        onEnd: () => { holding = false; document.body.classList.remove('is-dragging'); lastDragEnd = Date.now(); afterChange(false); },
       };
       sortables = [Sortable.create(answer, opts), Sortable.create(pool, opts)];
     }
@@ -1624,7 +1661,7 @@
     };
     document.addEventListener('keydown', onKey);
     const stopRelayout = onRelayout(fit);
-    cleanup = () => { document.removeEventListener('keydown', onKey); stopRelayout(); sortables.forEach(s => s.destroy()); };
+    cleanup = () => { document.removeEventListener('keydown', onKey); stopRelayout(); sortables.forEach(s => s.destroy()); document.body.classList.remove('is-dragging'); };
 
     function finish() {
       cleanup(); cleanup = null;

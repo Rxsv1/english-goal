@@ -448,7 +448,7 @@ h2 { margin: 0 0 12px; font-size: .8125rem; font-weight: 600; color: var(--muted
   box-shadow: 0 1px 0 var(--line-strong), var(--shadow-sm);
   font-weight: 700; font-size: clamp(1.25rem, 5.4vw, 1.5rem); letter-spacing: -.01em; white-space: nowrap;
   cursor: pointer; touch-action: none;
-  transition: background-color .2s, border-color .2s, color .2s, transform .1s;
+  transition: background-color .2s, border-color .2s, color .2s;
 }
 .tile:active { transform: scale(.96); }
 .answer-zone .tile { background: var(--accent-soft); border-color: transparent; box-shadow: none; color: var(--accent-dark); }
@@ -458,7 +458,15 @@ h2 { margin: 0 0 12px; font-size: .8125rem; font-weight: 600; color: var(--muted
 .tile.solved { background: var(--success) !important; border-color: transparent !important; box-shadow: none !important; color: var(--success-text) !important; cursor: default; }
 .tile.flash { animation: flash .9s; }
 .tile.ghost { opacity: .3; }
-.tile.dragging { box-shadow: var(--shadow-lift) !important; scale: 1.06; opacity: 1 !important; cursor: grabbing; }
+/* The copy of a word that follows the finger: no transitions at all (they made it lag behind), the same size as the tile, a little lifted */
+.tile.dragging, .tile.dragging:hover, .tile.dragging:active {
+  transition: none !important; animation: none !important; box-shadow: var(--shadow-lift) !important; opacity: 1 !important; border-color: var(--accent) !important;
+  cursor: grabbing; z-index: 200; will-change: transform; margin: 0 !important; pointer-events: none;
+}
+.tile.chosen { transition: none; }
+.tile.chosen:active { transform: none; }
+body.is-dragging, body.is-dragging * { cursor: grabbing !important; -webkit-user-select: none; user-select: none; }
+body.is-dragging .tile:not(.dragging) { transform: none; }
 @keyframes shake { 0%,100% { translate: 0; } 25% { translate: -4px; } 75% { translate: 4px; } }
 @keyframes flash { 50% { background: var(--hint); border-color: var(--hint-line); } }
 
@@ -1044,3 +1052,12 @@ html:has(#app.play), html:has(#app.play) body { height: 100%; overflow: hidden; 
   outline: none; box-shadow: var(--ring);
 }
 .u-head:focus-visible { border-radius: var(--r-lg); }
+
+/* ================================================================================================
+   v8 · Arabic translation on the cards
+   ================================================================================================ */
+.card-sentence.is-ar { font-family: 'Noto Naskh Arabic', 'Segoe UI', 'Geeza Pro', 'Traditional Arabic', Tahoma, system-ui, sans-serif; line-height: 1.8; letter-spacing: 0; font-weight: 600; text-wrap: balance; }
+.learn-card:has(.is-ar) .card-tip { visibility: hidden; }
+.flip-card { animation: flipCard .42s cubic-bezier(.2, .8, .2, 1); }
+@keyframes flipCard { from { transform: perspective(900px) rotateY(-88deg); opacity: .3; } to { transform: perspective(900px) rotateY(0); opacity: 1; } }
+.rbtn .emoji-ic { font-weight: 700; }

@@ -83,15 +83,28 @@
     return { gap: { index, answer, options: [...options] } };
   }
 
-  /** A stored sentence as the line the teacher edits ("She [is|are|am] reading"). */
+  /**
+   * A line may end with its Arabic translation after " // ":   She is reading a book // هي تقرأ كتاباً
+   * Returns { text, ar } (ar is '' when there is none).
+   */
+  function splitAr(raw) {
+    const t = String(raw === null || raw === undefined ? '' : raw);
+    const m = t.match(/\s\/\/\s/);
+    return m ? { text: t.slice(0, m.index), ar: t.slice(m.index + m[0].length).trim() } : { text: t, ar: '' };
+  }
+
+  /** A stored sentence as the line the teacher edits ("She [is|are|am] reading // الترجمة"). */
   function toLine(sentence) {
-    const gap = sentence && sentence.gap;
-    if (!gap) return sentence ? sentence.en : '';
-    const words = sentence.en.split(' ');
-    const word = words[gap.index];
-    if (word === undefined) return sentence.en;
-    words[gap.index] = word.replace(stripEdges(word), `[${gap.options.join('|')}]`);
-    return words.join(' ');
+    const base = (() => {
+      const gap = sentence && sentence.gap;
+      if (!gap) return sentence ? sentence.en : '';
+      const words = sentence.en.split(' ');
+      const word = words[gap.index];
+      if (word === undefined) return sentence.en;
+      words[gap.index] = word.replace(stripEdges(word), `[${gap.options.join('|')}]`);
+      return words.join(' ');
+    })();
+    return sentence && sentence.ar ? `${base} // ${sentence.ar}` : base;
   }
 
   /**
@@ -108,5 +121,5 @@
     return null;
   }
 
-  return { parseLine, checkGap, toLine, suggestLine, autoOptions };
+  return { parseLine, checkGap, toLine, suggestLine, autoOptions, splitAr };
 });

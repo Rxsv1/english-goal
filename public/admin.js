@@ -143,9 +143,11 @@
   function autoGapsOn() { try { return localStorage.getItem('ws:admin-autogaps') !== '0'; } catch (e) { return true; } }
   // A plain sentence line gets a gap when it has a safe word (be / have / do); lines that already have a gap, or a typing mistake, are left alone.
   function withAutoGap(line) {
-    const parsed = GrammarCore.parseLine(line);
+    const { text, ar } = GrammarCore.splitAr(line); // the Arabic after " // " is left alone
+    const parsed = GrammarCore.parseLine(text);
     if (parsed.error || parsed.gap) return line;
-    return GrammarCore.suggestLine(parsed.en) || line;
+    const withGap = GrammarCore.suggestLine(parsed.en);
+    return withGap ? (ar ? `${withGap} // ${ar}` : withGap) : line;
   }
   // The same for lessons that come from an imported JSON file (sentences written as text or as { en }).
   function autoGapItems(items) {
@@ -443,10 +445,28 @@
     const filterRow = h('div', { class: 'chips-row' },
       h('button', { class: 'chip', type: 'button', 'data-k': 'all', onclick: () => { only = 'all'; draw(); } }, `All (${users.length})`),
       h('button', { class: 'chip', type: 'button', 'data-k': 'attention', onclick: () => { only = 'attention'; draw(); } }, `⚠️ Needs attention (${attention.length})`));
+    // Arabic translation on the cards: a switch for each student, and one pair of buttons for everybody
+    const arCount = h('span', { class: 'ar-count' });
+    const setArabic = async (u, on) => {
+      try { await api('PUT', `/api/admin/users/${u.id}/arabic`, { enabled: on }); u.arabic = on; cache.delete(`/api/admin/users/${u.id}`); draw(); toast(on ? `Arabic is on for ${u.name}` : `Arabic is off for ${u.name}`); }
+      catch (e) { toast(e.message); }
+    };
+    const setArabicAll = async on => {
+      if (!users.length) return;
+      if (!confirm(`${on ? 'Turn Arabic translation ON' : 'Turn Arabic translation OFF'} for all ${plural(users.length, 'student')}?`)) return;
+      try { await api('PUT', '/api/admin/arabic', { enabled: on }); users.forEach(u => { u.arabic = on; cache.delete(`/api/admin/users/${u.id}`); }); draw(); toast(on ? 'Arabic is on for everyone' : 'Arabic is off for everyone'); }
+      catch (e) { toast(e.message); }
+    };
+    const arabicBar = h('div', { class: 'ar-bar' },
+      h('span', { class: 'ar-ic', 'aria-hidden': 'true' }, 'ع'), arCount, h('span', { class: 'spacer' }),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setArabicAll(true) }, 'Enable for all'),
+      h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setArabicAll(false) }, 'Disable for all'));
     const quizText = u => (u.quiz.attempts ? `❓ ${u.quiz.passed} passed${u.quiz.last ? ` · last ${u.quiz.last.score}/${u.quiz.last.total} ${u.quiz.last.passed ? '✓' : '✗'}` : ''}` : '❓ no quiz yet');
     const draw = () => {
       const q = search.value.trim().toLowerCase();
       filterRow.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', String(c.dataset.k === only)));
+      const arOn = users.filter(u => u.arabic).length;
+      arCount.textContent = `Arabic translation on the cards: on for ${arOn} of ${plural(users.length, 'student')}`;
       const shown = users.filter(u => (only === 'all' || needs.has(u.id)) && (!q || u.name.toLowerCase().includes(q) || u.email.includes(q)));
       list.replaceChildren(...(shown.length ? shown.map(u => h('a', { class: 'admin-item', href: `#/students/${u.id}` },
         avatar(u.name),
@@ -456,6 +476,11 @@
           h('div', { class: 'sub' }, `${u.email} · last active ${timeAgo(u.lastActiveAt || u.lastSeenAt)}`),
           h('div', { class: 'sub' }, u.currentLesson ? `${u.currentLesson.emoji} ${u.currentLesson.title}${u.currentLesson.completed ? ' (done)' : ''} · ` : 'No lesson started · ', quizText(u))),
         h('div', { class: 'nums' },
+          h('button', {
+            class: 'ar-toggle' + (u.arabic ? ' on' : ''), type: 'button', role: 'switch', 'aria-checked': String(Boolean(u.arabic)),
+            title: u.arabic ? 'Arabic translation is ON for this student (click to turn off)' : 'Arabic translation is OFF for this student (click to turn on)',
+            onclick: e => { e.preventDefault(); e.stopPropagation(); setArabic(u, !u.arabic); },
+          }, 'ع'),
           h('span', { title: 'Sentences built' }, `✅ ${u.stats.sentencesSolved}`),
           h('span', { title: 'Stars' }, `⭐ ${u.stats.stars}`),
           h('span', { title: 'Lessons completed' }, `🏆 ${u.stats.lessonsCompleted}`),
@@ -494,6 +519,7 @@
           h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: () => { addForm.hidden = false; f.name.focus(); } }, '+ Add student'))),
       addForm,
       h('div', { class: 'section' }, search),
+      arabicBar,
       h('div', { class: 'section' }, filterRow),
       h('div', { class: 'section' }, list)
     );
@@ -601,6 +627,14 @@
     });
 
     const actions = h('div', { class: 'toolbar' },
+      h('button', {
+        class: 'btn btn-sm ' + (u.arabic ? 'btn-primary' : 'btn-ghost'), type: 'button', role: 'switch', 'aria-checked': String(Boolean(u.arabic)),
+        title: 'Lets this student flip the cards to see the Arabic translation',
+        onclick: async () => {
+          try { await api('PUT', `/api/admin/users/${id}/arabic`, { enabled: !u.arabic }); cache.delete('/api/admin/users'); cache.delete(`/api/admin/users/${id}`); toast(u.arabic ? 'Arabic turned off' : 'Arabic turned on'); showStudent(id); }
+          catch (e) { toast(e.message); }
+        },
+      }, `ع Arabic on the cards: ${u.arabic ? 'ON' : 'OFF'}`),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { editForm.hidden = !editForm.hidden; } }, '✏️ Edit details'),
       h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async () => {
         const pw = prompt(`New password for ${u.name} (at least 8 characters):`);
@@ -814,7 +848,7 @@
         const problems = [];
         if (!ls.length) problems.push('Add at least one sentence.');
         ls.forEach((line, i) => {
-          const parsed = GrammarCore.parseLine(line); // a line may carry a grammar gap: She [is|are|am] reading
+          const parsed = GrammarCore.parseLine(GrammarCore.splitAr(line).text); // a line may carry a grammar gap (She [is|are|am] reading) and an Arabic part after //
           if (parsed.error) { problems.push(`Line ${i + 1}: ${parsed.error}`); return; }
           const x = parsed.en;
           const n = countWords(x);
@@ -867,20 +901,47 @@
       let added = 0, total = 0;
       mapLines(line => {
         total++;
-        const parsed = GrammarCore.parseLine(line);
+        const { text, ar } = GrammarCore.splitAr(line);
+        const parsed = GrammarCore.parseLine(text);
         if (parsed.error || parsed.gap) return line; // leave lines that already have a gap (or a mistake) alone
         const suggestion = GrammarCore.suggestLine(parsed.en);
         if (!suggestion) return line;
         added++;
-        return suggestion;
+        return ar ? `${suggestion} // ${ar}` : suggestion;
       });
       toast(added ? `Added a gap to ${added} of ${total} sentences. Check them, then save the lesson.` : 'No safe gaps found. Write your own, like [is|are|am].');
     } }, '✨ Suggest grammar gaps');
     const clearGapsBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => {
-      mapLines(line => { const parsed = GrammarCore.parseLine(line); return parsed.error ? line : parsed.en; });
+      mapLines(line => { const { text, ar } = GrammarCore.splitAr(line); const parsed = GrammarCore.parseLine(text); return parsed.error ? line : (ar ? `${parsed.en} // ${ar}` : parsed.en); });
       autoGaps.checked = false; autoGaps.dispatchEvent(new Event('change'));
       toast('All grammar gaps removed, and automatic gaps are switched off for saving.');
     } }, 'Remove all gaps');
+
+    // Arabic translations: "Translate missing" asks the translation service for every line that has no " // Arabic" yet. The teacher
+    // reads the result in the box, changes anything they do not like, and saves.
+    const trBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', disabled: true, title: 'Checking…' }, '🌐 Translate missing to Arabic');
+    api('GET', '/api/admin/translate/status').then(st => {
+      trBtn.disabled = !st.enabled;
+      trBtn.title = st.enabled ? 'Adds an Arabic translation to every sentence that has none' : 'Not set up on the server (see the README)';
+    }).catch(() => { trBtn.title = 'Could not check'; });
+    trBtn.addEventListener('click', async () => {
+      const per = new Map(units.map(u => [u, lines(u.text)]));
+      const targets = [];
+      per.forEach((ls, u) => ls.forEach((line, idx) => {
+        const { text, ar } = GrammarCore.splitAr(line);
+        const p = GrammarCore.parseLine(text);
+        if (!ar && !p.error && p.en) targets.push({ u, idx, en: p.en });
+      }));
+      if (!targets.length) return toast('Every sentence already has an Arabic translation.');
+      trBtn.disabled = true; trBtn.textContent = '🌐 Translating…';
+      try {
+        const r = await api('POST', '/api/admin/translate', { texts: targets.map(t => t.en) });
+        targets.forEach((t, k) => { if (r.translations[k]) per.get(t.u)[t.idx] += ` // ${r.translations[k]}`; });
+        units.forEach(u => { u.text = per.get(u).join('\n'); if (u.ta) u.ta.value = u.text; });
+        dirty = true; msg.textContent = ''; checkSentences();
+        toast(`Translated ${plural(targets.length, 'sentence')}. Read them, change any you do not like, then save.`);
+      } catch (e) { toast(e.message); } finally { trBtn.disabled = false; trBtn.textContent = '🌐 Translate missing to Arabic'; }
+    });
 
     f.title.addEventListener('input', () => { dirty = true; if (!slugTouched) f.slug.value = slugify(f.title.value); });
     f.slug.addEventListener('input', () => { dirty = true; slugTouched = true; });
@@ -900,7 +961,8 @@
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
         h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
-        h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
+        h('p', { class: 'muted help' }, 'Arabic (optional): the cards can show an Arabic translation. Write it after // on the same line, like  She is reading a book // هي تقرأ كتاباً.  “Translate missing to Arabic” fills in every line that has none (read them and change what you do not like). When you save, any sentence still without Arabic is translated automatically. Students only see it once you switch it on for them on the Students page.'),
+        h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn, trBtn),
         h('label', { class: 'switch' }, autoGaps, h('span', null, 'Add grammar gaps automatically when I save')),
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
