@@ -4,8 +4,11 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateUser } = require('../validate');
-const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
+const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
 const Quiz = require('../../public/quiz-core');
+const Review = require('../../public/review-core');
+const Speak = require('../../public/speak-core');
+const Words = require('../../public/words-core');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const clampInt = (v, min, max) => Math.min(max, Math.max(min, Number.isFinite(+v) ? Math.round(+v) : 0));
@@ -77,7 +80,7 @@ module.exports = function studentRoutes(pool) {
       pool.query(`SELECT COUNT(*)::int AS solved, COALESCE(SUM(stars),0)::int AS stars, COALESCE(SUM(${EXTRA_SQL}),0)::int AS extra FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT COUNT(*) FILTER (WHERE completed_at IS NOT NULL)::int AS completed, COALESCE(SUM(time_spent_sec),0)::int AS time FROM lesson_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
-                  WHERE user_id = $1 AND type IN ('sentence_solved','grammar_solved') ORDER BY d DESC LIMIT 400`, [uid]),
+                  WHERE user_id = $1 AND type IN ${STREAK_TYPES_SQL} ORDER BY d DESC LIMIT 400`, [uid]),
     ]);
     return {
       sentencesSolved: sp.rows[0].solved,
@@ -98,16 +101,26 @@ module.exports = function studentRoutes(pool) {
   // so no screen ever waits for the network (see public/app.js).
   r.get('/app', wrap(async (req, res) => {
     const uid = req.user.id;
-    const [stats, lessons, lp, sp, up, qa] = await Promise.all([
+    const [stats, lessons, lp, sp, up, qa, rv] = await Promise.all([
       loadStats(uid),
       pool.query(`SELECT l.* FROM lessons l WHERE ${VISIBLE_SQL} ORDER BY l.position, l.title`, [uid]),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
-      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1`, [uid]),
+      pool.query(`SELECT lesson_id, sentence, stars, ${EXTRA_SQL} AS extra, grammar_done AS gdone, arb_done AS adone FROM sentence_progress WHERE user_id = $1`, [uid]),
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
       pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [uid]),
+      // the sentences due for review today (most overdue first), from lessons the student can open
+      pool.query(`SELECT ri.lesson_id, ri.sentence, ri.stage FROM review_items ri JOIN lessons l ON l.id = ri.lesson_id
+                  WHERE ri.user_id = $1 AND ri.due_on IS NOT NULL AND ri.due_on <= (now() AT TIME ZONE 'UTC')::date AND ${VISIBLE_SQL}
+                  ORDER BY ri.due_on, ri.stage, ri.sentence LIMIT 200`, [uid]),
     ]);
     const quizBy = groupQuiz(qa.rows);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
+    const lessonById = new Map(lessons.rows.map(l => [l.id, l]));
+    const reviews = rv.rows.filter(x => { // a sentence the teacher has since removed or rewritten is not asked
+      const l = lessonById.get(x.lesson_id);
+      return l && unitsOf(l).some(u => u.sentences.some(sn => sn.en === x.sentence));
+    }).map(x => ({ slug: lessonById.get(x.lesson_id).slug, sentence: x.sentence, stage: x.stage }));
+    const arbDone = new Set(sp.rows.filter(x => x.adone).map(x => x.lesson_id + '|' + x.sentence)); // Arabic -> English step finished
     const solved = groupSolved(sp.rows);
     const extras = groupSolved(sp.rows, 'extra');
     const grammars = groupGrammar(sp.rows);
@@ -117,6 +130,7 @@ module.exports = function studentRoutes(pool) {
     res.json({
       user: publicUser(req.user),
       stats,
+      reviews,
       lessons: lessons.rows.map(l => {
         const s = solved.get(l.id) || new Map(), x = extras.get(l.id) || new Map(), g = grammars.get(l.id) || new Set();
         const p = lpMap.get(l.id);
@@ -129,12 +143,24 @@ module.exports = function studentRoutes(pool) {
           description: l.description,
           emoji: l.emoji,
           assigned: l.visibility === 'assigned',
+          arStep: l.ar_step !== false,
+          // the meanings of the words of this lesson, for every student (the Arabic switch of the cards does not matter here)
+          ...(() => {
+            const have = l.words && typeof l.words === 'object' ? l.words : {};
+            const used = new Set(unitsOf(l).flatMap(u => u.sentences.flatMap(sn => Words.keysOf(sn.en))));
+            const words = Object.fromEntries(Object.entries(have).filter(([k]) => used.has(k)));
+            return Object.keys(words).length ? { words } : {};
+          })(),
           units: unitsOf(l).map(u => ({
             id: u.id,
             title: u.title,
             quizPassed: qz.units.has(u.id),
+            // the grammar tip (and its Arabic, only for students the teacher switched Arabic on for)
+            ...(u.tip ? { tip: u.tip } : {}), ...(req.user.arabic_enabled && u.tipAr ? { tipAr: u.tipAr } : {}),
             // the Arabic is only sent to students the teacher switched it on for
-            sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}), ...(req.user.arabic_enabled && sn.ar ? { ar: sn.ar } : {}) })),
+            sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}), ...(req.user.arabic_enabled && sn.ar ? { ar: sn.ar } : {}),
+              // The Arabic -> English step shows the Arabic whether or not the card switch is on, so it travels in its own field ("arq").
+              ...(l.ar_step !== false && sn.ar ? { arq: sn.ar, ...(arbDone.has(l.id + '|' + sn.en) ? { arbDone: true } : {}) } : {}) })),
           })),
           lp: p ? { started_at: iso(p.started_at), last_activity_at: iso(p.last_activity_at), completed_at: iso(p.completed_at), time_spent_sec: p.time_spent_sec } : null,
           unitRows: [...(unitMap.get(l.id) || new Map()).values()].map(r => ({ unit_id: r.unit_id, learn_index: r.learn_index, learned_at: iso(r.learned_at) })),
@@ -224,6 +250,7 @@ module.exports = function studentRoutes(pool) {
         units: unitsOf(lesson).map(u => ({
           id: u.id,
           title: u.title,
+          ...(u.tip ? { tip: u.tip } : {}), ...(req.user.arabic_enabled && u.tipAr ? { tipAr: u.tipAr } : {}),
           sentences: u.sentences.map(s => ({ en: s.en, stars: solved.get(s.en) || 0, extra: extras.get(s.en) || 0, ...(s.gap ? { gap: s.gap, gdone: grammar.has(s.en) } : {}) })),
         })),
       },
@@ -254,6 +281,18 @@ module.exports = function studentRoutes(pool) {
       [uid, lessonId, seconds]
     );
     return rows[0].inserted;
+  }
+
+  // A sentence the student found hard goes into (or back to the start of) their review schedule: first review tomorrow.
+  // If it was already scheduled it goes back to stage 0 and is never pushed later than it already was.
+  async function markWeak(client, uid, lessonId, sentence) {
+    await client.query(
+      `INSERT INTO review_items (user_id, lesson_id, sentence, stage, due_on)
+       VALUES ($1,$2,$3,0,(now() AT TIME ZONE 'UTC')::date + $4::int)
+       ON CONFLICT (user_id, lesson_id, sentence) DO UPDATE SET
+         stage = 0, weak_count = review_items.weak_count + 1,
+         due_on = LEAST(COALESCE(review_items.due_on, EXCLUDED.due_on), EXCLUDED.due_on)`,
+      [uid, lessonId, sentence, Review.INTERVALS[0]]);
   }
 
   /**
@@ -392,6 +431,7 @@ module.exports = function studentRoutes(pool) {
         "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'sentence_solved',$3::jsonb)",
         [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, stars, mistakes, hints, seconds,
           ...(replay ? { replay: true } : {}), ...(cid ? { cid } : {}) })]);
+      if (!replay && (mistakes > 0 || hints > 0)) await markWeak(client, uid, lesson.id, sentence); // first try with mistakes or hints = weak
 
       const done = await completionChecks(client, uid, lesson, unit);
       await client.query('COMMIT');
@@ -438,9 +478,163 @@ module.exports = function studentRoutes(pool) {
       await client.query(
         "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'grammar_solved',$3::jsonb)",
         [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, mistakes, ...(first ? {} : { replay: true }), ...(cid ? { cid } : {}) })]);
+      if (first && mistakes > 0) await markWeak(client, uid, lesson.id, sentence); // a wrong grammar word = weak
       const done = await completionChecks(client, uid, lesson, unit);
       await client.query('COMMIT');
       res.json({ completed: done.allDone, justCompleted: done.justCompleted, unitCompleted: done.unitDone, unitJustCompleted: done.unitJustCompleted });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }));
+
+  // Speaking check on a learning card. The phone sends the text(s) the speech recognition heard (up to 3 tries); the server scores them itself with the
+  // same code the phone used, keeps the best score, the number of tries and the last text heard for the teacher. It never changes progress or stars.
+  r.post('/lessons/:slug/speak', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const lesson = await loadVisibleLesson(uid, req.params.slug);
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
+    const b = req.body || {};
+    const sentence = String(b.sentence || '').slice(0, 400);
+    const unit = unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence));
+    if (!unit) return res.status(400).json({ error: 'This sentence is not in the lesson any more.' });
+    const heard = (Array.isArray(b.heard) ? b.heard : []).filter(x => typeof x === 'string').slice(0, Speak.MAX_TRIES).map(x => x.slice(0, 300));
+    if (!heard.length) return res.status(400).json({ error: 'Nothing was heard.' });
+    const seconds = clampInt(b.seconds, 0, 600);
+    const cid = typeof b.cid === 'string' ? b.cid.slice(0, 64) : null;
+    // every try is scored; the best one counts, and the try that was best is the text the teacher reads
+    const scored = heard.map(text => ({ text, ...Speak.check(sentence, text) }));
+    const top = scored.reduce((a, x) => (x.percent > a.percent ? x : a), scored[0]);
+    const passed = scored.some(x => x.pass);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [uid + lesson.id]);
+      if (cid) {
+        const dup = await client.query(
+          "SELECT 1 FROM events WHERE user_id = $1 AND type = 'speak_checked' AND data ? 'cid' AND data->>'cid' = $2", [uid, cid]);
+        if (dup.rowCount) { await client.query('ROLLBACK'); return res.json({ duplicate: true }); }
+      }
+      const { rows: [row] } = await client.query(
+        `INSERT INTO speaking_scores (user_id, lesson_id, sentence, best_score, last_score, tries, passed, heard)
+         VALUES ($1,$2,$3,$4,$4,$5,$6,$7)
+         ON CONFLICT (user_id, lesson_id, sentence) DO UPDATE SET
+           heard = CASE WHEN EXCLUDED.best_score >= speaking_scores.best_score THEN EXCLUDED.heard ELSE speaking_scores.heard END,
+           best_score = GREATEST(speaking_scores.best_score, EXCLUDED.best_score), last_score = EXCLUDED.last_score,
+           tries = speaking_scores.tries + EXCLUDED.tries, checks = speaking_scores.checks + 1,
+           passed = speaking_scores.passed OR EXCLUDED.passed, updated_at = now()
+         RETURNING best_score, tries, passed`,
+        [uid, lesson.id, sentence, top.percent, heard.length, passed, top.text]);
+      await client.query(
+        "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'speak_checked',$3::jsonb)",
+        [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, score: top.percent, tries: heard.length, passed, heard: top.text, seconds, ...(cid ? { cid } : {}) })]);
+      await client.query('COMMIT');
+      res.json({ score: top.percent, passed, best: row.best_score, tries: row.tries });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }));
+
+  // Daily review: one answered question. Right = first try, no hints. A right answer moves the sentence to its next interval (1, 3, 7, 14, 30 days),
+  // a wrong one sends it back to 1 day. An answer given before the sentence is due can only send it back, never move it forward. Stars never change.
+  r.post('/review/answer', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const b = req.body || {};
+    const lesson = await loadVisibleLesson(uid, String(b.slug || '').slice(0, 80));
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
+    const sentence = String(b.sentence || '').slice(0, 400);
+    const unit = unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence));
+    if (!unit) return res.status(400).json({ error: 'This sentence is not in the lesson any more.' });
+    const kind = b.kind === 'grammar' ? 'grammar' : 'build';
+    if (kind === 'grammar' && !unit.sentences.some(sn => sn.en === sentence && sn.gap)) return res.status(400).json({ error: 'This sentence has no grammar gap.' });
+    const mistakes = clampInt(b.mistakes, 0, 999);
+    const hints = kind === 'build' ? clampInt(b.hints, 0, 999) : 0;
+    const seconds = clampInt(b.seconds, 0, 600);
+    const cid = typeof b.cid === 'string' ? b.cid.slice(0, 64) : null;
+    const correct = Review.isCorrect(mistakes, hints);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [uid + lesson.id]);
+      if (cid) {
+        const dup = await client.query(
+          "SELECT 1 FROM events WHERE user_id = $1 AND type = 'review_answered' AND data ? 'cid' AND data->>'cid' = $2", [uid, cid]);
+        if (dup.rowCount) { await client.query('ROLLBACK'); return res.json({ duplicate: true }); }
+      }
+      const { rows: [row] } = await client.query(
+        `SELECT stage, due_on IS NOT NULL AND due_on <= (now() AT TIME ZONE 'UTC')::date AS due FROM review_items
+         WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3 FOR UPDATE`, [uid, lesson.id, sentence]);
+      if (!row) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'This sentence is not in your review list.' }); }
+      const early = correct && !row.due; // not due yet and right: nothing moves (it was already reviewed)
+      const next = early ? { stage: row.stage, days: null, same: true } : Review.afterReview(row.stage, correct);
+      if (!early) await client.query(
+        `UPDATE review_items SET stage = $4, due_on = CASE WHEN $5::int IS NULL THEN NULL ELSE (now() AT TIME ZONE 'UTC')::date + $5::int END,
+           review_count = review_count + 1, wrong_count = wrong_count + $6, last_reviewed_at = now()
+         WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3`,
+        [uid, lesson.id, sentence, next.stage, next.days, correct ? 0 : 1]);
+      await client.query(
+        "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'review_answered',$3::jsonb)",
+        [uid, lesson.id, JSON.stringify({ sentence, kind, correct, mistakes, ...(kind === 'build' ? { hints } : {}), seconds, stage: next.stage,
+          ...(early ? { early: true } : { nextInDays: next.days }), ...(cid ? { cid } : {}) })]);
+      await client.query('COMMIT');
+      res.json({ correct, stage: next.stage, nextInDays: early ? null : next.days, early });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }));
+
+  // Optional step between Build and Grammar - the student sees only the Arabic and builds the English sentence. The result of the first try is kept
+  // for the teacher (mistakes, hints, seconds); later tries are practice. It gives no stars and is not needed to finish a unit.
+  r.post('/lessons/:slug/arbuild', wrap(async (req, res) => {
+    const uid = req.user.id;
+    const lesson = await loadVisibleLesson(uid, req.params.slug);
+    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
+    const b = req.body || {};
+    const sentence = String(b.sentence || '').slice(0, 400);
+    const unit = lesson.ar_step === false ? null : unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence && sn.ar));
+    if (!unit) return res.status(400).json({ error: 'This sentence has no Arabic step.' });
+    const mistakes = clampInt(b.mistakes, 0, 999);
+    const hints = clampInt(b.hints, 0, 999);
+    const seconds = clampInt(b.seconds, 0, 600);
+    const cid = typeof b.cid === 'string' ? b.cid.slice(0, 64) : null;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [uid + lesson.id]);
+      if (cid) {
+        const dup = await client.query(
+          "SELECT 1 FROM events WHERE user_id = $1 AND type = 'arbuild_solved' AND data ? 'cid' AND data->>'cid' = $2", [uid, cid]);
+        if (dup.rowCount) { await client.query('ROLLBACK'); return res.json({ duplicate: true }); }
+      }
+      if (await isUnitLocked(client, uid, lesson, unit.id)) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Finish the previous unit first.' }); }
+      const prev = await client.query(
+        'SELECT arb_done FROM sentence_progress WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3 FOR UPDATE', [uid, lesson.id, sentence]);
+      if (!prev.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Build this sentence first.' }); }
+      const first = !prev.rows[0].arb_done;
+      await touchLesson(client, uid, lesson.id, seconds);
+      await client.query(
+        `UPDATE sentence_progress SET arb_done = TRUE, arb_times = arb_times + 1,
+           arb_mistakes = CASE WHEN $4 THEN $5 ELSE arb_mistakes END, arb_hints = CASE WHEN $4 THEN $6 ELSE arb_hints END,
+           arb_seconds = CASE WHEN $4 THEN $7 ELSE arb_seconds END
+         WHERE user_id = $1 AND lesson_id = $2 AND sentence = $3`,
+        [uid, lesson.id, sentence, first, mistakes, hints, seconds]);
+      await client.query(
+        "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'arbuild_solved',$3::jsonb)",
+        [uid, lesson.id, JSON.stringify({ sentence, unit: unit.title, unitId: unit.id, mistakes, hints, seconds, ...(first ? {} : { replay: true }), ...(cid ? { cid } : {}) })]);
+      if (first && (mistakes > 0 || hints > 0)) await markWeak(client, uid, lesson.id, sentence);
+      await client.query('COMMIT');
+      res.json({ first });
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
@@ -507,6 +701,8 @@ module.exports = function studentRoutes(pool) {
       await client.query(
         "INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'quiz_attempt',$3::jsonb)",
         [uid, lesson.id, JSON.stringify({ scope, ...(unit ? { unit: unit.title, unitId: unit.id } : {}), score: graded.score, total: graded.total, needed: graded.needed, passed: graded.passed, seconds })]);
+      // every sentence the student got wrong in this quiz is weak
+      for (const d of new Set(details.filter(x => !x.correct && typeof x.sentence === 'string').map(x => x.sentence))) await markWeak(client, uid, lesson.id, d);
       const done = await completionChecks(client, uid, lesson, unit);
       await client.query('COMMIT');
       res.json({

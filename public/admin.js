@@ -137,7 +137,7 @@
   const slugify = t => String(t).toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/, '');
   const countWords = s => s.trim().split(/\s+/).map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')).filter(Boolean).length;
-  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const plural = (n, w, many) => `${n} ${n === 1 ? w : many || w + 's'}`;
 
   // Automatic grammar gaps (on by default; the teacher's choice is remembered on this computer).
   function autoGapsOn() { try { return localStorage.getItem('ws:admin-autogaps') !== '0'; } catch (e) { return true; } }
@@ -239,6 +239,12 @@
         `Needs ${e.data.needed}/${e.data.total}${e.data.seconds ? ` · ${fmtTime(e.data.seconds)}` : ''}`];
       case 'quiz_reset': return ['🔁', `quiz reset in ${L}: ${e.data.label || 'quiz'}`, 'The student takes it again'];
       case 'grammar_solved': return [e.data.replay ? '🔁' : '✏️', `${e.data.replay ? 'practised the grammar again' : 'chose the missing word'} in ${L}${e.data.mistakes ? ` (${plural(e.data.mistakes, 'wrong choice')})` : ''}`, e.data.sentence || ''];
+      case 'arbuild_solved': return [e.data.replay ? '🔁' : '🔤', `${e.data.replay ? 'practised Arabic → English again' : 'built the English from the Arabic'} in ${L}`,
+        `${e.data.sentence || ''} · ${plural(e.data.mistakes || 0, 'mistake')}, ${plural(e.data.hints || 0, 'hint')}${e.data.seconds ? ` · ${fmtTime(e.data.seconds)}` : ''}`];
+      case 'review_answered': return [e.data.correct ? '🧠' : '🔁', `daily review (${e.data.kind === 'grammar' ? 'grammar' : 'build'}): ${e.data.correct ? 'right' : 'wrong'} in ${L}${e.data.early ? ' · reviewed early' : ''}`,
+        `${e.data.sentence || ''} · ${plural(e.data.mistakes || 0, 'mistake')}${e.data.hints ? `, ${plural(e.data.hints, 'hint')}` : ''}${e.data.seconds ? ` · ${fmtTime(e.data.seconds)}` : ''}${e.data.early ? '' : e.data.nextInDays ? ` · ${e.data.nextInDays === 1 ? 'next review tomorrow' : `next review in ${e.data.nextInDays} days`}` : ' · finished all reviews'}`];
+      case 'speak_checked': return ['🎤', `said a sentence out loud in ${L}: ${e.data.score}%${e.data.passed ? ' ✓' : ' ✗ (continued anyway)'}`,
+        `${e.data.sentence || ''} · heard: “${e.data.heard || '…'}” · ${plural(e.data.tries || 1, 'try', 'tries')}`];
       case 'restart': return ['🔄', e.data.unit ? `started unit “${e.data.unit}” over in ${L}` : `started ${L} over`, 'Saved progress was kept'];
       case 'lesson_complete': return ['🏆', `completed ${L}`, e.data.maxStars ? `⭐ ${e.data.stars} / ${e.data.maxStars}` : ''];
       default: return ['•', e.type];
@@ -259,12 +265,12 @@
   }
 
   // A student's timeline: every step they took, grouped by day, with mistakes, hints and time spent. Filter by kind.
-  const KINDS = { all: null, sentences: ['sentence_solved', 'grammar_solved', 'cards_done'], quizzes: ['quiz_attempt', 'quiz_reset'] };
+  const KINDS = { all: null, sentences: ['sentence_solved', 'arbuild_solved', 'grammar_solved', 'cards_done', 'speak_checked'], reviews: ['review_answered'], quizzes: ['quiz_attempt', 'quiz_reset'] };
   function timeline(events) {
     if (!events.length) return h('p', { class: 'muted' }, 'No activity yet.');
     const body = h('div', { class: 'timeline' });
     let kind = 'all';
-    const chips = h('div', { class: 'chips-row' }, Object.entries({ all: 'Everything', sentences: 'Sentences & cards', quizzes: 'Quizzes' }).map(([k, label]) =>
+    const chips = h('div', { class: 'chips-row' }, Object.entries({ all: 'Everything', sentences: 'Sentences & cards', reviews: 'Reviews', quizzes: 'Quizzes' }).map(([k, label]) =>
       h('button', { class: 'chip', type: 'button', 'aria-pressed': String(k === kind), 'data-k': k, onclick: () => { kind = k; draw(); } }, label)));
     const draw = () => {
       chips.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', String(c.dataset.k === kind)));
@@ -282,6 +288,20 @@
     };
     draw();
     return h('div', null, chips, body);
+  }
+
+  // How the student's speaking checks went (the learning cards): the average, and the sentences with the lowest scores with what the phone heard.
+  function speakingPanel(sp) {
+    const body = !sp || !sp.count
+      ? h('p', { class: 'muted' }, 'No speaking checks yet. Students on a phone or browser with speech recognition say each sentence into the microphone on the cards.')
+      : h('div', null,
+        h('p', { class: 'muted' }, `${plural(sp.count, 'sentence')} said out loud · average best score ${sp.average}%. The lowest first:`),
+        h('ul', { class: 'admin-list' }, sp.lowest.map(x => h('li', { class: 'admin-item' },
+          h('div', { class: 'info' },
+            h('div', { class: 'name', lang: 'en' }, x.sentence),
+            h('div', { class: 'sub' }, `${x.emoji || '📘'} ${x.lesson} · heard: “${x.heard || '…'}” · ${plural(x.tries, 'try', 'tries')}`)),
+          h('span', { class: 'tag ' + (x.passed ? 'tag-private' : 'tag-draft') }, `${x.score}%`)))));
+    return h('div', { class: 'panel' }, h('h2', null, '🎤 Speaking'), body);
   }
 
   // The quiz attempts of one student: each one opens to show every question, what the student chose and the right answer.
@@ -679,6 +699,7 @@
       assignPanel,
       h('div', { class: 'panel' }, h('h2', null, 'Sentences practised per day (last 14 days)'), barChart(d.daily, 'solved', 'Sentences practised per day'))),
       h('div', { class: 'col' },
+      speakingPanel(d.speaking),
       quizPanel(quiz, id, () => showStudent(id)),
       h('div', { class: 'panel' }, h('h2', null, 'Timeline'), h('p', { class: 'muted' }, 'Every step this student took, with mistakes, hints and the time it took.'), timeline(d.events))))
     );
@@ -744,6 +765,7 @@
           h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download('/api/admin/export', `lessons-${new Date().toISOString().slice(0, 10)}.json`) }, 'Export all'),
           h('a', { class: 'btn btn-primary btn-sm', href: '#/lessons/new' }, '+ New lesson'), fileIn)),
       arabicPanel(),
+      wordsPanel(),
       h('p', { class: 'muted' }, 'Drag ☰ to change the order. Drafts are hidden from students. 🔒 lessons are only for selected students.'),
       lessons.length ? list : h('p', { class: 'state' }, 'No lessons yet. Click “New lesson” to create one.')
     );
@@ -768,30 +790,30 @@
     try { return JSON.parse(t.slice(from, to + 1)); }
     catch (e) { throw new Error('I could not read that as JSON. Copy the whole answer of the AI (it may have been cut off: ask it to continue, or send fewer sentences).'); }
   }
-  function arabicPanel() {
+  // The Arabic of the cards and the word meanings share one panel: download what is missing, give the file to an AI, paste the answer back.
+  function aiPanel(c) {
     let prompt = '';
     const status = h('div', { class: 'ar-status' }, 'Checking…');
     const missingList = h('div', { class: 'ar-missing muted' });
     const answer = h('textarea', { class: 'ar-answer', rows: '5', dir: 'ltr', placeholder: 'Paste the AI’s answer here…', 'aria-label': 'The answer of the AI' });
-    const replaceBox = h('input', { type: 'checkbox', id: 'ar-replace' });
+    const replaceBox = h('input', { type: 'checkbox', id: c.id + '-replace' });
     const result = h('div', { class: 'ar-result', role: 'status' });
     const promptText = h('p', { class: 'muted' }, 'Loading…');
     const fileIn = h('input', { type: 'file', accept: 'application/json,.json,.txt', hidden: true });
-    const addBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button' }, 'Add the translations');
-    const dlBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download('/api/admin/arabic/export', 'sentences-for-translation.json') }, '⬇️ 1. Download the sentences (100 at a time)');
+    const addBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button' }, c.addLabel);
+    const dlBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download(c.exportUrl, c.fileName) }, c.downloadLabel);
     const load = async () => {
       try {
-        const st = await fetchFresh('/api/admin/arabic/status');
+        const st = await fetchFresh(c.statusUrl);
         prompt = st.prompt;
         promptText.textContent = st.prompt;
         const pct = st.total ? Math.round((st.ready / st.total) * 100) : 0;
         const bar = h('span', { class: 'mini-bar wide' }, h('span'));
         bar.firstChild.style.width = pct + '%';
-        status.replaceChildren(bar, h('b', null, ` Arabic is ready for ${st.ready} of ${plural(st.total, 'sentence')}`),
-          h('span', { class: 'muted' }, ` · switched on for ${st.studentsOn} of ${plural(st.students, 'student')} (Students page)`));
+        status.replaceChildren(bar, h('b', null, ` ${c.readyText(st)}`), c.statusExtra ? h('span', { class: 'muted' }, ` · ${c.statusExtra(st)}`) : null);
         dlBtn.disabled = st.ready >= st.total;
         const open = st.lessons.filter(l => l.ready < l.total);
-        missingList.textContent = open.length ? `Still without Arabic: ${open.slice(0, 6).map(l => `${l.emoji} ${l.title} (${l.ready}/${l.total})`).join(' · ')}${open.length > 6 ? ` · and ${open.length - 6} more` : ''}` : (st.total ? 'Every lesson has its Arabic. ✓' : '');
+        missingList.textContent = open.length ? `${c.stillText} ${open.slice(0, 6).map(l => `${l.emoji} ${l.title} (${l.ready}/${l.total})`).join(' · ')}${open.length > 6 ? ` · and ${open.length - 6} more` : ''}` : (st.total ? c.doneText : '');
       } catch (e) { status.textContent = e.message; }
     };
     addBtn.addEventListener('click', async () => {
@@ -800,10 +822,10 @@
       addBtn.disabled = true;
       try {
         const data = parseAiJson(answer.value);
-        const r = await api('POST', '/api/admin/arabic/import', { data, replace: replaceBox.checked });
-        const lines = [`Added Arabic to ${plural(r.updated, 'sentence')} in ${plural(r.lessonsChanged, 'lesson')}.`];
-        if (r.unchanged) lines.push(`${r.unchanged} already had Arabic and were left as they were.`);
-        if (r.notFound) lines.push(`${plural(r.notFound, 'sentence')} ${r.notFound === 1 ? 'does' : 'do'} not match any lesson (did the AI change the English?): “${r.notFoundExamples.join('”, “')}”${r.notFound > r.notFoundExamples.length ? ' …' : ''}`);
+        const r = await api('POST', c.importUrl, { data, replace: replaceBox.checked });
+        const lines = [c.addedText(r)];
+        if (r.unchanged) lines.push(`${r.unchanged} already had ${c.noun} and were left as they were.`);
+        if (r.notFound) lines.push(`${plural(r.notFound, c.item)} ${r.notFound === 1 ? 'does' : 'do'} not match any lesson (did the AI change the English?): “${r.notFoundExamples.join('”, “')}”${r.notFound > r.notFoundExamples.length ? ' …' : ''}`);
         if (r.rejected) lines.push(`${plural(r.rejected, 'answer')} ${r.rejected === 1 ? 'was' : 'were'} not Arabic text and ${r.rejected === 1 ? 'was' : 'were'} ignored: “${r.rejectedExamples.join('”, “')}”${r.rejected > r.rejectedExamples.length ? ' …' : ''}`);
         result.replaceChildren(...lines.map(t => h('div', null, t)));
         result.classList.add(r.notFound || r.rejected ? 'warn' : 'good');
@@ -815,17 +837,13 @@
     });
     fileIn.addEventListener('change', async e => {
       const f = e.target.files[0]; e.target.value = '';
-      if (f) { answer.value = await f.text(); toast('File loaded. Press “Add the translations”.'); }
+      if (f) { answer.value = await f.text(); toast(`File loaded. Press “${c.addLabel}”.`); }
     });
     load();
     return h('div', { class: 'panel ar-panel' },
-      h('h2', null, 'ع Arabic translations'),
+      h('h2', null, c.title),
       status, missingList,
-      h('ol', { class: 'ar-steps' },
-        h('li', null, 'Download the sentences that still need Arabic (a file with up to 100 sentences).'),
-        h('li', null, 'Open your AI (ChatGPT, Claude, Gemini…), copy the instruction below, send it together with the file (or paste the file’s content).'),
-        h('li', null, 'Copy the AI’s whole answer, paste it in the box, and press “Add the translations”. Repeat until everything is ready.'),
-        h('li', null, 'Then switch Arabic on for your students on the Students page.')),
+      h('ol', { class: 'ar-steps' }, c.steps.map(t => h('li', null, t))),
       h('div', { class: 'toolbar' }, dlBtn,
         h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async () => {
           if (!prompt) return toast('Please wait a moment…');
@@ -835,9 +853,37 @@
       answer,
       h('div', { class: 'toolbar' }, addBtn,
         h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => fileIn.click() }, 'or choose a file'), fileIn,
-        h('label', { class: 'switch ar-replace' }, replaceBox, h('span', null, 'Replace Arabic that already exists'))),
+        h('label', { class: 'switch ar-replace' }, replaceBox, h('span', null, c.replaceLabel))),
       result);
   }
+
+  const arabicPanel = () => aiPanel({
+    id: 'ar', title: 'ع Arabic translations', noun: 'Arabic', item: 'sentence',
+    statusUrl: '/api/admin/arabic/status', exportUrl: '/api/admin/arabic/export', importUrl: '/api/admin/arabic/import', fileName: 'sentences-for-translation.json',
+    downloadLabel: '⬇️ 1. Download the sentences (100 at a time)', addLabel: 'Add the translations', replaceLabel: 'Replace Arabic that already exists',
+    readyText: st => `Arabic is ready for ${st.ready} of ${plural(st.total, 'sentence')}`,
+    statusExtra: st => `switched on for ${st.studentsOn} of ${plural(st.students, 'student')} (Students page)`,
+    stillText: 'Still without Arabic:', doneText: 'Every lesson has its Arabic. ✓',
+    addedText: r => `Added Arabic to ${plural(r.updated, 'sentence')} in ${plural(r.lessonsChanged, 'lesson')}.`,
+    steps: ['Download the sentences that still need Arabic (a file with up to 100 sentences).',
+      'Open your AI (ChatGPT, Claude, Gemini…), copy the instruction below, send it together with the file (or paste the file’s content).',
+      'Copy the AI’s whole answer, paste it in the box, and press “Add the translations”. Repeat until everything is ready.',
+      'Then switch Arabic on for your students on the Students page.'],
+  });
+
+  // Tap a word on a card to see its meaning: the same download -> AI -> paste back flow, for single words.
+  const wordsPanel = () => aiPanel({
+    id: 'wd', title: '📖 Word meanings (tap a word)', noun: 'a meaning', item: 'word',
+    statusUrl: '/api/admin/words/status', exportUrl: '/api/admin/words/export', importUrl: '/api/admin/words/import', fileName: 'words-for-translation.json',
+    downloadLabel: '⬇️ 1. Download words without meaning (100 at a time)', addLabel: 'Add the meanings', replaceLabel: 'Replace meanings that already exist',
+    readyText: st => `Meanings are ready for ${st.ready} of ${plural(st.total, 'different word')}`,
+    stillText: 'Still words without a meaning in:', doneText: 'Every word has its meaning. ✓',
+    addedText: r => `Added ${plural(r.updated, 'meaning')} in ${plural(r.lessonsChanged, 'lesson')}.`,
+    steps: ['Download the words that still have no meaning (up to 100 different words, each with an example sentence; tiny words like a, the, is, to are left out).',
+      'Open your AI, copy the instruction below, send it together with the file (or paste the file’s content).',
+      'Copy the AI’s whole answer, paste it in the box, and press “Add the meanings”. Only words that are really in a lesson, with Arabic text, are added. Repeat until everything is ready.',
+      'Students see the meaning when they tap a word on a card, even if the Arabic switch is off for them. You can also write or fix meanings in the lesson editor.'],
+  });
 
   // ctx = { userId }: editing from a student's card. The lesson stays private to that student.
   async function showEditor(id, ctx) {
@@ -863,6 +909,7 @@
       level: h('select', { id: 'f-level' }, levels.map(lv => h('option', { value: lv }, lv))),
       desc: h('input', { id: 'f-desc', maxlength: '200', value: lesson.description, placeholder: 'Order food and ask for the bill.' }),
       published: h('input', { id: 'f-published', type: 'checkbox', checked: lesson.published }),
+      arStep: h('input', { id: 'f-arstep', type: 'checkbox', checked: lesson.arStep !== false }),
       visPublic: h('input', { type: 'radio', name: 'vis', value: 'public', checked: lesson.visibility !== 'assigned' }),
       visAssigned: h('input', { type: 'radio', name: 'vis', value: 'assigned', checked: lesson.visibility === 'assigned' }),
     };
@@ -896,8 +943,20 @@
 
     // ---- Units editor ----
     const lines = text => text.split('\n').map(x => x.trim().replace(/\s+/g, ' ')).filter(Boolean);
+    // Word meanings (tap a word on a card): one "word = meaning" per line.
+    const wordsBox = h('textarea', { rows: '6', class: 'words-input', spellcheck: 'false', 'aria-label': 'Word meanings', placeholder: 'airport = مطار\nboarding = صعود الطائرة',
+      oninput: () => { dirty = true; msg.textContent = ''; checkWords(); } });
+    wordsBox.value = WordsCore.toLines(lesson.words);
+    const wordsCheck = h('div', { class: 'check' });
+    function checkWords() {
+      const r = WordsCore.fromLines(wordsBox.value);
+      const n = r.words ? Object.keys(r.words).length : 0;
+      wordsCheck.replaceChildren(h('span', { class: r.error ? '' : 'ok' }, r.error || `${plural(n, 'word meaning')}${n ? ' ✓' : ''}`));
+      return !r.error;
+    }
+    checkWords();
     const units = (lesson.units && lesson.units.length ? lesson.units : [{ id: null, title: 'Unit 1', sentences: [] }])
-      .map(u => ({ id: u.id || null, title: u.title, text: (u.sentences || []).map(x => GrammarCore.toLine(x)).join('\n') }));
+      .map(u => ({ id: u.id || null, title: u.title, tip: u.tip || '', tipAr: u.tipAr || '', text: (u.sentences || []).map(x => GrammarCore.toLine(x)).join('\n') }));
     const unitsBox = h('div', { class: 'units-editor' });
     const scheduleCheck = oncePerFrame(() => checkSentences()); // re-checking every line on every key press would be wasteful
 
@@ -925,6 +984,19 @@
         ta.value = u.text;
         u.ta = ta;
         u.check = h('div', { class: 'check' });
+        // Grammar tip: a short explanation the student reads before the Grammar step of this unit (optional).
+        const tipIn = h('textarea', { rows: '3', maxlength: '300', class: 'tip-input', 'aria-label': `Unit ${i + 1} grammar tip`,
+          placeholder: 'For example: We use “is” with he, she and it. We use “are” with you, we and they.',
+          oninput: e => { u.tip = e.target.value; dirty = true; } });
+        tipIn.value = u.tip;
+        const tipArIn = h('textarea', { rows: '2', maxlength: '300', class: 'tip-input', dir: 'rtl', lang: 'ar', 'aria-label': `Unit ${i + 1} grammar tip in Arabic`,
+          placeholder: 'الشرح بالعربية (اختياري)',
+          oninput: e => { u.tipAr = e.target.value; dirty = true; } });
+        tipArIn.value = u.tipAr;
+        const tipBox = h('details', { class: 'unit-tip', open: Boolean(u.tip || u.tipAr) },
+          h('summary', null, '💡 Grammar tip for this unit (optional)'),
+          h('p', { class: 'muted help' }, 'Students read it on a card before the Grammar step and can open it again with the Tip button. Up to 300 characters. The Arabic part is shown only to students who have Arabic switched on.'),
+          tipIn, tipArIn);
         return h('div', { class: 'unit-edit' },
           h('div', { class: 'unit-edit-head' },
             h('span', { class: 'unit-no' }, `Unit ${i + 1}`),
@@ -932,7 +1004,7 @@
             h('button', { class: 'icon-btn', type: 'button', title: 'Move up', 'aria-label': 'Move unit up', disabled: i === 0, onclick: () => moveUnit(i, -1) }, '↑'),
             h('button', { class: 'icon-btn', type: 'button', title: 'Move down', 'aria-label': 'Move unit down', disabled: i === units.length - 1, onclick: () => moveUnit(i, 1) }, '↓'),
             h('button', { class: 'icon-btn', type: 'button', title: 'Remove unit', 'aria-label': 'Remove unit', disabled: units.length === 1, onclick: () => removeUnit(i) }, '✕')),
-          ta, u.check);
+          ta, u.check, tipBox);
       }));
       checkSentences();
     }
@@ -1017,7 +1089,7 @@
     f.title.addEventListener('input', () => { dirty = true; if (!slugTouched) f.slug.value = slugify(f.title.value); });
     f.slug.addEventListener('input', () => { dirty = true; slugTouched = true; });
     f.slug.addEventListener('blur', () => { f.slug.value = slugify(f.slug.value); });
-    [f.emoji, f.desc, f.level, f.published].forEach(x => x.addEventListener('input', () => { dirty = true; }));
+    [f.emoji, f.desc, f.level, f.published, f.arStep].forEach(x => x.addEventListener('input', () => { dirty = true; }));
 
     const saveBtn = h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save lesson');
     const form = h('form', { class: 'card form', novalidate: true },
@@ -1031,10 +1103,15 @@
       h('div', null,
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
-        h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
+        h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. To tell the student why a wrong word is wrong, add ?? and the reason after the sentence, like  She [is|are|am] reading. ?? We use "is" with she.  (up to 140 characters; the Arabic still goes last: … ?? reason // الترجمة). Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
         h('p', { class: 'muted help' }, 'Arabic: you can add the Arabic of all your lessons at once on the Lessons page (Arabic translations). To change one sentence, write its Arabic after // on its line, like  She is reading a book // هي تقرأ كتاباً.  Students only see it once you switch it on for them.'),
         h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
         h('label', { class: 'switch' }, autoGaps, h('span', null, 'Add grammar gaps automatically when I save')),
+        h('details', { class: 'unit-tip words-edit', open: Boolean(Object.keys(lesson.words || {}).length) },
+          h('summary', null, '📖 Word meanings: what a student sees when tapping a word (optional)'),
+          h('p', { class: 'muted help' }, 'One word per line, then =, then its Arabic meaning, like  airport = مطار . Capital letters and punctuation do not matter (Airport, airport. and “airport” are the same word). A word without a meaning shows nothing. Students see the meaning even when the Arabic switch is off. To add many at once, use “Word meanings” on the Lessons page.'),
+          wordsBox, wordsCheck),
+        h('label', { class: 'switch' }, f.arStep, h('span', null, 'Arabic → English step: after Build, the student sees the Arabic and builds the English (only for sentences that have Arabic; optional for the student)')),
         unitsBox,
         h('div', { class: 'toolbar' }, addUnitBtn, h('span', { class: 'spacer' }), check),
         id ? h('p', { class: 'muted' }, 'Tip: renaming or moving units keeps student progress. Changing a sentence’s text means students build that sentence again.') : null),
@@ -1060,12 +1137,13 @@
       e.preventDefault(); msg.textContent = '';
       if (!f.title.value.trim()) { msg.textContent = 'Please add a title.'; f.title.focus(); return; }
       if (!checkSentences()) { msg.textContent = 'Please fix the units above.'; if (checkSentences.firstBad) checkSentences.firstBad.ta.focus(); return; }
+      if (!checkWords()) { msg.textContent = 'Please fix the word meanings.'; wordsBox.closest('details').open = true; wordsBox.focus(); return; }
       const assigned = ctx ? true : f.visAssigned.checked;
       if (!ctx && assigned && !selected.size && !confirm('No students are selected, so nobody will see this lesson. Save anyway?')) return;
       const body = {
         title: f.title.value, emoji: f.emoji.value, slug: ctx && id ? lesson.slug : slugify(f.slug.value || f.title.value), level: f.level.value,
-        description: f.desc.value, published: f.published.checked,
-        units: units.map((u, i) => ({ ...(u.id ? { id: u.id } : {}), title: u.title.trim() || `Unit ${i + 1}`, sentences: lines(u.text).map(en => ({ en: autoGaps.checked ? withAutoGap(en) : en })) })),
+        description: f.desc.value, published: f.published.checked, arStep: f.arStep.checked, words: WordsCore.fromLines(wordsBox.value).words,
+        units: units.map((u, i) => ({ ...(u.id ? { id: u.id } : {}), title: u.title.trim() || `Unit ${i + 1}`, tip: u.tip, tipAr: u.tipAr, sentences: lines(u.text).map(en => ({ en: autoGaps.checked ? withAutoGap(en) : en })) })),
         visibility: assigned ? 'assigned' : 'public',
         // From a student's card: new lessons go to that student; edits keep whoever already has it.
         ...(ctx ? (id ? {} : { assignedUserIds: [ctx.userId] }) : assigned ? { assignedUserIds: [...selected] } : {}),
@@ -1091,8 +1169,9 @@
   async function showLessonProgress(id) {
     const my = viewId;
     loading('tiles');
-    let d, hard = [];
-    try { [d, hard] = await Promise.all([get(`/api/admin/lessons/${id}/progress`), fetchFresh(`/api/admin/lessons/${id}/hard`).then(r => r.sentences).catch(() => [])]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
+    let d, hard = [], say = [];
+    try { [d, hard, say] = await Promise.all([get(`/api/admin/lessons/${id}/progress`), fetchFresh(`/api/admin/lessons/${id}/hard`).then(r => r.sentences).catch(() => []),
+      fetchFresh(`/api/admin/lessons/${id}/speaking`).then(r => r.sentences).catch(() => [])]); } catch (e) { return my === viewId ? errorBox(e) : undefined; }
     if (my !== viewId) return;
     const l = d.lesson;
     const st = d.students;
@@ -1137,7 +1216,14 @@
             h('td', null, x.grammar || '–'),
             h('td', null, x.quizWrong ? `${x.quizWrong} of ${x.quizAsked}` : '–'),
             h('td', null, x.students))))))
-          : h('p', { class: 'muted' }, 'Nothing is hard yet: no mistakes, hints or wrong quiz answers so far.'))
+          : h('p', { class: 'muted' }, 'Nothing is hard yet: no mistakes, hints or wrong quiz answers so far.')),
+      h('div', { class: 'panel' }, h('h2', null, '🎤 Hardest to say'),
+        h('p', { class: 'muted' }, 'From the microphone check on the cards: the lowest average best score first (the share of words the phone heard). Practise these out loud in class.'),
+        say.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
+          h('thead', null, h('tr', null, ...['Sentence', 'Average score', 'Lowest score', 'Tries', 'Not passed', 'Students'].map(t => h('th', null, t)))),
+          h('tbody', null, say.map(x => h('tr', null,
+            h('td', { lang: 'en' }, x.sentence), h('td', null, `${x.avgScore}%`), h('td', null, `${x.worst}%`), h('td', null, x.tries), h('td', null, x.notPassed || '–'), h('td', null, x.students))))))
+          : h('p', { class: 'muted' }, 'No speaking checks yet.'))
     );
   }
 

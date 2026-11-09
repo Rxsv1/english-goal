@@ -5,6 +5,8 @@
  * Writing only the answer, [is], fills in the two wrong choices for a few well-known word families (see AUTO).
  * A sentence with a gap is stored as  { en: "She is reading a book.", gap: { index: 1, answer: "is", options: ["is","are","am"] } }
  * where index is the position of the word in en when it is split at spaces.
+ * The teacher may add the reason after the brackets:  She [is|are|am] reading. ?? We use "is" with she.
+ * It is stored as gap.why and shown to the student when they pick a wrong word.
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -13,6 +15,8 @@
   'use strict';
 
   const WORD = /^[\p{L}][\p{L}'’-]*$/u;
+  const MAX_WHY = 140; // short enough to show under the sentence on a phone without scrolling
+  const WHY_SEP = /\s\?\?\s*/;
   const stripEdges = t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 
   // Word families where the wrong choices are always really wrong (so a student can never be marked wrong for a
@@ -39,9 +43,18 @@
    * or { error } with a message the teacher can act on.
    */
   function parseLine(raw) {
-    const text = String(raw === null || raw === undefined ? '' : raw).trim();
+    let text = String(raw === null || raw === undefined ? '' : raw).trim();
+    // "?? the reason" after the sentence explains the gap ("why"). It only makes sense together with a gap.
+    let why = '';
+    const w = text.match(WHY_SEP);
+    if (w) { why = text.slice(w.index + w[0].length).trim().replace(/\s+/g, ' '); text = text.slice(0, w.index).trim(); }
+    if (why.length > MAX_WHY) return { error: `The reason after ?? must be ${MAX_WHY} characters or fewer.` };
+    if (/\s\/\/\s/.test(why)) return { error: 'The reason after ?? cannot contain //.' };
     const open = text.indexOf('['), close = text.indexOf(']');
-    if (open < 0 && close < 0) return { en: text.replace(/\s+/g, ' '), gap: null };
+    if (open < 0 && close < 0) {
+      if (why) return { error: 'A reason after ?? needs a grammar gap in the sentence, like She [is|are|am] reading. ?? We use "is" with she.' };
+      return { en: text.replace(/\s+/g, ' '), gap: null };
+    }
     if (open < 0 || close < open || text.indexOf('[', open + 1) >= 0 || text.indexOf(']', close + 1) >= 0)
       return { error: 'Use exactly one pair of brackets, like [is|are|am].' };
 
@@ -63,7 +76,7 @@
     const head = before.replace(/\s+/g, ' ').replace(/^ /, '');
     const en = (head + answer + after.replace(/\s+/g, ' ')).trim();
     const index = en.slice(0, head.length).split(' ').length - 1; // the word the gap sits in
-    return { en, gap: { index, answer, options } };
+    return { en, gap: { index, answer, options, ...(why ? { why } : {}) } };
   }
 
   /** Checks a gap that arrives as data (JSON import, API). Returns { gap } or { error }. */
@@ -71,6 +84,13 @@
     const bad = message => ({ error: message });
     if (!gap || typeof gap !== 'object') return bad('The grammar gap is not valid.');
     const { index, answer, options } = gap;
+    let why = '';
+    if (gap.why !== undefined && gap.why !== null) {
+      if (typeof gap.why !== 'string') return bad('The reason (why) must be text.');
+      why = gap.why.trim().replace(/\s+/g, ' ');
+      if (why.length > MAX_WHY) return bad(`The reason (why) must be ${MAX_WHY} characters or fewer.`);
+      if (/\s\/\/\s/.test(why)) return bad('The reason (why) cannot contain //.');
+    }
     if (!Number.isInteger(index) || index < 0) return bad('The grammar gap has no valid word position.');
     if (typeof answer !== 'string' || !WORD.test(answer)) return bad('The grammar answer must be a single word.');
     if (!Array.isArray(options) || options.length !== 3 || !options.every(o => typeof o === 'string' && WORD.test(o)))
@@ -80,7 +100,7 @@
     const token = String(en).split(' ')[index];
     if (token === undefined || stripEdges(token).toLowerCase() !== answer.toLowerCase())
       return bad('The grammar gap does not match the word in the sentence.');
-    return { gap: { index, answer, options: [...options] } };
+    return { gap: { index, answer, options: [...options], ...(why ? { why } : {}) } };
   }
 
   /**
@@ -90,7 +110,11 @@
   function splitAr(raw) {
     const t = String(raw === null || raw === undefined ? '' : raw);
     const m = t.match(/\s\/\/\s/);
-    return m ? { text: t.slice(0, m.index), ar: t.slice(m.index + m[0].length).trim() } : { text: t, ar: '' };
+    if (!m) return { text: t, ar: '' };
+    let text = t.slice(0, m.index), ar = t.slice(m.index + m[0].length).trim();
+    const w = ar.match(WHY_SEP); // "She [is|are|am] reading // هي تقرأ ?? why" works too
+    if (w) { text += ' ?? ' + ar.slice(w.index + w[0].length); ar = ar.slice(0, w.index).trim(); }
+    return { text, ar };
   }
 
   /** A stored sentence as the line the teacher edits ("She [is|are|am] reading // الترجمة"). */
@@ -102,7 +126,7 @@
       const word = words[gap.index];
       if (word === undefined) return sentence.en;
       words[gap.index] = word.replace(stripEdges(word), `[${gap.options.join('|')}]`);
-      return words.join(' ');
+      return words.join(' ') + (gap.why ? ` ?? ${gap.why}` : '');
     })();
     return sentence && sentence.ar ? `${base} // ${sentence.ar}` : base;
   }
@@ -121,5 +145,5 @@
     return null;
   }
 
-  return { parseLine, checkGap, toLine, suggestLine, autoOptions, splitAr };
+  return { parseLine, checkGap, toLine, suggestLine, autoOptions, splitAr, MAX_WHY };
 });

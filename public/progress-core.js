@@ -204,6 +204,24 @@
   }
 
   /**
+   * The Arabic -> English step was solved for a sentence that was already built. It gives no stars and is not needed to finish a unit; it only
+   * remembers that the step was done (same rule as the server). Returns null when it does not apply, otherwise { first }.
+   */
+  function applyArb(raw, stats, sentence, seconds, now) {
+    let found = null;
+    for (const u of raw.units || []) for (const s of u.sentences || []) if (s.en === sentence && s.arq) found = s;
+    if (!found || !num(found.stars)) return null;
+    const first = !found.arbDone;
+    found.arbDone = true;
+    touchLesson(raw, seconds, now);
+    if (stats) {
+      stats.timeSpent = num(stats.timeSpent) + num(seconds);
+      if (!stats.streak) stats.streak = 1;
+    }
+    return { first };
+  }
+
+  /**
    * A quiz was passed (scope = 'final' or a unit id). Only passing changes anything; a failed attempt is just a try.
    * Returns { completed } for the whole lesson.
    */
@@ -222,5 +240,5 @@
     return { completed: m.completed, passed: Boolean(passed) };
   }
 
-  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyQuiz };
+  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyArb, applyQuiz };
 });

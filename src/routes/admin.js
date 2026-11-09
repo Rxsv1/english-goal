@@ -4,8 +4,9 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateLesson, validateUser, LEVELS } = require('../validate');
-const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL } = require('../progress');
+const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL } = require('../progress');
 const { slugify } = require('../validate');
+const Words = require('../../public/words-core');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 // A list of ids sent by the dashboard: strings only, and not absurdly many.
@@ -20,6 +21,8 @@ const lessonOut = (l, extra = {}) => ({
   emoji: l.emoji,
   published: l.published,
   visibility: l.visibility,
+  arStep: l.ar_step !== false,
+  wordsCount: l.words && typeof l.words === 'object' ? Object.keys(l.words).length : 0,
   position: l.position,
   count: l.sentences.length,
   unitsCount: unitsOf(l).length,
@@ -261,7 +264,7 @@ module.exports = function adminRoutes(pool) {
     const { rows: [u] } = await pool.query(`${USER_STATS_SQL} WHERE u.id = $1`, [uid]);
     if (!u) return res.status(404).json({ error: 'Student not found.' });
 
-    const [lessons, lp, sp, up, assigned, days, events, daily, qa] = await Promise.all([
+    const [lessons, lp, sp, up, assigned, days, events, daily, qa, speak] = await Promise.all([
       pool.query(`SELECT l.*, (SELECT COUNT(*) FROM lesson_assignments a WHERE a.lesson_id = l.id)::int AS assigned_count
                   FROM lessons l ORDER BY l.position, l.title`),
       pool.query('SELECT * FROM lesson_progress WHERE user_id = $1', [uid]),
@@ -269,13 +272,16 @@ module.exports = function adminRoutes(pool) {
       pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [uid]),
       pool.query('SELECT lesson_id FROM lesson_assignments WHERE user_id = $1', [uid]),
       pool.query(`SELECT DISTINCT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d FROM events
-                  WHERE user_id = $1 AND type IN ('sentence_solved','grammar_solved') ORDER BY d DESC LIMIT 400`, [uid]),
+                  WHERE user_id = $1 AND type IN ${STREAK_TYPES_SQL} ORDER BY d DESC LIMIT 400`, [uid]),
       recentEvents({ userId: uid, limit: 400 }),
       pool.query(`SELECT to_char(d, 'YYYY-MM-DD') AS day, COUNT(e.id)::int AS solved
         FROM generate_series((now() AT TIME ZONE 'UTC')::date - 13, (now() AT TIME ZONE 'UTC')::date, interval '1 day') d
         LEFT JOIN events e ON (e.created_at AT TIME ZONE 'UTC')::date = d AND e.user_id = $1 AND e.type = 'sentence_solved'
         GROUP BY d ORDER BY d`, [uid]),
       pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [uid]),
+      // speaking: how each sentence the student said out loud went (lowest scores first)
+      pool.query(`SELECT s.sentence, s.best_score, s.tries, s.passed, s.heard, l.title AS lesson_title, l.emoji AS lesson_emoji
+                  FROM speaking_scores s JOIN lessons l ON l.id = s.lesson_id WHERE s.user_id = $1 ORDER BY s.best_score, s.tries DESC, s.sentence`, [uid]),
     ]);
     const lpMap = new Map(lp.rows.map(x => [x.lesson_id, x]));
     const solved = groupSolved(sp.rows);
@@ -296,6 +302,11 @@ module.exports = function adminRoutes(pool) {
       })),
       daily: daily.rows,
       events,
+      speaking: {
+        count: speak.rows.length,
+        average: speak.rows.length ? Math.round(speak.rows.reduce((a, x) => a + x.best_score, 0) / speak.rows.length) : null,
+        lowest: speak.rows.slice(0, 8).map(x => ({ sentence: x.sentence, score: x.best_score, tries: x.tries, passed: x.passed, heard: x.heard, lesson: x.lesson_title, emoji: x.lesson_emoji })),
+      },
     });
   }));
 
@@ -374,7 +385,7 @@ module.exports = function adminRoutes(pool) {
     const { rows: [l] } = await pool.query('SELECT * FROM lessons WHERE id = $1', [req.params.id]);
     if (!l) return res.status(404).json({ error: 'Lesson not found.' });
     const a = await pool.query('SELECT user_id FROM lesson_assignments WHERE lesson_id = $1', [l.id]);
-    res.json({ lesson: lessonOut(l, { units: unitsOf(l), sentences: l.sentences, assignedUserIds: a.rows.map(x => x.user_id) }) });
+    res.json({ lesson: lessonOut(l, { units: unitsOf(l), sentences: l.sentences, words: l.words || {}, assignedUserIds: a.rows.map(x => x.user_id) }) });
   }));
 
   // Per-student progress for one lesson.
@@ -428,6 +439,17 @@ module.exports = function adminRoutes(pool) {
     }));
     out.sort((x, y) => y.score - x.score);
     res.json({ sentences: out.slice(0, 15) });
+  }));
+
+  // "Hardest to say": the sentences of one lesson with the lowest speaking scores (the average of each student's best score), and how many tries they took.
+  r.get('/lessons/:id/speaking', wrap(async (req, res) => {
+    const { rows: [l] } = await pool.query('SELECT id FROM lessons WHERE id = $1', [req.params.id]);
+    if (!l) return res.status(404).json({ error: 'Lesson not found.' });
+    const { rows } = await pool.query(
+      `SELECT sentence, COUNT(*)::int AS students, ROUND(AVG(best_score))::int AS avg_score, MIN(best_score)::int AS worst,
+              SUM(tries)::int AS tries, COUNT(*) FILTER (WHERE NOT passed)::int AS not_passed
+       FROM speaking_scores WHERE lesson_id = $1 GROUP BY sentence ORDER BY AVG(best_score), SUM(tries) DESC, sentence LIMIT 15`, [l.id]);
+    res.json({ sentences: rows.map(x => ({ sentence: x.sentence, students: x.students, avgScore: x.avg_score, worst: x.worst, tries: x.tries, notPassed: x.not_passed })) });
   }));
 
   async function saveAssignments(client, lessonId, userIds) {
@@ -558,6 +580,115 @@ module.exports = function adminRoutes(pool) {
     res.json({ updated, unchanged, lessonsChanged, received: pairs.size, notFound: notFound.length, notFoundExamples: notFound.slice(0, 5), rejected: rejected.length, rejectedExamples: rejected.slice(0, 5) });
   }));
 
+  /* ================= Word meanings (tap a word on a card) =================
+   * Each lesson keeps { word: Arabic meaning } (the "words" column). The teacher fills it by hand in the lesson editor, in a JSON file, or like the Arabic
+   * of the sentences: download the words that have no meaning yet, give the file to an AI, paste its answer back. Only words that really appear in a
+   * lesson's sentences get a meaning, only Arabic text is accepted, existing meanings are kept unless the teacher asks to replace them, and nothing else
+   * in a lesson (sentences, units, progress) is touched.
+   */
+  const WORDS_PROMPT =
+    'You are a careful translator from English to Modern Standard Arabic for learners of English. ' +
+    'The JSON below has a list "words"; each item has a "word" (one English word), an "example" (a sentence that uses it, only to show which meaning is meant) and an empty "ar". ' +
+    'Fill in every "ar" with the Arabic meaning of that word as it is used in its example (one or two Arabic words, no transliteration, no explanations). ' +
+    'Do NOT change any "word" or "example", keep the same items in the same order, and do not add or remove items. ' +
+    'Answer with ONLY the JSON, in exactly the same shape, with no text before or after it and no markdown.';
+
+  // The different words (not the tiny ones) of every lesson that have no meaning in that lesson yet, with one example sentence each.
+  function wordsOverview(rows) {
+    const examples = new Map();      // word -> first sentence that uses it
+    const missing = new Set();       // words that lack a meaning in at least one lesson that uses them
+    const all = new Set();
+    const lessons = rows.map(l => {
+      const have = l.words && typeof l.words === 'object' ? l.words : {};
+      const keys = new Set();
+      for (const u of unitsOf(l)) for (const sn of u.sentences) for (const k of Words.keysOf(sn.en)) {
+        if (Words.SKIP.has(k)) continue;
+        keys.add(k);
+        if (!examples.has(k)) examples.set(k, sn.en);
+      }
+      let ready = 0;
+      for (const k of keys) { all.add(k); if (have[k]) ready++; else missing.add(k); }
+      return { id: l.id, title: l.title, emoji: l.emoji, total: keys.size, ready };
+    });
+    return { examples, missing, all, lessons };
+  }
+
+  r.get('/words/export', wrap(async (req, res) => {
+    const size = Math.min(300, Math.max(1, parseInt(req.query.size, 10) || 100));
+    const everything = req.query.all === '1';
+    const { rows } = await pool.query('SELECT id, title, emoji, units, words FROM lessons ORDER BY position, title');
+    const { examples, missing, all } = wordsOverview(rows);
+    const list = [];
+    for (const k of everything ? all : missing) {
+      const had = everything ? (rows.map(l => l.words && l.words[k]).find(Boolean) || '') : '';
+      list.push({ word: k, ar: had, example: examples.get(k) });
+    }
+    res.set('Content-Disposition', 'attachment; filename="words-for-translation.json"');
+    res.json({ instructions: WORDS_PROMPT, wordsLeft: list.length, words: list.slice(0, size) });
+  }));
+
+  r.get('/words/status', wrap(async (req, res) => {
+    const { rows } = await pool.query('SELECT id, title, emoji, units, words FROM lessons ORDER BY position, title');
+    const { missing, all, lessons } = wordsOverview(rows);
+    res.json({ total: all.size, ready: all.size - missing.size, lessons, prompt: WORDS_PROMPT });
+  }));
+
+  // Whatever the AI sent back, as word -> Arabic pairs. Understands the downloaded file (items with "word" and "ar"), a plain map { "airport": "مطار" },
+  // and a lessons file (each lesson's "words").
+  function collectWordPairs(node, out = new Map(), depth = 0) {
+    if (depth > 8 || out.size > 50000 || node === null || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { node.slice(0, 50000).forEach(x => collectWordPairs(x, out, depth + 1)); return out; }
+    const w = typeof node.word === 'string' ? node.word : typeof node.en === 'string' ? node.en : null;
+    if (w !== null) { if (typeof node.ar === 'string') out.set(Words.key(w), node.ar); return out; }
+    const entries = Object.entries(node);
+    if (entries.length && entries.every(([, v]) => typeof v === 'string')) { entries.forEach(([k, v]) => out.set(Words.key(k), v)); return out; }
+    entries.forEach(([, v]) => collectWordPairs(v, out, depth + 1));
+    return out;
+  }
+
+  r.post('/words/import', wrap(async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Nothing to add. Paste the AI\'s answer first.' });
+    const replace = !Array.isArray(body) && Boolean(body.replace);
+    const pairs = collectWordPairs(Array.isArray(body) ? body : (body.data !== undefined ? body.data : body));
+    pairs.delete('replace');
+    if (!pairs.size) return res.status(400).json({ error: 'No word meanings found in that text. It should be a list of items like {"word": "airport", "ar": "..."}.' });
+    const rejected = [];
+    const good = new Map();
+    for (const [k, raw] of pairs) {
+      const ar = String(raw).trim().replace(/\s+/g, ' ');
+      if (!Words.validKey(k) || !ar || ar.length > Words.MAX_MEANING || !Words.ARABIC_RE.test(ar)) rejected.push(k || '?'); else good.set(k, ar);
+    }
+    const matched = new Set();
+    let updated = 0, unchanged = 0, lessonsChanged = 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query('SELECT id, units, words FROM lessons FOR UPDATE');
+      for (const l of rows) {
+        const have = l.words && typeof l.words === 'object' ? { ...l.words } : {};
+        let changed = false;
+        const used = new Set(unitsOf(l).flatMap(u => u.sentences.flatMap(sn => Words.keysOf(sn.en))));
+        for (const [k, ar] of good) {
+          if (!used.has(k)) continue; // only words that really are in this lesson
+          matched.add(k);
+          if (have[k] && (!replace || have[k] === ar)) { unchanged++; continue; }
+          if (!have[k] && Object.keys(have).length >= Words.MAX_WORDS) continue;
+          have[k] = ar; updated++; changed = true;
+        }
+        if (changed) { await client.query('UPDATE lessons SET words = $2::jsonb, updated_at = now() WHERE id = $1', [l.id, JSON.stringify(have)]); lessonsChanged++; }
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    const notFound = [...good.keys()].filter(k => !matched.has(k));
+    res.json({ updated, unchanged, lessonsChanged, received: pairs.size, notFound: notFound.length, notFoundExamples: notFound.slice(0, 5), rejected: rejected.length, rejectedExamples: rejected.slice(0, 5) });
+  }));
+
   // Arabic on the cards: switched on for one student, or for everyone at once.
   r.put('/users/:id/arabic', wrap(async (req, res) => {
     const enabled = Boolean(req.body && req.body.enabled);
@@ -586,14 +717,16 @@ module.exports = function adminRoutes(pool) {
       if (id) {
         ({ rows: [row] } = await client.query(
           `UPDATE lessons SET slug=$2, title=$3, level=$4, description=$5, emoji=$6, published=$7, visibility=$8,
-                  sentences=$9::jsonb, units=$10::jsonb, updated_at=now() WHERE id=$1 RETURNING *`,
-          [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]));
+                  sentences=$9::jsonb, units=$10::jsonb, ar_step=COALESCE($11::boolean, ar_step), words=COALESCE($12::jsonb, words), updated_at=now() WHERE id=$1 RETURNING *`,
+          [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units), d.arStep === undefined ? null : d.arStep,
+            d.words === undefined ? null : JSON.stringify(d.words)]));
         if (!row) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Lesson not found.' }); }
       } else {
         ({ rows: [row] } = await client.query(
-          `INSERT INTO lessons (id, slug, title, level, description, emoji, published, visibility, position, sentences, units)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT COALESCE(MAX(position) + 1, 0) FROM lessons),$9::jsonb,$10::jsonb) RETURNING *`,
-          [crypto.randomUUID(), d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]));
+          `INSERT INTO lessons (id, slug, title, level, description, emoji, published, visibility, position, sentences, units, ar_step, words)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT COALESCE(MAX(position) + 1, 0) FROM lessons),$9::jsonb,$10::jsonb,COALESCE($11::boolean, TRUE),COALESCE($12::jsonb, '{}'::jsonb)) RETURNING *`,
+          [crypto.randomUUID(), d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units), d.arStep === undefined ? null : d.arStep,
+            d.words === undefined ? null : JSON.stringify(d.words)]));
       }
       await saveAssignments(client, row.id, assignedUserIds);
       await client.query('COMMIT');
@@ -629,8 +762,8 @@ module.exports = function adminRoutes(pool) {
       version: 2,
       exportedAt: new Date().toISOString(),
       lessons: rows.map(l => ({ title: l.title, slug: l.slug, level: l.level, emoji: l.emoji, description: l.description,
-        published: l.published, visibility: l.visibility,
-        units: unitsOf(l).map(u => ({ title: u.title, sentences: u.sentences })) })),
+        published: l.published, visibility: l.visibility, arStep: l.ar_step !== false, words: l.words || {},
+        units: unitsOf(l).map(u => ({ title: u.title, ...(u.tip ? { tip: u.tip } : {}), ...(u.tipAr ? { tipAr: u.tipAr } : {}), sentences: u.sentences })) })),
     });
   }));
 
@@ -663,23 +796,34 @@ module.exports = function adminRoutes(pool) {
           // Keep unit ids when a unit with the same title already exists, so card progress is kept.
           const byTitle = new Map(unitsOf(existing).map(u => [u.title.toLowerCase(), u.id]));
           const used = new Set();
-          for (const u of d.units) {
+          const oldById = new Map(unitsOf(existing).map(u => [u.id, u]));
+          const fileItem = list[checked.indexOf(d)];
+          const rawUnits = fileItem && Array.isArray(fileItem.units) ? fileItem.units : [];
+          d.units.forEach((u, k) => {
             const keep = byTitle.get(u.title.toLowerCase());
             if (keep && !used.has(keep)) { u.id = keep; used.add(keep); }
-          }
+            // An older file without any "tip" must not wipe the tips the teacher already wrote for that unit.
+            const raw = rawUnits[k], was = oldById.get(u.id);
+            if (was && raw && typeof raw === 'object' && raw.tip === undefined && raw.tipAr === undefined) {
+              if (was.tip) u.tip = was.tip;
+              if (was.tipAr) u.tipAr = was.tipAr;
+            }
+          });
           await client.query(
             `UPDATE lessons SET title=$2, level=$3, description=$4, emoji=$5, published=$6, visibility=$7, sentences=$8::jsonb,
-               units=$9::jsonb, updated_at=now() WHERE id=$1`,
-            [existing.id, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
+               units=$9::jsonb, ar_step=COALESCE($10::boolean, ar_step), words=COALESCE($11::jsonb, words), updated_at=now() WHERE id=$1`,
+            [existing.id, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units), d.arStep === undefined ? null : d.arStep,
+              d.words === undefined ? null : JSON.stringify(d.words)]);
           updated++;
           fileOrder.push(existing.id);
           continue;
         }
         const id = crypto.randomUUID();
         await client.query(
-          `INSERT INTO lessons (id, slug, title, level, description, emoji, published, visibility, position, sentences, units)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT COALESCE(MAX(position) + 1, 0) FROM lessons),$9::jsonb,$10::jsonb)`,
-          [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units)]);
+          `INSERT INTO lessons (id, slug, title, level, description, emoji, published, visibility, position, sentences, units, ar_step, words)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT COALESCE(MAX(position) + 1, 0) FROM lessons),$9::jsonb,$10::jsonb,COALESCE($11::boolean, TRUE),COALESCE($12::jsonb, '{}'::jsonb))`,
+          [id, d.slug, d.title, d.level, d.description, d.emoji, d.published, d.visibility, JSON.stringify(d.sentences), JSON.stringify(d.units), d.arStep === undefined ? null : d.arStep,
+            d.words === undefined ? null : JSON.stringify(d.words)]);
         if (assignTo) await client.query('INSERT INTO lesson_assignments (lesson_id, user_id) VALUES ($1,$2)', [id, assignTo]);
         created++;
         fileOrder.push(id);

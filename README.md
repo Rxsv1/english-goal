@@ -21,6 +21,8 @@ The lesson page shows only the current unit open; tapping any other unit opens a
 
 Every unit follows the same three steps, built around memorising whole sentences so students can speak:
 
+(A unit can also have the optional **Arabic → English** step between Build and Grammar: see "Arabic → build the English" below.)
+
 1. **Read and say it.** The student reads the sentence, listens to it (normal or slow), then says it out loud and taps
    **"I said it out loud"**. The next sentence stays locked until they do. (Going back to a unit they already learned is free.)
 2. **Re-order to prove it.** The sentence is hidden and its words are shuffled; the student puts them back in order.
@@ -48,13 +50,110 @@ I live [in|on|at] Cairo.
   `{ "en": "She is reading", "gap": { "index": 1, "answer": "is", "options": ["is", "are", "am"] } }`
   (`index` is the position of the word, counting from 0).
 
+### Grammar tips and "why it's wrong" (teacher)
+
+Each unit can have a short **grammar tip** (up to 300 characters, several short lines allowed, with an optional Arabic version). In the lesson editor
+open **💡 Grammar tip for this unit** under the unit's sentences.
+
+- **Before the Grammar step** the student sees the tip on a card, reads it, and presses **Start**. This happens every time the Grammar step starts.
+  On the Grammar screen a **💡 Tip** button (key **T** on a computer) opens it again over the screen. A unit without a tip works exactly as before.
+- The Arabic tip follows the same rule as the Arabic on the cards: the server sends it only to students the teacher switched Arabic on for.
+- **Why a wrong word is wrong:** write the reason after the sentence with `??`. When the student picks a wrong word, the reason is shown on the card
+  (instead of only "Not that one"). A gap without a reason shows the old message. Up to 140 characters, and a reason needs a gap.
+
+```
+She [is|are|am] reading a book. ?? We use "is" with she.
+She [is|are|am] reading a book. ?? We use "is" with she. // هي تقرأ كتاباً
+```
+In JSON: `"units": [{ "title": "...", "tip": "...", "tipAr": "...", "sentences": [...] }]` and
+`{ "en": "She is reading", "gap": { "index": 1, "answer": "is", "options": ["is","are","am"], "why": "We use \"is\" with she." } }`.
+Export writes them, import reads them. An older file with **no** `tip` key does not erase the tips already written for a unit with the same title
+(write `"tip": ""` to remove one on purpose).
+
+### Arabic → build the English (optional step)
+
+After **Build** and before **Grammar**, a unit can offer one more step for the sentences that have Arabic: the student sees **only the Arabic** and builds
+the English sentence from shuffled word tiles (the same puzzle as Build: hints, red marks, "swap the orange words"). There is no Listen button, and nothing is
+read aloud, until the sentence is solved. A sentence without Arabic skips the step.
+
+- **It works even when the student's Arabic switch is off.** The switch still only controls flipping the cards in the Learn step: the server sends the
+  step's Arabic in its own field (`arq`), only for lessons that have the step switched on.
+- **Optional for the student, nothing else changes.** It gives no stars and is not needed to finish a unit or a lesson (grammar and the quiz still decide that), so
+  older progress cannot change. After Build the result screen offers **Next: Arabic → English 🔤** with a *Skip to Grammar / Skip to the quiz* button under it. The lesson page's
+  **Continue** button leads to it after Build until the student starts the grammar; it is also in the unit's step list ("Arabic → English") for practice.
+- **Saved on the server like Build:** the first try's mistakes, hints and seconds are kept per sentence (`sentence_progress.arb_*`); tries after that are practice. A request that is sent
+  twice (bad signal) is counted once. The **teacher's timeline** shows "built the English from the Arabic" with mistakes, hints and time (and "practised … again" for repeats), and it counts for the day streak.
+- **Teacher setting per lesson:** in the lesson editor tick or untick **Arabic → English step**. It is on by default (it only appears for sentences that have Arabic, so a lesson without
+  Arabic is unchanged). Turning it off hides the step and stops accepting results; results already saved are kept. In JSON it is `"arStep": true/false` on the lesson (written by *Export all*;
+  an older file without `arStep` never changes the setting).
+
+### Daily review of hard sentences
+
+Sentences the student found hard come back on a schedule, so they stay in memory. **Nothing needs to be set up by the teacher.**
+
+- **What is "weak":** a sentence built with a mistake or a hint the first time, a wrong grammar word the first time, a wrong answer in a quiz, or a mistake/hint in the
+  Arabic → English step. (Practising again is practice and does not add sentences.) Perfect sentences are never scheduled.
+- **The schedule:** a weak sentence comes back after **1 day, then 3, 7, 14 and 30 days**. A correct review moves it to the next interval (after the 30-day one it is
+  finished); a wrong review sends it back to 1 day. *Correct* means: right at the first try, without a hint. A sentence that becomes weak again starts again at 1 day.
+  Days are UTC dates (the same days the streak uses).
+- **Student:** when sentences are due, the home screen shows **🧠 Review (N)** (on phones and computers; sentences from finished lessons count too). A session has **up to 10**
+  due sentences, most overdue first, and mixes **Build** questions with **Grammar** questions (a sentence with a grammar gap is asked as Grammar about half of the time;
+  one without a gap is always Build). The questions are the normal Build puzzle and Grammar screen, one screen each. At the end the student sees what was right and when each
+  sentence comes back, and can start another session if more are due. It works offline: answers are saved on the phone and sent later like everything else.
+- **Reviews never change stars** (or units, quizzes or lesson completion). They **count for the day streak**.
+- **Teacher:** a student's timeline has a **Reviews** filter and shows each answer ("daily review (build): right · next review in 7 days", or "wrong", "reviewed early", "finished all
+  reviews"). A sentence the teacher deletes or rewrites, or a lesson the student can no longer open, is simply not asked any more.
+- **After the update (once, automatic):** on first start the app adds the sentences students *already* found hard (by the same rules, from their saved progress and quiz answers) to
+  their schedules, with their first review **spread over the next 7 days** (about a seventh each day) instead of all on day one. Restarting never repeats this.
+- Technical: table `review_items` (one row per student and sentence: stage, due date); the schedule rules are in `public/review-core.js`, shared by the app and the server
+  (`POST /api/review/answer` applies them; `GET /api/app` returns `reviews`, the sentences due today).
+
+### Speaking check on the cards (microphone)
+
+On a browser with speech recognition (Chrome, Edge, and Safari on newer iPhones: `SpeechRecognition` / `webkitSpeechRecognition`) the **"I said it out loud"** button on the Learn
+cards becomes a **🎤 microphone button**. Phones or browsers without it keep the old button, exactly as before. The step still only appears the first time through a unit (and when the
+student starts it over), and the next sentence stays locked until the sentence is said.
+
+- **How it works:** the student taps 🎤 and says the sentence. The phone gets back the *text* it heard and compares it with the sentence (`public/speak-core.js`): case, punctuation and
+  apostrophes are ignored (`Don't` = `dont`), a hyphen splits a word (`check-in` = `check in`), the numbers 0-20 count as words (`2` = `two`), and the words are matched **in order**.
+  A try **passes at 80% of the words** (4 of 5, 5 of 6...; a 4-word sentence needs all 4). The words it did **not** hear are shown in orange on the card, the heard ones in green.
+- **Up to 3 tries**, then the button becomes **Continue anyway**. A try where nothing was heard (or the student stopped) does not use up a try.
+- **The microphone is asked for only when the student first taps 🎤** (never on page load). If the permission is refused, or speech recognition does not work (for example no
+  network for the recognition service, or Siri dictation is off on an iPhone), the old "I said it out loud" button is used from then on, with a short message.
+  While the microphone listens, the Listen and Slowly buttons are switched off so the phone does not hear its own voice. It stops by itself after 9 seconds.
+- **Only text is sent, never audio.** After the sentence is passed (or the 3rd try is used) the phone sends the text of each try; **the server scores it again with the same
+  `speak-core.js`**, so a score cannot be made up by the phone. It keeps, for each student and sentence: the best score ever, the number of tries, whether it was ever passed, and the best
+  text heard (table `speaking_scores`). Saving works offline like everything else. It never changes progress, stars or the streak.
+- **Teacher:** the student's timeline shows "said a sentence out loud … 83% ✓ · heard: “…” · 2 tries" (part of the *Sentences & cards* filter); the student's card has a **🎤 Speaking** panel (average and the
+  lowest sentences with what was heard); and the lesson's **progress page** has **🎤 Hardest to say**: the sentences with the lowest average score across students, with tries and how many did not pass.
+  Teachers need to do nothing after the update. The speech recognition of Chrome sends the voice to the browser maker's service, so it needs an internet connection and a secure (`https`) page.
+
+### Tap a word to see its meaning
+
+On a Learn card, tapping a word still reads it aloud, and now also shows a small **bubble with its Arabic meaning** next to the word (right-to-left text). It closes when the student taps
+anywhere else, on Escape, on the next card, or after 5 seconds. The bubble floats inside the card, so nothing moves and the screen never scrolls. A word without a meaning shows **no bubble**.
+**It is always available**: the meanings are sent to every student, whether or not the Arabic switch for the cards is on for them (that switch still only controls flipping the whole card).
+
+- **Matching ignores case and punctuation:** `Airport`, `airport.` and `(airport)` are all the word `airport` (so are `Don’t` and `don't`). A hyphenated word like `check-in` is one word.
+- **Each lesson has a word list**, `{ "words": { "airport": "مطار", "boarding": "صعود الطائرة" } }`, in JSON import/export (*Export all* writes it; importing a file **without** `words` keeps the list a lesson
+  already has, `"words": {}` clears it). In the **lesson editor**, open **📖 Word meanings** and write one `word = meaning` per line (`airport = مطار`); the editor checks every line. Meanings must be Arabic text
+  (up to 80 characters), a lesson can have up to 1000, and only words that really appear in the lesson's sentences are sent to students.
+- **Many words at once with an AI** (Lessons page > **📖 Word meanings**), exactly like the Arabic translations:
+  1. **Download words without meaning**: up to 100 different words at a time, each once (any capitals/punctuation made plain), with an example sentence so the AI picks the right meaning. Tiny words
+     (`a an the to of in on at is am are was were be and or i it he she we you they do does my your for with`) are left out, and so are words that already have a meaning in every lesson that uses them.
+  2. Give the file and the instruction (**Copy the instruction for the AI**) to your AI; 3. paste its whole answer back and press **Add the meanings**. Repeat until the page says everything is ready.
+  The same safety checks apply: the answer is understood even with text around it or in a code block, and also as a plain `{ "word": "Arabic" }` map or a lessons file; a word is added only to
+  lessons whose sentences **really contain it** (a word the AI changed is reported, not added); text that is not Arabic is refused; meanings that already exist are kept unless you tick **Replace
+  meanings that already exist**; sentences, units and student progress are never touched.
+
 ## Features
 
 **Students**
 - Sign up with name, email and password (or get an account from the teacher)
 - Lessons are split into **units** (e.g. "At the airport", "At the hotel"). Units open in order: finishing one unlocks the next.
-- Each unit has 2 steps: **1. Learn** (cards: read, listen normally or slowly, tap a word to hear it)
-  and **2. Build** (tap or drag words into order; hints, stars, red marks for wrong words). Build unlocks after the cards.
+- Each unit has these steps: **1. Learn** (cards: read, listen normally or slowly, tap a word to hear it and see its Arabic meaning, say the sentence into the microphone)
+  and **2. Build** (tap or drag words into order; hints, stars, red marks for wrong words). Build unlocks after the cards. Then an optional **Arabic → English** step, the **Grammar**
+  step (with a tip card and the reason for a wrong word) and the **quiz**. Hard sentences come back later in the **daily Review**.
 - Progress is saved after every card and every sentence. It never goes backwards, and the best stars are kept.
   Students can stop at any time and continue on any device ("Continue where you stopped").
 - **Home keeps your place, finished lessons move away:** going back from a lesson (the arrow or the phone's back button) returns to the same spot in the list. A lesson the student finishes leaves the home list and appears on the **Completed lessons** page (a 🏆 row on the home screen), where it can still be opened and played again.
@@ -105,6 +204,14 @@ I live [in|on|at] Cairo.
 
 Upgrading is automatic: on start the app adds any new tables, turns older lessons into a single unit, and keeps all lessons and student progress.
 
+**After updating to this version** (nothing is required, but this is what happens and what a teacher may want to do):
+- New columns/tables are added on the first start (`lessons.ar_step`, `lessons.words`, `sentence_progress.arb_*`, `review_items`, `speaking_scores`). Nothing is removed or changed, and no one's stars, units, quizzes or lesson completion change.
+- **Daily review:** on that first start, sentences students already found hard are added to their review schedules, with the first reviews **spread over the next 7 days**. Students will see a **🧠 Review (N)** card from tomorrow.
+- **Arabic → English step:** it appears after Build for every sentence that already has Arabic (it is optional for students). To stop it for a lesson, untick **Arabic → English step** in that lesson's editor.
+- **Grammar tips, "why", word meanings:** nothing shows until the teacher writes them (lesson editor, JSON, or the *Word meanings* download for the AI on the Lessons page).
+- **Speaking check:** automatic on phones/browsers with speech recognition. Make sure the site is served over `https` (CranL does this), otherwise the microphone is not available and the old button is used.
+- Reload the app once on each phone so the new files load (the app updates itself the next time it is opened online).
+
 ## Deploy / update on CranL
 
 1. Upload all the files to your GitHub repository (replace the old ones).
@@ -145,6 +252,8 @@ Upgrading is automatic: on start the app adds any new tables, turns older lesson
 }
 ```
 
+A unit may also have `"tip"` and `"tipAr"` (see "Grammar tips"), a grammar gap may have `"why"`, and a lesson may have `"arStep"` (the Arabic → English step on/off, default on)
+and `"words"` (word meanings, see "Tap a word"). A sentence may have `"ar"` (its Arabic). Every one of these is optional: a file without them keeps what the lesson already has.
 A lesson can also use a plain `"sentences": [...]` list instead of `units`; it then becomes a single unit.
 A sentence may appear only once per lesson. `visibility` is `"public"` (all students) or `"assigned"` (only students you select afterwards in the dashboard).
 Importing from a student's card always creates new private lessons for that student (it never overwrites other lessons).
@@ -166,7 +275,7 @@ Each sentence gives 3 stars (perfect), 2 (1-2 mistakes/hints) or 1. In the Build
 sentence counts as a mistake, and a sentence has at most 3 hints. The result of the first time is the student's score and is
 what unlocks the next unit. Playing a sentence again is practice only: the saved stars never change (so "extra" stars are always 0
 for new progress; older extra stars in the database are still shown). The streak counts the days on which the student finished at
-least one sentence (Build or Grammar); a missed day resets it to 0. The database is the source of truth: the phone saves progress
+least one sentence (Build, Arabic → English or Grammar); a missed day resets it to 0. The database is the source of truth: the phone saves progress
 at once, sends it in the background, and re-reads everything from the server when the app is opened, when the connection comes back
 and about once a minute.
 
@@ -278,9 +387,15 @@ src/routes/student.js   Sign-up/login, lessons, saving progress
 src/routes/admin.js     Teacher API: overview, students, lessons, assignments, CSV
 src/validate.js         Input rules
 test/api.test.js        End-to-end API tests (run with TEST_DATABASE_URL set to an empty test database)
-test/grammar.test.js    Grammar-gap parsing tests (no database needed)
+test/grammar.test.js    Grammar-gap parsing tests, including tips/"why" (no database needed)
+test/review.test.js     Review schedule rules (no database needed)
+test/speak.test.js      Speaking check scoring (no database needed)
+test/words.test.js      Word meaning matching and checks (no database needed)
 src/seed.js             6 starter lessons (only added to an empty database)
 public/progress-core.js Scoring rules shared by the server and the browser
+public/review-core.js   Review schedule (1, 3, 7, 14, 30 days) shared by the server and the browser
+public/speak-core.js    Speaking check scoring (heard text vs sentence) shared by the server and the browser
+public/words-core.js    Word meanings: matching a tapped word with a lesson's list (server, editor, app)
 public/grammar-core.js  Reads/writes grammar gaps like [is|are|am] (server, teacher editor)
 public/app.js           Student app
 public/admin.js         Teacher dashboard

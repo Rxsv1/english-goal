@@ -256,3 +256,12 @@ table.data a { color: inherit; }
 .ar-result.good { background: var(--success); color: var(--success-text); }
 .ar-result.warn { background: #FFF1D6; color: #8A4B00; }
 .ar-result.bad { background: var(--danger-soft); color: var(--danger); }
+
+/* Grammar tip box inside a unit of the lesson editor */
+.unit-tip { margin-top: 4px; }
+.unit-tip > summary { cursor: pointer; font-weight: 600; font-size: .9375rem; color: var(--muted); padding: 6px 0; }
+.unit-tip .help { margin: 4px 0 8px; }
+.form .unit-edit textarea.tip-input { min-height: 64px; margin-bottom: 8px; }
+
+/* Word meanings box in the lesson editor */
+.form .words-edit textarea { min-height: 120px; direction: ltr; background: var(--surface); }

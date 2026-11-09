@@ -4,6 +4,13 @@
 
   const Progress = window.ProgressCore; // the scoring rules, shared with the server (progress-core.js)
   const Quiz = window.QuizCore;         // the quiz maker and marker, shared with the server (quiz-core.js)
+  const Review = window.ReviewCore;     // the daily review schedule rules, shared with the server (review-core.js)
+  const Words = window.WordsCore;       // word meanings: matches a tapped word with the lesson's list, shared with the server (words-core.js)
+  const Speak = window.SpeakCore;       // compares what the microphone heard with the sentence, shared with the server (speak-core.js)
+  // The browser's speech recognition (Chrome, Edge, Safari on newer iPhones). Without it the cards keep the old "I said it out loud" button.
+  // Nothing is asked of the student (no microphone permission) until they tap the microphone for the first time.
+  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  let micBlocked = false; // set when the microphone / recognition does not work on this device: the old button is used from then on
   const app = document.getElementById('app');
   const APP_NAME = (document.querySelector('meta[name="app-name"]') || {}).content || 'WordStack';
   const MAX_PRACTICE = 30;
@@ -266,7 +273,7 @@
     const g = x.gap;
     if (!isObj(g) || typeof g.answer !== 'string' || !Number.isInteger(g.index) || g.index < 0
       || !Array.isArray(g.options) || g.options.length !== 3 || !g.options.every(o => typeof o === 'string') || !g.options.includes(g.answer)) return {};
-    return { gap: { index: g.index, answer: g.answer, options: [...g.options] }, gdone: Boolean(x.gdone) };
+    return { gap: { index: g.index, answer: g.answer, options: [...g.options], ...(typeof g.why === 'string' && g.why.trim() ? { why: g.why.slice(0, 140) } : {}) }, gdone: Boolean(x.gdone) };
   }
 
   function sanitizeApp(d) {
@@ -284,8 +291,12 @@
             id: u.id,
             title: text(u.title),
             quizPassed: Boolean(u.quizPassed),
+            ...(typeof u.tip === 'string' && u.tip.trim() ? { tip: u.tip.slice(0, 300) } : {}),
+            ...(typeof u.tipAr === 'string' && u.tipAr.trim() ? { tipAr: u.tipAr.slice(0, 300) } : {}),
             sentences: u.sentences.filter(x => isObj(x) && typeof x.en === 'string' && x.en.trim())
-              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3), ...cleanGap(x), ...(typeof x.ar === 'string' && x.ar.trim() ? { ar: x.ar.slice(0, 300) } : {}) })),
+              .map(x => ({ en: x.en, stars: clampNum(x.stars, 0, 3), extra: clampNum(x.extra, 0, 3), ...cleanGap(x), ...(typeof x.ar === 'string' && x.ar.trim() ? { ar: x.ar.slice(0, 300) } : {}),
+                // "arq" = the Arabic shown in the Arabic -> English step (sent whether or not the card switch is on); "arbDone" = that step is done
+                ...(typeof x.arq === 'string' && x.arq.trim() ? { arq: x.arq.slice(0, 300), ...(x.arbDone ? { arbDone: true } : {}) } : {}) })),
           });
         }
         if (!units.length) continue;
@@ -294,6 +305,8 @@
           slug: l.slug, title: text(l.title), level: text(l.level), description: text(l.description), emoji: text(l.emoji) || '📘',
           assigned: Boolean(l.assigned),
           finalPassed: Boolean(l.finalPassed),
+          // word meanings { word: Arabic }: only plain strings are kept
+          words: isObj(l.words) ? Object.fromEntries(Object.entries(l.words).filter(([k, v]) => k.length <= 40 && typeof v === 'string' && v.trim()).slice(0, 1000).map(([k, v]) => [k, v.slice(0, 80)])) : {},
           units,
           lp: lp ? { started_at: lp.started_at || null, last_activity_at: lp.last_activity_at || null, completed_at: lp.completed_at || null, time_spent_sec: toNum(lp.time_spent_sec) } : null,
           unitRows: (Array.isArray(l.unitRows) ? l.unitRows : []).filter(r => isObj(r) && typeof r.unit_id === 'string')
@@ -305,6 +318,9 @@
         stats: { sentencesSolved: toNum(st.sentencesSolved), stars: toNum(st.stars), extraStars: toNum(st.extraStars),
           lessonsCompleted: toNum(st.lessonsCompleted), timeSpent: toNum(st.timeSpent), streak: toNum(st.streak) },
         lessons,
+        // the sentences due for review today: { slug, sentence, stage }
+        reviews: (Array.isArray(d.reviews) ? d.reviews : []).filter(x => isObj(x) && typeof x.slug === 'string' && typeof x.sentence === 'string')
+          .slice(0, 200).map(x => ({ slug: x.slug, sentence: x.sentence, stage: clampNum(x.stage, 0, 5) })),
       };
     } catch (e) {
       return null;
@@ -355,7 +371,7 @@
     const raw = rawLesson(slug);
     if (!raw) return null;
     return {
-      lesson: { slug: raw.slug, title: raw.title, level: raw.level, description: raw.description, emoji: raw.emoji, assigned: raw.assigned,
+      lesson: { slug: raw.slug, title: raw.title, level: raw.level, description: raw.description, emoji: raw.emoji, assigned: raw.assigned, words: raw.words || {},
         units: JSON.parse(JSON.stringify(raw.units)) },
       progress: modelOf(raw),
     };
@@ -374,6 +390,36 @@
     models.delete(raw); rev++; saveData();
     return r;
   }
+  // The Arabic -> English step was solved: remembered on the device at once (no stars, nothing is needed to finish the unit).
+  function noteArb(slug, sentence, seconds) {
+    const raw = rawLesson(slug);
+    const r = raw && Progress.applyArb(raw, S.stats, sentence, seconds, new Date().toISOString());
+    if (!r) return { first: false };
+    models.delete(raw); rev++; saveData();
+    return r;
+  }
+  // The sentences of a unit that the Arabic -> English step uses: built, with Arabic. Normally only the ones not done yet; `all` plays every one again.
+  const arbItems = (unit, all) => unit.sentences.filter(sn => sn.arq && sn.stars && (all || !sn.arbDone));
+  const arbCounts = unit => ({ total: unit.sentences.filter(sn => sn.arq).length, done: unit.sentences.filter(sn => sn.arq && sn.arbDone).length });
+
+  // The sentences due for review, with what the screens need. A sentence whose lesson (or text) the teacher changed is simply left out.
+  function reviewItems() {
+    const out = [];
+    for (const r of (S && S.reviews) || []) {
+      const raw = rawLesson(r.slug);
+      const sn = raw && raw.units.flatMap(u => u.sentences).find(x => x.en === r.sentence);
+      if (sn) out.push({ slug: r.slug, sentence: r.sentence, stage: r.stage, hasGap: Boolean(sn.gap) });
+    }
+    return out;
+  }
+  // A review question was answered: it is no longer due today (right or wrong, its next review is tomorrow or later). Reviews never touch stars.
+  function noteReview(slug, sentence) {
+    if (!S) return;
+    S.reviews = (S.reviews || []).filter(x => !(x.slug === slug && x.sentence === sentence));
+    if (!S.stats.streak) S.stats.streak = 1; // a review counts for the day streak
+    rev++; saveData();
+  }
+
   // A quiz was finished: only passing changes the progress (the unit, or the lesson, can now be finished).
   function noteQuiz(slug, scope, passed, seconds) {
     const raw = rawLesson(slug);
@@ -624,7 +670,7 @@
 
   // The kind of screen decides how wide the page may be on a computer (see the "large screens" part of style.css).
   function layoutFor(path) {
-    if (/^\/lesson\/[^/]+\/(u\/|final$)/.test(path) || path === '/practice') return 'game';
+    if (/^\/lesson\/[^/]+\/(u\/|final$)/.test(path) || path === '/practice' || path === '/review') return 'game';
     if (path === '/profile' || path === '/login' || path === '/signup') return 'narrow';
     return 'wide';
   }
@@ -661,10 +707,11 @@
     if (!me) return goLogin();
     let m;
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)$/))) return showLessonHub(m[1]);
-    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|review|grammar|quiz)$/i))) return showLessonStep(m[1], m[2], m[3]);
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|arbuild|review|grammar|quiz)$/i))) return showLessonStep(m[1], m[2], m[3]);
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/final$/))) return showFinalQuiz(m[1]);
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/(learn|build|review|grammar)$/))) return navigate(`/lesson/${m[1]}`, true);
     if (path === '/practice') return showPractice();
+    if (path === '/review') return showReview();
     if (path === '/profile') return showProfile();
     if (path === '/completed') return showCompleted();
     if (path !== '/') history.replaceState(null, '', '/');
@@ -879,6 +926,13 @@
     const hello = `${greet}, ${firstName}`;
     const hint = stats.sentencesSolved ? 'Keep going, you are doing great! ⭐' : 'Tap a lesson to play! 🎈';
     const emptyText = finished.length ? 'You finished every lesson! 🎉 Play your own text below, or open a finished lesson to play it again.' : 'No lessons yet. Your teacher will add some soon.';
+    const dueN = reviewItems().length;
+    const reviewCard = dueN ? h('a', { class: 'lesson-card card-review', href: '/review', 'data-link': true },
+      h('span', { class: 'emoji', 'aria-hidden': 'true' }, '🧠'),
+      h('div', { class: 'body' },
+        h('div', { class: 'title' }, `Review (${dueN})`),
+        h('div', { class: 'desc' }, 'Hard sentences are back. A few minutes keeps them in your head.')),
+      h('span', { class: 'chev', html: ICON.next })) : null;
     const statRow = () => h('div', { class: 'stat-row two' },
       statTile('star', stats.stars, 'Stars', stats.extraStars ? `+${stats.extraStars} extra` : null),
       statTile('flame', stats.streak, 'Day streak'));
@@ -892,6 +946,7 @@
           h('aside', { class: 'home-side' },
             showInstallTip ? installTip() : null,
             statRow(),
+            reviewCard,
             cont ? continueCard(cont) : null,
             finished.length ? completedLink(finished) : null),
           h('div', { class: 'home-main' },
@@ -909,6 +964,7 @@
       h('p', { class: 'subtitle' }, hint),
       showInstallTip ? installTip() : null,
       statRow(),
+      reviewCard,
       cont ? continueCard(cont) : null,
       finished.length ? completedLink(finished) : null,
       assigned.length ? h('section', { class: 'section' },
@@ -1040,6 +1096,8 @@
       const list = h('div', { class: 'bsheet-list' },
         rowLink(ICON.cards, 'Cards', up.learned ? 'Listen to each sentence and say it' : up.learnIndex > 0 ? `Continue · ${up.learnIndex + 1} of ${up.total}` : 'Learn the sentences', unitPath(slug, unit, 'learn')),
         up.learned ? rowLink(ICON.puzzle, 'Practise', `Build the sentences again · ${up.solved} of ${up.total} built`, unitPath(slug, unit, 'review')) : null,
+        up.learned && up.solved === up.total && arbCounts(unit).total ? rowLink('🔤', 'Arabic → English', `Build the English from the Arabic · ${arbCounts(unit).done} of ${arbCounts(unit).total} done`,
+          unitPath(slug, unit, 'arbuild') + (arbCounts(unit).done === arbCounts(unit).total ? '?replay=1' : '')) : null,
         up.learned && up.grammarTotal && up.solved === up.total ? rowLink('✏️', 'Grammar', `Choose the missing word · ${up.grammarDone} of ${up.grammarTotal}`, unitPath(slug, unit, 'grammar') + '?replay=1') : null,
         up.quizReady || up.quizPassed ? rowLink('❓', 'Quiz', up.quizPassed ? 'Passed · take it again if you like' : 'The last step of this unit', unitPath(slug, unit, 'quiz')) : null);
       let more = null;
@@ -1079,13 +1137,17 @@
       let open = null;
       if (current) {
         // The unit's three steps in order: read and say it, build it, then the grammar gap (if the unit has one).
-        const step = !up.learned ? 'learn' : up.solved < up.total ? 'build' : up.grammarReady ? 'grammar' : 'quiz';
-        const label = step === 'learn' ? (up.learnIndex > 0 ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : step === 'grammar' ? (up.grammarDone ? 'Continue' : 'Start') : 'Take the quiz';
+        // The optional Arabic -> English step comes right after Build, until the student starts the grammar (it can be skipped from its first screen).
+        const ab = arbCounts(unit);
+        const arbNow = up.solved === up.total && ab.total > ab.done && !up.grammarDone && !up.quizPassed;
+        const step = !up.learned ? 'learn' : up.solved < up.total ? 'build' : arbNow ? 'arbuild' : up.grammarReady ? 'grammar' : 'quiz';
+        const label = step === 'learn' ? (up.learnIndex > 0 ? 'Continue' : 'Start') : step === 'build' ? (up.solved ? 'Continue' : 'Play') : step === 'arbuild' ? (ab.done ? 'Continue' : 'Start') : step === 'grammar' ? (up.grammarDone ? 'Continue' : 'Start') : 'Take the quiz';
         const learnTxt = up.learned ? 'Learned' : up.learnIndex > 0 ? `Learn ${up.learnIndex + 1}/${up.total}` : 'Learn';
         open = h('div', { class: 'u-open' },
           h('div', { class: 'unit-steps' },
             h('span', { class: up.learned ? 'ok' : '', html: ICON.cards }, learnTxt),
             h('span', { class: up.solved === up.total ? 'ok' : '', html: ICON.puzzle }, `Build ${up.solved}/${up.total}`),
+            ab.total ? h('span', { class: ab.done === ab.total ? 'ok' : '' }, `🔤 Arabic ${ab.done}/${ab.total}`) : null,
             up.grammarTotal ? h('span', { class: up.grammarDone === up.grammarTotal ? 'ok' : '' }, `✏️ Grammar ${up.grammarDone}/${up.grammarTotal}`) : null,
             h('span', { class: up.quizPassed ? 'ok' : '' }, `❓ Quiz ${up.quizPassed ? '✓' : '–'}`),
             up.stars ? h('span', { class: 'star', html: ICON.star }, String(up.stars)) : null),
@@ -1192,6 +1254,14 @@
       if (!items.length) return navigate(`/lesson/${slug}`, true);
       return runPuzzle({ ...ctx, items, mode: 'build', exitPath: `/lesson/${slug}` });
     }
+    if (step === 'arbuild') {
+      // The optional Arabic -> English step: everything must be built first; normally only the sentences not done yet, a replay plays them all.
+      const replay = q.get('replay') === '1';
+      if (up.solved < up.total) { toast('Build the sentences first 🧩'); return navigate(unitPath(slug, unit, 'build'), true); }
+      const items = arbItems(unit, replay);
+      if (!items.length) return navigate(`/lesson/${slug}`, true);
+      return runPuzzle({ ...ctx, items, mode: 'arbuild', replay, exitPath: `/lesson/${slug}` });
+    }
     if (step === 'grammar') {
       // Normally only the gaps still to answer, once everything is built; a replay (or a restart) plays them all again.
       const replay = q.get('replay') === '1' || flags.restart;
@@ -1244,7 +1314,11 @@
     const dots = progressDots(total);
     const num = h('div', { class: 'card-num' });
     const text = h('p', { class: 'card-sentence', lang: 'en' });
-    const card = h('div', { class: 'learn-card', tabindex: '-1' }, num, text, h('p', { class: 'card-tip' }, 'Tap any word to hear it'));
+    const promptEl = h('p', { class: 'prompt' });
+    const hasWords = Boolean(lesson.words && Object.keys(lesson.words).length);
+    const defaultTip = hasWords ? 'Tap any word to hear it and see its meaning' : 'Tap any word to hear it';
+    const tipLine = h('p', { class: 'card-tip' }, defaultTip); // also shows the result of a speaking try
+    const card = h('div', { class: 'learn-card', tabindex: '-1' }, num, text, tipLine);
     const listen = rbtn(ICON.sound, 'Listen');
     const slow = rbtn('🐢', 'Slowly');
     const prev = rbtn(ICON.back, 'Back', { 'aria-label': 'Previous sentence' });
@@ -1258,6 +1332,12 @@
     // The first time through (and when starting over) every sentence must be said out loud before moving on.
     const needSay = !up.learned || restart;
     const saidOut = new Set();
+    // Speaking check: with speech recognition the "I said it out loud" button becomes a microphone. The student says the sentence, the phone compares
+    // what it heard with the sentence (speak-core.js) and colours the words it did not hear. Up to 3 tries, then they may continue anyway.
+    const micOn = () => Boolean(SpeechRec) && !micBlocked && needSay;
+    const spoken = new Map();            // card index -> { heard: [text per try], last: result of the latest try, sent, startedAt }
+    const spokenOf = k => { let v = spoken.get(k); if (!v) spoken.set(k, v = { heard: [], last: null, sent: false, startedAt: 0 }); return v; };
+    let listening = false, rec = null, micTimer = 0;
     if (!canSpeak) { listen.disabled = true; slow.disabled = true; listen.title = 'Speech is not supported on this device'; }
 
     setView(
@@ -1268,13 +1348,13 @@
       dots.el,
       jump,
       h('div', { class: 'stage' },
-        h('p', { class: 'prompt' }, needSay ? '👀 Read  ·  🔊 Listen  ·  🗣️ Say it out loud' : '👀 Look and listen'),
+        promptEl,
         card),
       h('div', { class: 'dock' },
         h('div', { class: 'tools' }, prev, listen, slow, arBtn),
         next,
         restart ? h('p', { class: 'skip-row' }, h('a', { href: reviewPath, 'data-link': true }, 'Already know them? Skip to building ›')) : null),
-      h('p', { class: 'kbd-hint' }, (needSay ? '←  →  next / previous  ·  Space listen  ·  S I said it' : '←  →  next / previous  ·  Space listen') + (hasAr ? '  ·  A Arabic' : '')) // shown on computers only
+      h('p', { class: 'kbd-hint' }, (needSay ? '←  →  next / previous  ·  Space listen  ·  ' + (micOn() ? 'S microphone' : 'S I said it') : '←  →  next / previous  ·  Space listen') + (hasAr ? '  ·  A Arabic' : '')) // shown on computers only
     );
     app.classList.add('play');
 
@@ -1296,8 +1376,34 @@
       speak(sentences[i].en, s, () => card.classList.remove('speaking'));
     }
 
+    // Tapping a word also shows its Arabic meaning in a small bubble (when the lesson has one for it: matched without caring about capitals or
+    // punctuation). It does not depend on the Arabic switch of the cards. A word without a meaning shows nothing, and the bubble takes no room
+    // from the card, so nothing moves or scrolls. It closes when the student taps anywhere else, on the next card, or after a few seconds.
+    let pop = null;
+    function hideMeaning() { if (pop) { pop.remove(); pop = null; } }
+    function showMeaning(span, word) {
+      hideMeaning();
+      const meaning = Words.lookup(lesson.words, word);
+      if (!meaning) return;
+      pop = h('div', { class: 'word-pop', role: 'tooltip', dir: 'rtl', lang: 'ar' }, meaning);
+      pop.style.maxWidth = Math.min(card.clientWidth - 24, 300) + 'px';
+      card.append(pop);
+      const cr = card.getBoundingClientRect(), sr = span.getBoundingClientRect();
+      const pw = pop.offsetWidth, ph = pop.offsetHeight, mid = sr.left - cr.left + sr.width / 2;
+      const left = Math.max(8, Math.min(cr.width - pw - 8, mid - pw / 2));
+      let top = sr.top - cr.top - ph - 10, below = false;
+      if (top < 8) { top = sr.bottom - cr.top + 10; below = true; } // no room above the word: show it under the word
+      pop.style.left = left + 'px'; pop.style.top = top + 'px';
+      pop.style.setProperty('--ax', Math.max(14, Math.min(pw - 14, mid - left)) + 'px');
+      pop.classList.toggle('below', below);
+      later(hideMeaning, 5000);
+    }
+    const onTapAway = e => { if (!e.target.closest('.word, .word-pop')) hideMeaning(); };
+    document.addEventListener('pointerdown', onTapAway);
+
     // The sentence on the card: in English (each word can be tapped to hear it) or, after the Arabic button, its Arabic translation.
     function drawText() {
+      hideMeaning();
       const cur = sentences[i];
       if (showAr && cur.ar) {
         text.replaceChildren(cur.ar);
@@ -1307,10 +1413,12 @@
         showAr = false;
         text.removeAttribute('dir'); text.lang = 'en'; text.classList.remove('is-ar');
         num.textContent = `Sentence ${i + 1}`;
+        const marks = (spoken.get(i) || {}).last ? spoken.get(i).last.words : null; // which words the phone heard in the latest try
         text.replaceChildren(...cur.en.split(/\s+/).flatMap((w, k) => [
           k ? ' ' : '',
-          h('span', { class: 'word', role: 'button', tabindex: '0', onclick: () => speak(stripEdges(w) || w, true),
-            onkeydown: e => { if (e.key === 'Enter') speak(stripEdges(w) || w, true); } }, w),
+          h('span', { class: 'word' + (marks && marks[k] === true ? ' heard' : marks && marks[k] === false ? ' missed' : ''), role: 'button', tabindex: '0',
+            onclick: e => { speak(stripEdges(w) || w, true); showMeaning(e.currentTarget, w); },
+            onkeydown: e => { if (e.key === 'Enter') { speak(stripEdges(w) || w, true); showMeaning(e.currentTarget, w); } } }, w),
         ]));
       }
       if (arBtn) {
@@ -1338,7 +1446,14 @@
       prev.disabled = i === 0;
       const said = !needSay || saidOut.has(i);
       const last = i === total - 1;
-      if (!said) {
+      listen.disabled = !canSpeak || listening; slow.disabled = !canSpeak || listening; // never play the sentence while the microphone is listening
+      showSpeakLine();
+      promptEl.textContent = needSay ? (micOn() ? '👀 Read  ·  🔊 Listen  ·  🎤 Say it' : '👀 Read  ·  🔊 Listen  ·  🗣️ Say it out loud') : '👀 Look and listen';
+      if (!said && micOn()) {
+        const left = Speak.MAX_TRIES - spokenOf(i).heard.length;
+        next.className = 'btn btn-main btn-say' + (listening ? ' listening' : '');
+        next.innerHTML = listening ? '🎤 Listening… tap to stop' : left === Speak.MAX_TRIES ? '🎤 Tap and say it' : left > 0 ? `🎤 Try again (${left} left)` : 'Continue anyway ' + ICON.next;
+      } else if (!said) {
         next.className = 'btn btn-main btn-say';
         next.innerHTML = '🗣️ I said it out loud';
       } else {
@@ -1354,12 +1469,77 @@
     // The first tap on the main button says "I said it out loud"; after that it moves on.
     function markSaid() {
       if (!needSay || saidOut.has(i)) return false;
+      if (micOn()) { micTap(); return true; }
       saidOut.add(i); sfx.win(); render(false);
       return true;
     }
 
+    // The line under the sentence: the hint to tap a word, or how the last speaking try went.
+    function showSpeakLine() {
+      const st = spoken.get(i);
+      tipLine.classList.remove('good', 'bad');
+      if (!micOn() || !st || !st.last) { tipLine.textContent = defaultTip; return; }
+      const left = Speak.MAX_TRIES - st.heard.length;
+      if (st.last.pass) { tipLine.textContent = `✅ ${st.last.percent}% heard. Well said!`; tipLine.classList.add('good'); }
+      else if (left > 0) { tipLine.textContent = `${st.last.percent}% heard. The orange words were missed. Try again!`; tipLine.classList.add('bad'); }
+      else { tipLine.textContent = `${st.last.percent}% heard. Let's move on, you can practise this one again later.`; tipLine.classList.add('bad'); }
+      fitText(card, text);
+    }
+    function sendSpeak() {
+      const st = spoken.get(i);
+      if (!slug || !st || st.sent || !st.heard.length) return;
+      st.sent = true;
+      const seconds = Math.min(600, Math.round((Date.now() - st.startedAt) / 1000));
+      outbox.send(`/api/lessons/${slug}/speak`, { sentence: sentences[i].en, heard: st.heard, seconds, cid: uid() }).catch(() => {});
+    }
+    function stopListening() {
+      clearTimeout(micTimer);
+      if (rec) { const r = rec; rec = null; r.onresult = r.onerror = r.onend = null; try { r.abort(); } catch (e) { /* already stopped */ } }
+      listening = false;
+    }
+    // The microphone does not work here (permission refused, no network for the recognition, ...): from now on the old button is used.
+    function micFailed(why) {
+      micBlocked = true; stopListening();
+      toast(why);
+      render(false);
+    }
+    function micTap() {
+      const st = spokenOf(i);
+      if (listening) { try { rec.stop(); } catch (e) { stopListening(); render(false); } return; } // stop early: the result still arrives
+      if (st.heard.length >= Speak.MAX_TRIES) { sendSpeak(); saidOut.add(i); sfx.card(); render(false); return; } // 3 tries used: continue anyway
+      stopSpeech(); clearScreenTimers(); // never listen to our own voice
+      let r;
+      try { r = new SpeechRec(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
+      rec = r; r.lang = 'en-US'; r.interimResults = false; r.continuous = false; r.maxAlternatives = 3;
+      let got = false, error = '';
+      r.onresult = ev => {
+        got = true;
+        const alts = [];
+        const first = ev.results && ev.results[0];
+        for (let k = 0; first && k < first.length; k++) alts.push(first[k].transcript);
+        const best = Speak.best(sentences[i].en, alts);
+        if (!st.startedAt) st.startedAt = Date.now();
+        st.heard.push(best.text); st.last = best.result;
+        if (best.result.pass) { sendSpeak(); saidOut.add(i); sfx.win(); } else { sfx.wrong(); if (st.heard.length >= Speak.MAX_TRIES) sendSpeak(); }
+      };
+      r.onerror = ev => { error = (ev && ev.error) || 'error'; };
+      r.onend = () => {
+        if (rec !== r) return;
+        stopListening();
+        if (!got) {
+          if (/^(not-allowed|service-not-allowed|audio-capture|network|language-not-supported)$/.test(error)) return micFailed('The microphone does not work here. Use the button instead.');
+          toast('I did not hear anything. Tap the microphone and try again.');
+        }
+        drawText(); render(false);
+      };
+      try { st.startedAt = st.startedAt || Date.now(); r.start(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
+      listening = true; render(false);
+      micTimer = setTimeout(() => { if (rec === r) { try { r.stop(); } catch (e) { stopListening(); render(false); } } }, 9000); // never listens for ever
+    }
+
     async function go(delta) {
-      if (delta > 0 && needSay && !saidOut.has(i)) { toast('Say the sentence out loud first 🗣️'); return; }
+      if (delta > 0 && needSay && !saidOut.has(i)) { toast(micOn() ? 'Tap the microphone and say the sentence first 🎤' : 'Say the sentence out loud first 🗣️'); return; }
+      stopListening();
       const secs = secondsOnCard();
       if (delta > 0 && i === total - 1) {
         sendLearn(i, true, secs).catch(e => toast(e.message));
@@ -1394,6 +1574,7 @@
     });
     const onKey = e => {
       if (e.target.closest('input, textarea')) return;
+      if (e.key === 'Escape') hideMeaning();
       if (e.key === 'ArrowRight') go(1);
       else if (e.key === 'ArrowLeft') go(-1);
       else if (e.key === ' ' && !e.target.closest('button, [role="button"]')) { e.preventDefault(); speakCard(false); }
@@ -1403,7 +1584,7 @@
     };
     document.addEventListener('keydown', onKey);
     const stopRelayout = onRelayout(() => fitText(card, text));
-    cleanup = () => { document.removeEventListener('keydown', onKey); stopRelayout(); };
+    cleanup = () => { document.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onTapAway); stopRelayout(); stopListening(); hideMeaning(); };
 
     if (up.status === 'new') sendLearn(0, false, 0).catch(() => {});
     render(true);
@@ -1421,28 +1602,31 @@
    */
   function runPuzzle(o) {
     const { lesson, slug, items, mode, exitPath, unit, unitIndex, chain, restart } = o;
+    const review = o.review || null; // one question of a daily review session: { pos, total, onAnswer(result), onNext() }
     if (!Array.isArray(items) || !items.length) return navigate(exitPath || '/', true); // nothing to play
+    const arb = mode === 'arbuild'; // Arabic -> English: the student sees only the Arabic and builds the English sentence
     const tracked = Boolean(slug);
     const total = tracked ? unit.sentences.length : items.length;
     let doneCount = tracked && mode === 'build' ? unit.sentences.filter(s => s.stars).length : 0;
-    document.title = `${mode === 'practice' ? 'Practice' : 'Build'} · ${lesson.title} · ${config.appName}`;
+    document.title = `${mode === 'practice' ? 'Practice' : arb ? 'Arabic to English' : 'Build'} · ${lesson.title} · ${config.appName}`;
 
     const results = []; // stars per item this round
     let pos = 0, round = null, sortables = [];
     const locals = []; // what each sentence of this round earned, worked out on the device at once
-    const canGoBack = mode !== 'build';
+    const canGoBack = mode !== 'build' && !arb && !review;
     const MIN_SCALE = 0.52; // the smallest the tiles may shrink to, so long sentences still fit on the screen
 
     const MAX_HINTS = 3; // hints per sentence; the number left is shown on the Hint button
-    const dots = progressDots(mode === 'build' ? total : items.length);
+    const dots = progressDots(review ? review.total : mode === 'build' ? total : items.length);
     const pill = h('div', { class: 'pill' });
-    const answer = h('div', { class: 'zone answer-zone', 'data-placeholder': 'Tap the words in the right order', 'aria-label': 'Your sentence' });
+    const answer = h('div', { class: 'zone answer-zone', 'data-placeholder': arb ? 'Tap the English words in order' : 'Tap the words in the right order', 'aria-label': 'Your sentence' });
     const pool = h('div', { class: 'zone pool-zone', 'aria-label': 'Words to use' });
     const measure = h('div', { class: 'zone pool-zone measure', 'aria-hidden': 'true' }); // invisible copy of all the words, used to size things
     const answerBox = h('div', { class: 'answer-box' }, answer);
     const tray = h('div', { class: 'tray' }, pool, measure);
     const feedback = h('p', { class: 'feedback', role: 'status' });
-    const stage = h('div', { class: 'stage puzzle-stage' }, answerBox, feedback, tray);
+    const arPrompt = arb ? h('div', { class: 'ar-prompt', dir: 'rtl', lang: 'ar' }) : null; // the Arabic sentence to translate
+    const stage = h('div', { class: 'stage puzzle-stage' }, arPrompt, answerBox, feedback, tray);
 
     // Hearing the sentence would give the answer away, so Listen only appears (in the result sheet) once it is solved.
     const hintBtn = rbtn(ICON.hint, 'Hint', { 'aria-label': 'Hint' });
@@ -1453,7 +1637,7 @@
     const dock = h('div', { class: 'dock' }, h('div', { class: 'tools' }, prevBtn, hintBtn), status);
     let sheet = null, listenBtn = null, nextBtn = null;
 
-    const chip = mode === 'practice' ? 'Practice' : unitChip(lesson, unitIndex, mode === 'review' ? 'Practise again' : 'Build');
+    const chip = review ? 'Review' : mode === 'practice' ? 'Practice' : unitChip(lesson, unitIndex, arb ? 'Arabic → English' : mode === 'review' ? 'Practise again' : 'Build');
     setView(
       h('div', { class: 'game-top' },
         h('a', { class: 'icon-btn', href: exitPath, 'data-link': true, 'aria-label': 'Leave', html: ICON.back }),
@@ -1481,8 +1665,13 @@
       const vPad = el => ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth'].reduce((a, p) => a + (parseFloat(cs(el)[p]) || 0), 0);
       const heightOf = order => { measure.replaceChildren(...order.map(makeTile)); return measure.offsetHeight; };
       const st = cs(stage);
+      if (arPrompt) { // the Arabic sentence may take at most 30% of the stage; a longer one gets a smaller font
+        arPrompt.style.fontSize = ''; arPrompt.style.maxHeight = Math.floor(stage.clientHeight * 0.3) + 'px';
+        let px = parseFloat(cs(arPrompt).fontSize) || 24;
+        for (let n = 0; n < 30 && arPrompt.scrollHeight > arPrompt.clientHeight + 1 && px > 13; n++) { px -= 1; arPrompt.style.fontSize = px + 'px'; }
+      }
       const inner = stage.clientHeight - parseFloat(st.paddingTop) - parseFloat(st.paddingBottom);
-      const fixed = feedback.offsetHeight + (parseFloat(st.rowGap) || 10) * 2 + vPad(answerBox) + vPad(tray);
+      const fixed = feedback.offsetHeight + (parseFloat(st.rowGap) || 10) * (arPrompt ? 3 : 2) + vPad(answerBox) + vPad(tray) + (arPrompt ? arPrompt.offsetHeight : 0);
       let k = 1, hPool = 0, hAnswer = 0;
       for (let n = 0; n < 16; n++) {
         stage.style.setProperty('--k', k.toFixed(3));
@@ -1500,6 +1689,10 @@
       if (mode === 'build') {
         pill.textContent = `${doneCount} / ${total}`;
         dots.set(doneCount, doneCount < total ? doneCount : -1);
+      } else if (review) {
+        const solved = Boolean(round && round.solved);
+        pill.textContent = `${review.pos + 1} / ${review.total}`;
+        dots.set(review.pos + (solved ? 1 : 0), solved ? -1 : review.pos);
       } else {
         const solved = Boolean(round && round.solved);
         pill.textContent = `${pos + 1} / ${items.length}`;
@@ -1519,6 +1712,7 @@
       const target = hideCapital(tokenize(sentence));
       round = { sentence, target, order: shuffle(target), mistakes: 0, hints: 0, solved: false, lastWrong: null, startedAt: Date.now(), cid: uid() };
       if (sheet) { sheet.remove(); sheet = null; }
+      if (arPrompt) arPrompt.textContent = items[pos].arq;
       answer.replaceChildren();
       pool.replaceChildren(...round.order.map(makeTile));
       answerBox.classList.remove('solved');
@@ -1567,7 +1761,15 @@
       results[pos] = s;
       const seconds = Math.min(600, Math.round((Date.now() - round.startedAt) / 1000));
       let local = null;
-      if (tracked) {
+      if (review) {
+        // A review question: the session screen saves it (it never touches stars); nothing else happens here.
+        review.onAnswer({ kind: 'build', mistakes: round.mistakes, hints: round.hints, seconds });
+      } else if (arb) {
+        // No stars here: the step only remembers how it went (mistakes, hints, seconds) for the teacher.
+        noteArb(slug, round.sentence, seconds);
+        outbox.send(`/api/lessons/${slug}/arbuild`, { sentence: round.sentence, mistakes: round.mistakes, hints: round.hints, seconds, cid: round.cid })
+          .catch(e => { toast(e.message); return null; });
+      } else if (tracked) {
         // Stars, extra and unlocks are worked out here and now (same rules as the server), so nothing waits for the network.
         local = noteSolve(slug, round.sentence, s, seconds);
         locals[pos] = local;
@@ -1584,13 +1786,13 @@
       updateBar();
       const praise = s === 3 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : s === 2 ? ['Well done! 👏', 'Great job! 😊', 'Nice work! 👍'] : ['You got it! 💪', 'Good job, keep going! 🌈'];
       listenBtn = rbtn(ICON.sound, 'Listen', { hidden: !canSpeak, 'aria-label': 'Listen to the sentence' });
-      nextBtn = h('button', { class: 'btn btn-main btn-ok', type: 'button', html: (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next });
+      nextBtn = h('button', { class: 'btn btn-main btn-ok', type: 'button', html: ((review ? review.pos + 1 < review.total : pos + 1 < items.length) ? 'Next ' : 'Finish ') + ICON.next });
       listenBtn.addEventListener('click', () => speak(round.sentence));
       nextBtn.addEventListener('click', goNext);
       sheet = h('div', { class: 'sheet', role: 'status' },
         h('div', { class: 'sheet-head' },
           h('span', { class: 'sheet-msg' }, praise[(Math.random() * praise.length) | 0]),
-          h('div', { class: 'stars', 'aria-label': `${s} of 3 stars` }, starNodes(s))),
+          arb || review ? null : h('div', { class: 'stars', 'aria-label': `${s} of 3 stars` }, starNodes(s))),
         // Practising a sentence again never changes the saved stars.
         local && local.replay ? h('div', { class: 'sheet-extra' }, 'Practice: your saved stars stay the same.') : null,
         h('div', { class: 'sheet-row' }, listenBtn, nextBtn));
@@ -1664,8 +1866,34 @@
     const stopRelayout = onRelayout(fit);
     cleanup = () => { document.removeEventListener('keydown', onKey); stopRelayout(); sortables.forEach(s => s.destroy()); document.body.classList.remove('is-dragging'); };
 
+    // Results of the Arabic -> English step: no stars; it leads on to the grammar (or the quiz), and can always be left.
+    function finishArb() {
+      const now = lessonView(slug);
+      const unitNow = now && now.progress.units[unitIndex];
+      const perfect = results.filter(r => r === 3).length;
+      const offline = !navigator.onLine || outbox.items().length > 0;
+      const actions = h('div', { class: 'result-actions' });
+      if (unitNow && unitNow.grammarReady) actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'grammar'), 'data-link': true }, 'Next: Grammar ✏️'));
+      else if (unitNow && unitNow.quizReady) actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'quiz'), 'data-link': true }, 'Next: Quiz ❓'));
+      actions.append(h('a', { class: 'btn ' + (actions.children.length ? 'btn-ghost' : 'btn-primary'), href: `/lesson/${slug}`, 'data-link': true }, 'Back to lesson'));
+      actions.append(h('a', { class: 'btn btn-ghost', href: '/', 'data-link': true, 'data-top': true }, 'All lessons'));
+      setView(h('section', { class: 'results' },
+        h('div', { class: 'celebration', 'aria-hidden': 'true' }, perfect === items.length ? '🎉' : '💪'),
+        h('h1', null, 'Great translating! 🔤'),
+        h('p', { class: 'subtitle' }, `No mistakes or hints: ${perfect} of ${items.length}.`),
+        h('p', { class: 'muted' }, 'This step gives no stars. Your teacher can see how it went.'),
+        offline ? h('p', { class: 'muted' }, 'You are offline. Your progress will be saved when you reconnect.') : null,
+        h('details', { class: 'result-details' }, h('summary', null, `See ${items.length === 1 ? 'the sentence' : `all ${items.length} sentences`}`),
+          h('ul', { class: 'result-list' }, items.map(it => h('li', null, h('span', { lang: 'en' }, it.en), h('span', { class: 'ar-mini', dir: 'rtl', lang: 'ar' }, it.arq))))),
+        actions));
+      sfx.finish(); confetti(90);
+      scheduleSync(1500);
+    }
+
     function finish() {
       cleanup(); cleanup = null;
+      if (review) return review.onNext();
+      if (arb) return finishArb();
       const offline = tracked && (!navigator.onLine || outbox.items().length > 0);
       const extraGained = locals.reduce((a, r) => a + ((r && r.extra) || 0), 0);
       const earned = results.reduce((a, b) => a + (b || 0), 0);
@@ -1675,6 +1903,8 @@
       const unitNow = now && now.progress.units[unitIndex];
       // Built everything: if the unit has grammar gaps they come next, and the unit is not finished until they are answered.
       const grammarNext = Boolean(building && unitNow && unitNow.grammarReady);
+      // Sentences with Arabic come next (optional: the grammar / quiz link stays under it as "skip").
+      const arbNext = Boolean(building && unitNow && unitNow.solved === unitNow.total && now && arbItems(now.lesson.units[unitIndex], false).length);
       const quizNext = Boolean(building && !grammarNext && unitNow && unitNow.quizReady); // built everything: the unit quiz is the last step
       const unitDone = building && !grammarNext && !quizNext;
       const lessonDone = building && Boolean(now && now.progress.completed);
@@ -1686,7 +1916,11 @@
 
       const actions = h('div', { class: 'result-actions' });
       if (tracked) {
-        if (grammarNext)
+        if (arbNext) {
+          actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'arbuild'), 'data-link': true }, 'Next: Arabic → English 🔤'));
+          const skipTo = grammarNext ? ['grammar', 'Skip to Grammar ✏️'] : quizNext ? ['quiz', 'Skip to the quiz ❓'] : null;
+          if (skipTo) actions.append(h('a', { class: 'btn btn-ghost', href: unitPath(slug, unit, skipTo[0]), 'data-link': true }, skipTo[1]));
+        } else if (grammarNext)
           actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'grammar'), 'data-link': true }, 'Next: Grammar ✏️'));
         else if (quizNext)
           actions.append(h('a', { class: 'btn btn-primary', href: unitPath(slug, unit, 'quiz'), 'data-link': true }, 'Next: Quiz ❓'));
@@ -1718,8 +1952,9 @@
         h('p', { class: 'subtitle' }, `You earned ${earned} of ${max} stars in this round.`),
         extraGained > 0 ? h('p', { class: 'extra-banner' }, `+${extraGained} extra ${extraGained === 1 ? 'star' : 'stars'} added to your score!`) : null,
         replayed && !offline ? h('p', { class: 'muted' }, 'This was practice. Your saved stars stay the same.') : null,
-        grammarNext ? h('p', { class: 'muted' }, 'Now a quick grammar check: choose the missing word. ✏️') : null,
-        quizNext ? h('p', { class: 'muted' }, 'Last step: a short quiz. Pass it to finish the unit. ❓') : null,
+        arbNext ? h('p', { class: 'muted' }, 'Now the Arabic: read it and build the English sentence. 🔤 (You can skip this step.)') : null,
+        !arbNext && grammarNext ? h('p', { class: 'muted' }, 'Now a quick grammar check: choose the missing word. ✏️') : null,
+        !arbNext && quizNext ? h('p', { class: 'muted' }, 'Last step: a short quiz. Pass it to finish the unit. ❓') : null,
         building && !grammarNext && !quizNext && !lessonDone && nextUnit ? h('p', { class: 'muted' }, `Next up: Unit ${unitIndex + 2} is now open. Your progress is saved.`) : null,
         offline ? h('p', { class: 'muted' }, 'You are offline. Your progress will be saved when you reconnect.') : null,
         h('details', { class: 'result-details' }, h('summary', null, `See ${items.length === 1 ? 'the sentence' : `all ${items.length} sentences`}`),
@@ -1756,19 +1991,64 @@
     };
   }
 
+  /* ---------- Grammar tip: a short explanation the teacher wrote for the unit ---------- */
+  // English, plus the Arabic when the server sent it (only to students the teacher switched Arabic on for).
+  const tipNodes = unit => [
+    h('p', { class: 'gtip-text', lang: 'en' }, unit.tip),
+    unit.tipAr ? h('p', { class: 'gtip-text gtip-ar', dir: 'rtl', lang: 'ar' }, unit.tipAr) : null,
+  ];
+
+  // The card shown before the Grammar step: read it, then "Start".
+  function showGrammarTip(o, onStart) {
+    const { lesson, unit, unitIndex, exitPath } = o;
+    document.title = `Grammar tip · ${lesson.title} · ${config.appName}`;
+    const body = h('div', { class: 'gtip-body' }, ...tipNodes(unit));
+    const card = h('div', { class: 'learn-card gtip-card' }, h('div', { class: 'card-num' }, '💡 Grammar tip'), body);
+    const start = h('button', { class: 'btn btn-main btn-primary', type: 'button', html: 'Start ' + ICON.next });
+    const go = () => { if (cleanup) { cleanup(); cleanup = null; } onStart(); };
+    start.addEventListener('click', go);
+    setView(
+      h('div', { class: 'game-top' },
+        h('a', { class: 'icon-btn', href: exitPath, 'data-link': true, 'aria-label': 'Leave', html: ICON.back }),
+        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, unitChip(lesson, unitIndex, 'Grammar'))),
+        soundButton()),
+      h('div', { class: 'stage' }, card),
+      h('div', { class: 'dock' }, start),
+      h('p', { class: 'kbd-hint' }, 'Enter start') // shown on computers only
+    );
+    app.classList.add('play');
+    const fit = () => fitText(card, body, 14);
+    const onKey = e => { if (e.key === 'Enter' && !e.target.closest('button, a') && !e.repeat) go(); };
+    document.addEventListener('keydown', onKey);
+    const stopRelayout = onRelayout(fit);
+    cleanup = () => { document.removeEventListener('keydown', onKey); stopRelayout(); };
+    fit();
+    start.focus({ preventScroll: true });
+  }
+
   function runGrammar(o) {
     const { lesson, slug, items, exitPath, unit, unitIndex, replay, chain, restart } = o;
+    const review = o.review || null; // one question of a daily review session: { pos, total, onAnswer(result), onNext() }
     document.title = `Grammar · ${lesson.title} · ${config.appName}`;
     if (!items.length) return navigate(exitPath, true);
+    // A unit with a tip shows it first (every time the Grammar step starts); the Tip button opens it again.
+    if (unit && unit.tip && !o.tipSeen) return showGrammarTip(o, () => runGrammar({ ...o, tipSeen: true }));
     let pos = 0, round = null;
     const firstTry = [];       // for each sentence: answered right at the first choice?
     const triesLeftBehind = []; // wrong choices before the right one
 
     const pill = h('div', { class: 'pill' });
-    const dots = progressDots(items.length);
+    const dots = progressDots(review ? review.total : items.length);
     const num = h('div', { class: 'card-num' }, 'Fill the gap');
     const sentenceEl = h('p', { class: 'card-sentence', lang: 'en' });
-    const card = h('div', { class: 'learn-card gap-card' }, num, sentenceEl);
+    const whyEl = h('p', { class: 'gap-why', role: 'status', hidden: true }); // "why it's wrong", shown after a wrong choice
+    const card = h('div', { class: 'learn-card gap-card' }, num, sentenceEl, whyEl);
+    const tipBtn = unit && unit.tip ? h('button', { class: 'pill pill-btn', type: 'button', 'aria-label': 'Show the grammar tip' }, '💡 Tip') : null;
+    const openTip = () => {
+      const panel = showSheet('💡 Grammar tip', ...tipNodes(unit));
+      panel.append(h('button', { class: 'btn btn-primary btn-block gtip-close', type: 'button', onclick: closeSheet }, 'Got it'));
+    };
+    if (tipBtn) tipBtn.addEventListener('click', openTip);
     const choices = h('div', { class: 'gap-options', role: 'group', 'aria-label': 'Choose the missing word' });
     const feedback = h('p', { class: 'feedback', role: 'status' });
     const dock = h('div', { class: 'dock' }, feedback, choices);
@@ -1777,12 +2057,12 @@
     setView(
       h('div', { class: 'game-top' },
         h('a', { class: 'icon-btn', href: exitPath, 'data-link': true, 'aria-label': 'Leave', html: ICON.back }),
-        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, unitChip(lesson, unitIndex, 'Grammar'))),
-        pill, soundButton()),
+        h('div', { class: 'lesson-name' }, h('span', { class: 'step-chip' }, review ? 'Review' : unitChip(lesson, unitIndex, 'Grammar'))),
+        tipBtn, pill, soundButton()),
       dots.el,
       h('div', { class: 'stage' }, card),
       dock,
-      h('p', { class: 'kbd-hint' }, 'Keys 1 2 3 choose the first, second or third word  ·  Enter next') // shown on computers only
+      h('p', { class: 'kbd-hint' }, 'Keys 1 2 3 choose the first, second or third word  ·  Enter next' + (tipBtn ? '  ·  T tip' : '')) // shown on computers only
     );
     app.classList.add('play');
 
@@ -1799,9 +2079,10 @@
       choices.classList.remove('away');
       if (sheet) { sheet.remove(); sheet = null; }
       feedback.textContent = ''; feedback.className = 'feedback';
+      whyEl.hidden = true; whyEl.textContent = '';
       card.classList.remove('right');
-      pill.textContent = `${pos + 1} / ${items.length}`;
-      dots.set(pos, pos);
+      pill.textContent = `${(review ? review.pos : pos) + 1} / ${review ? review.total : items.length}`;
+      dots.set(review ? review.pos : pos, review ? review.pos : pos);
     }
 
     function choose(btn) {
@@ -1810,7 +2091,10 @@
       if (word !== round.it.gap.answer) {
         round.mistakes++;
         btn.disabled = true; btn.classList.add('wrong');
-        feedback.textContent = 'Not that one. Try again 💪'; feedback.className = 'feedback bad';
+        // The teacher's reason ("We use is with she") is shown inside the card, so the screen never grows; without one the old message stays.
+        const why = round.it.gap.why;
+        if (why) { whyEl.textContent = '💡 ' + why; whyEl.hidden = false; fitText(card, sentenceEl); }
+        feedback.textContent = why ? 'Try again 💪' : 'Not that one. Try again 💪'; feedback.className = 'feedback bad';
         sfx.wrong(); if (navigator.vibrate) navigator.vibrate(60);
         return;
       }
@@ -1824,12 +2108,15 @@
       choices.classList.add('away');
       card.classList.add('right');
       const seconds = Math.min(600, Math.round((Date.now() - round.startedAt) / 1000));
-      noteGrammar(slug, round.it.en, seconds);
-      outbox.send(`/api/lessons/${slug}/grammar`, { sentence: round.it.en, mistakes: round.mistakes, seconds, cid: round.cid }).catch(e => { toast(e.message); return null; });
-      dots.set(pos + 1, -1);
+      if (review) review.onAnswer({ kind: 'grammar', mistakes: round.mistakes, hints: 0, seconds }); // the review screen saves it
+      else {
+        noteGrammar(slug, round.it.en, seconds);
+        outbox.send(`/api/lessons/${slug}/grammar`, { sentence: round.it.en, mistakes: round.mistakes, seconds, cid: round.cid }).catch(e => { toast(e.message); return null; });
+      }
+      dots.set((review ? review.pos : pos) + 1, -1);
       feedback.textContent = ''; feedback.className = 'feedback';
       const praise = round.mistakes === 0 ? ['Perfect! 🌟', 'Excellent! 🎉', 'Amazing! 🤩'] : ['You got it! 💪', 'Good job! 👏'];
-      nextBtn = h('button', { class: 'btn btn-main btn-ok', type: 'button', html: (pos + 1 < items.length ? 'Next ' : 'Finish ') + ICON.next });
+      nextBtn = h('button', { class: 'btn btn-main btn-ok', type: 'button', html: ((review ? review.pos + 1 < review.total : pos + 1 < items.length) ? 'Next ' : 'Finish ') + ICON.next });
       nextBtn.addEventListener('click', goNext);
       sheet = h('div', { class: 'sheet', role: 'status' },
         h('div', { class: 'sheet-head' }, h('span', { class: 'sheet-msg' }, praise[(Math.random() * praise.length) | 0])),
@@ -1845,9 +2132,10 @@
     }
 
     const onKey = e => {
-      if (!round || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (!round || e.ctrlKey || e.metaKey || e.altKey || e.repeat || sheetEl) return;
       if (e.target.closest && e.target.closest('input, textarea, select')) return;
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (key === 't' && tipBtn) return openTip();
       if (round.done) { if (key === 'Enter' && nextBtn && document.activeElement !== nextBtn) nextBtn.click(); }
       else if (/^[1-3]$/.test(key)) { const b = choices.children[Number(key) - 1]; if (b) b.click(); }
     };
@@ -1857,6 +2145,7 @@
 
     function finish() {
       cleanup(); cleanup = null;
+      if (review) return review.onNext();
       const now = lessonView(slug);
       const unitNow = now && now.progress.units[unitIndex];
       const lessonDone = Boolean(now && now.progress.completed);
@@ -1894,6 +2183,64 @@
     }
 
     loadRound();
+  }
+
+  /* ================================================================ */
+  /* Daily review: up to 10 hard sentences that are due today           */
+  /* ================================================================ */
+  // Each question is the normal Build puzzle or Grammar question (see `review` in runPuzzle / runGrammar), one after the other. Right = first try
+  // without hints. Every answer is saved on the phone at once and sent to the server, which moves the sentence to its next interval (1, 3, 7, 14, 30
+  // days; a wrong answer sends it back to 1 day). Reviews never change stars, but they count for the day streak.
+  function showReview() {
+    document.title = `Review · ${config.appName}`;
+    if (!S) return showSkeleton('home');
+    const due = reviewItems();
+    if (!due.length) { toast('Nothing to review today 🎉'); return navigate('/', true); }
+    const session = Review.pickSession(due);
+    const total = session.length;
+    const done = [];
+    let pos = 0;
+
+    function answered(it, r) {
+      const correct = Review.isCorrect(r.mistakes, r.hints);
+      done.push({ it, correct, next: Review.afterReview(it.stage, correct).days });
+      noteReview(it.slug, it.sentence);
+      outbox.send('/api/review/answer', { slug: it.slug, sentence: it.sentence, kind: r.kind, mistakes: r.mistakes, hints: r.hints || 0, seconds: r.seconds, cid: uid() })
+        .catch(e => { toast(e.message); return null; });
+    }
+
+    function step() {
+      if (pos >= total) return finishReview();
+      const it = session[pos];
+      const raw = rawLesson(it.slug);
+      const sn = raw && raw.units.flatMap(u => u.sentences).find(x => x.en === it.sentence);
+      if (!sn) { pos++; return step(); } // the teacher changed the lesson meanwhile
+      const base = { lesson: { title: raw.title, units: [] }, items: [JSON.parse(JSON.stringify(sn))], exitPath: '/', unitIndex: 0,
+        review: { pos, total, onAnswer: r => answered(it, r), onNext: () => { pos++; step(); } } };
+      if (it.kind === 'grammar' && sn.gap) runGrammar({ ...base, slug: it.slug, unit: null, tipSeen: true });
+      else runPuzzle({ ...base, slug: null, mode: 'review-q', unit: null });
+    }
+
+    function finishReview() {
+      const right = done.filter(x => x.correct).length;
+      const more = reviewItems().length;
+      setView(h('section', { class: 'results' },
+        h('div', { class: 'celebration', 'aria-hidden': 'true' }, right === done.length ? '🧠' : '💪'),
+        h('h1', null, 'Review done!'),
+        h('p', { class: 'subtitle' }, `Right the first time: ${right} of ${done.length}.`),
+        h('p', { class: 'muted' }, 'Reviews never change your stars. Sentences you got right come back later; the ones you missed come back tomorrow.'),
+        h('details', { class: 'result-details', open: true }, h('summary', null, 'Your sentences'),
+          h('ul', { class: 'result-list' }, done.map(x => h('li', null,
+            h('span', { lang: 'en' }, x.it.sentence, h('small', { class: 'ar-mini' }, Review.whenText(x.next))),
+            h('span', { class: 's gram', 'aria-label': x.correct ? 'right' : 'wrong' }, x.correct ? '✓' : '✗'))))),
+        h('div', { class: 'result-actions' },
+          more ? h('a', { class: 'btn btn-primary', href: '/review', 'data-link': true }, `Review more (${more})`) : null,
+          h('a', { class: 'btn ' + (more ? 'btn-ghost' : 'btn-primary'), href: '/', 'data-link': true, 'data-top': true }, 'Back to lessons'))));
+      sfx.finish(); confetti(done.length && right === done.length ? 160 : 80);
+      scheduleSync(1500);
+    }
+
+    step();
   }
 
   /* ================================================================ */

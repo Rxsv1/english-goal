@@ -769,3 +769,486 @@ test('importing a lessons file puts the lessons in the order of the file; lesson
   assert.equal((await admin('POST', '/import', { assignTo: kay.id, lessons: [mk('Kays', 'ord-kays')] })).status, 200);
   assert.equal((await admin('GET', '/lessons')).data.lessons.map(l => l.slug).filter(x => x !== 'ord-kays').join(), frozen);
 });
+
+test('grammar tips and "why": written in the editor or JSON, shown to students, kept by imports', { skip }, async () => {
+  const tess = await newStudent('Tess');
+  const made = await admin('POST', '/lessons', { title: 'Tips lesson', slug: 'tips-lesson', units: [
+    { title: 'Be', tip: 'We use "is" with he, she and it.\n\n  We use "are" with you, we and they. ', tipAr: 'نستخدم is مع he و she و it', sentences: [
+      'She [is|are|am] reading a book ?? We use "is" with she. // هي تقرأ كتاباً',
+      { en: 'They are late today', gap: { index: 1, answer: 'are', options: ['are', 'is', 'am'], why: 'They is plural, so we use "are".' } },
+      'I like green tea' ] },
+    { title: 'No tip here', sentences: ['We like red apples'] },
+  ] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const id = made.data.lesson.id;
+
+  // 1) what the teacher gets back: tip lines tidied, the reason stored on the gap, the Arabic kept next to it
+  const full = (await admin('GET', `/lessons/${id}`)).data.lesson;
+  assert.equal(full.units[0].tip, 'We use "is" with he, she and it.\nWe use "are" with you, we and they.');
+  assert.equal(full.units[0].tipAr, 'نستخدم is مع he و she و it');
+  assert.deepEqual(full.units[0].sentences[0].gap, { index: 1, answer: 'is', options: ['is', 'are', 'am'], why: 'We use "is" with she.' });
+  assert.equal(full.units[0].sentences[0].ar, 'هي تقرأ كتاباً');
+  assert.equal(full.units[0].sentences[1].gap.why, 'They is plural, so we use "are".');
+  assert.equal('tip' in full.units[1], false, 'a unit without a tip has no tip fields at all (older lessons look the same)');
+
+  // 2) the student gets the tip and the reasons; the Arabic tip only once Arabic is switched on for them
+  const view = async () => (await tess.as('GET', '/app')).data.lessons.find(l => l.slug === 'tips-lesson');
+  let l = await view();
+  assert.equal(l.units[0].tip, full.units[0].tip);
+  assert.equal(l.units[0].tipAr, undefined);
+  assert.equal(l.units[0].sentences[0].gap.why, 'We use "is" with she.');
+  assert.equal(l.units[0].sentences[0].ar, undefined);
+  assert.equal('tip' in l.units[1], false);
+  await admin('PUT', `/users/${tess.id}/arabic`, { enabled: true });
+  l = await view();
+  assert.equal(l.units[0].tipAr, 'نستخدم is مع he و she و it');
+  const one = (await tess.as('GET', '/lessons/tips-lesson')).data.lesson;
+  assert.equal(one.units[0].tip, full.units[0].tip);
+  assert.equal(one.units[0].tipAr, 'نستخدم is مع he و she و it');
+
+  // 3) mistakes are explained, nothing is saved
+  const bad1 = await admin('POST', '/lessons', { title: 'Bad why', units: [{ title: 'U', sentences: ['She is reading ?? no gap here'] }] });
+  assert.equal(bad1.status, 400); assert.match(bad1.data.error, /needs a grammar gap/);
+  const bad2 = await admin('POST', '/lessons', { title: 'Bad tip', units: [{ title: 'U', tip: 'x'.repeat(301), sentences: ['We like tea'] }] });
+  assert.equal(bad2.status, 400); assert.match(bad2.data.error, /300 characters/);
+  const bad3 = await admin('POST', '/lessons', { title: 'Bad why 2', units: [{ title: 'U', sentences: [{ en: 'She is reading', gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'], why: 'y'.repeat(141) } }] }] });
+  assert.equal(bad3.status, 400); assert.match(bad3.data.error, /140/);
+
+  // 4) export -> import round trip keeps tips and reasons
+  const exported = (await admin('GET', '/export')).data.lessons.find(x => x.slug === 'tips-lesson');
+  assert.equal(exported.units[0].tip, full.units[0].tip);
+  assert.equal(exported.units[0].tipAr, full.units[0].tipAr);
+  assert.equal(exported.units[0].sentences[0].gap.why, 'We use "is" with she.');
+  const copy = await admin('POST', '/import', { lessons: [{ ...exported, slug: 'tips-lesson-copy', title: 'Tips copy' }] });
+  assert.equal(copy.status, 200, JSON.stringify(copy.data));
+  const copyId = (await admin('GET', '/lessons')).data.lessons.find(x => x.slug === 'tips-lesson-copy').id;
+  assert.equal((await admin('GET', `/lessons/${copyId}`)).data.lesson.units[0].tip, full.units[0].tip);
+
+  // 5) an older file with no "tip" does NOT wipe the tips already written; an explicit empty tip does
+  const oldFile = { lessons: [{ title: 'Tips lesson', slug: 'tips-lesson', units: [{ title: 'Be', sentences: ['She [is|are|am] reading a book', 'They [are|is|am] late today'] }] }] };
+  assert.equal((await admin('POST', '/import', oldFile)).status, 200);
+  const after = (await admin('GET', `/lessons/${id}`)).data.lesson;
+  assert.equal(after.units[0].tip, full.units[0].tip);
+  assert.equal(after.units[0].tipAr, full.units[0].tipAr);
+  assert.equal(after.units[0].id, full.units[0].id, 'the unit keeps its id, so student progress is kept');
+  oldFile.lessons[0].units[0].tip = '';
+  await admin('POST', '/import', oldFile);
+  assert.equal('tip' in (await admin('GET', `/lessons/${id}`)).data.lesson.units[0], false);
+});
+
+test('Arabic -> English step: needs the sentence built, works with the Arabic switch off, saved for the teacher, never changes stars or unit completion', { skip }, async () => {
+  const Core = require('../public/progress-core.js');
+  const lia = await newStudent('Lia');
+  const made = await admin('POST', '/lessons', { title: 'Arabic build', slug: 'arabic-build', units: [
+    { title: 'A', sentences: ['I like green apples // أحب التفاح الأخضر', 'She [is|are|am] reading a book // هي تقرأ كتابا', 'No Arabic here at all'] },
+    { title: 'B', sentences: ['We are going home now // نحن ذاهبون إلى البيت الآن'] },
+  ] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const lessonId = made.data.lesson.id;
+  assert.equal(made.data.lesson.arStep, true, 'on by default');
+  const view = async () => (await lia.as('GET', '/app')).data.lessons.find(l => l.slug === 'arabic-build');
+  const arb = (sentence, mistakes = 0, hints = 0, extra = {}) => lia.as('POST', '/lessons/arabic-build/arbuild', { sentence, mistakes, hints, seconds: 7, cid: Math.random().toString(36), ...extra });
+
+  // the Arabic of the step reaches the student although the Arabic switch for the cards is OFF; "ar" (the card flip) stays hidden
+  let l = await view();
+  const [s1, s2, s3] = l.units[0].sentences;
+  assert.equal(s1.arq, 'أحب التفاح الأخضر');
+  assert.equal(s1.ar, undefined, 'the card switch still controls the cards');
+  assert.equal(s3.arq, undefined, 'a sentence without Arabic skips the step');
+  assert.equal(s1.arbDone, undefined);
+
+  // rules: built first, only sentences with Arabic, never in a locked unit
+  assert.equal((await arb('I like green apples')).status, 409, 'not built yet');
+  assert.equal((await arb('No Arabic here at all')).status, 400);
+  assert.equal((await arb('Not in the lesson')).status, 400);
+  assert.equal((await arb('We are going home now')).status, 403, 'unit B is still locked');
+  const u1 = l.units[0];
+  await lia.as('POST', `/lessons/arabic-build/units/${u1.id}/learn`, { index: 2, done: true });
+  for (const sn of u1.sentences) assert.equal((await solve(lia, 'arabic-build', sn.en, 1, 0)).status, 200);
+
+  // solving the step: the first result is what the teacher sees; later tries are practice
+  const cid = 'same-cid';
+  const first = await arb('I like green apples', 2, 1, { cid });
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.equal(first.data.first, true);
+  assert.equal((await arb('I like green apples', 0, 0, { cid })).data.duplicate, true, 'a resent request is not counted twice');
+  const again = await arb('I like green apples', 0, 0);
+  assert.equal(again.data.first, false);
+  assert.equal((await arb('She is reading a book', 0, 0)).data.first, true);
+
+  l = await view();
+  assert.equal(l.units[0].sentences[0].arbDone, true);
+  assert.equal(l.units[0].sentences[1].arbDone, true);
+  assert.equal(l.units[0].sentences[0].stars, 2, 'stars are untouched (1 mistake from building = 2 stars)');
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: DB });
+  const row = (await pool.query("SELECT arb_done, arb_mistakes, arb_hints, arb_seconds, arb_times, stars FROM sentence_progress WHERE user_id = $1 AND sentence = 'I like green apples'", [lia.id])).rows[0];
+  await pool.end();
+  assert.deepEqual(row, { arb_done: true, arb_mistakes: 2, arb_hints: 1, arb_seconds: 7, arb_times: 2, stars: 2 }, 'first try kept; the resent duplicate is not counted');
+
+  // the teacher's timeline shows it, with mistakes / hints / seconds, and a repeat is marked as practice
+  const events = (await admin('GET', `/users/${lia.id}`)).data.events.filter(e => e.type === 'arbuild_solved');
+  assert.equal(events.length, 3);
+  const firstEv = events.find(e => e.data.sentence === 'I like green apples' && !e.data.replay);
+  assert.deepEqual([firstEv.data.mistakes, firstEv.data.hints, firstEv.data.seconds], [2, 1, 7]);
+  assert.equal(events.filter(e => e.data.replay).length, 1);
+  assert.equal(events.some(e => 'cid' in e.data), false);
+
+  // the unit is NOT finished by this step (grammar and the quiz still decide that), exactly as before
+  const state = Core.modelOf(l);
+  assert.equal(state.units[0].completed, false);
+  assert.equal(state.units[0].grammarReady, true);
+  // the device rule matches
+  const raw = JSON.parse(JSON.stringify(l));
+  raw.units[0].sentences[1].arbDone = false;
+  const stats = { timeSpent: 0, streak: 0 };
+  assert.deepEqual(Core.applyArb(raw, stats, 'She is reading a book', 4, new Date().toISOString()), { first: true });
+  assert.deepEqual(Core.applyArb(raw, stats, 'She is reading a book', 4, new Date().toISOString()), { first: false });
+  assert.equal(Core.applyArb(raw, stats, 'No Arabic here at all', 4, 'x'), null);
+  assert.equal(raw.units[0].sentences[1].arbDone, true);
+  assert.equal(stats.timeSpent, 8);
+
+  // the teacher switches the step off for this lesson: nothing is sent, nothing is accepted; progress is kept
+  const body = (await admin('GET', `/lessons/${lessonId}`)).data.lesson;
+  const off = await admin('PUT', `/lessons/${lessonId}`, { ...body, arStep: false });
+  assert.equal(off.status, 200, JSON.stringify(off.data));
+  assert.equal(off.data.lesson.arStep, false);
+  l = await view();
+  assert.equal(l.units[0].sentences[0].arq, undefined);
+  assert.equal((await arb('I like green apples')).status, 400);
+  // an older file without "arStep" must not switch it back on; saving from the editor with arStep true does
+  const file = (await admin('GET', '/export')).data.lessons.find(x => x.slug === 'arabic-build');
+  assert.equal(file.arStep, false);
+  delete file.arStep;
+  assert.equal((await admin('POST', '/import', { lessons: [file] })).status, 200);
+  assert.equal((await admin('GET', `/lessons/${lessonId}`)).data.lesson.arStep, false);
+  assert.equal((await admin('PUT', `/lessons/${lessonId}`, { ...body, arStep: true })).data.lesson.arStep, true);
+  assert.equal((await view()).units[0].sentences[0].arbDone, true, 'earlier results are still there');
+});
+
+// ---------- Daily review (spaced repetition) ----------
+async function withDb(fn) {
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: DB });
+  try { return await fn(pool); } finally { await pool.end(); }
+}
+const dayOffset = n => `((now() AT TIME ZONE 'UTC')::date + (${n}))`;
+
+test('daily review: hard sentences enter the schedule, come back on the 1, 3, 7, 14, 30 day plan, never touch stars, and count for the streak', { skip }, async () => {
+  const rae = await newStudent('Rae');
+  const made = await admin('POST', '/lessons', { title: 'Review lesson', slug: 'review-lesson', units: [
+    { title: 'A', sentences: ['I like green apples', 'She [is|are|am] reading a book', 'We like red tea', 'They have blue cars', 'He [has|have|having] a small bag'] },
+  ] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const lessonId = made.data.lesson.id;
+  const app = async () => (await rae.as('GET', '/app')).data;
+  const unit = (await app()).lessons.find(l => l.slug === 'review-lesson').units[0];
+  await rae.as('POST', `/lessons/review-lesson/units/${unit.id}/learn`, { index: 4, done: true });
+  const rows = () => withDb(async p => (await p.query(
+    "SELECT sentence, stage, to_char(due_on,'YYYY-MM-DD') AS due, (due_on - (now() AT TIME ZONE 'UTC')::date) AS in_days, weak_count FROM review_items WHERE user_id = $1 ORDER BY sentence", [rae.id])).rows);
+  const sql = (q, a) => withDb(p => p.query(q, a));
+
+  // 1) what makes a sentence weak: mistakes or hints while building. A perfect sentence is not scheduled.
+  assert.equal((await solve(rae, 'review-lesson', 'I like green apples', 1, 0)).status, 200);        // a mistake
+  assert.equal((await solve(rae, 'review-lesson', 'We like red tea', 0, 2)).status, 200);            // hints
+  assert.equal((await solve(rae, 'review-lesson', 'They have blue cars', 0, 0)).status, 200);        // perfect
+  assert.equal((await solve(rae, 'review-lesson', 'She is reading a book', 0, 0)).status, 200);      // perfect build, wrong grammar below
+  assert.equal((await solve(rae, 'review-lesson', 'He has a small bag', 0, 0)).status, 200);         // perfect, a wrong quiz answer later
+  let list = await rows();
+  assert.deepEqual(list.map(x => [x.sentence, x.stage, x.in_days]), [['I like green apples', 0, 1], ['We like red tea', 0, 1]], 'first review tomorrow');
+  // practising again with mistakes is practice only: it does not add a perfect sentence
+  assert.equal((await solve(rae, 'review-lesson', 'They have blue cars', 3, 0)).status, 200);
+  assert.equal((await rows()).length, 2);
+  // a wrong grammar word
+  assert.equal((await rae.as('POST', '/lessons/review-lesson/grammar', { sentence: 'She is reading a book', mistakes: 2, cid: 'g1' })).status, 200);
+  assert.deepEqual((await rows()).map(x => x.sentence), ['I like green apples', 'She is reading a book', 'We like red tea']);
+  // nothing is due yet (tomorrow), so the home screen has no Review card
+  assert.deepEqual((await app()).reviews, []);
+
+  // 2) a wrong quiz answer makes that sentence weak
+  assert.equal((await rae.as('POST', '/lessons/review-lesson/grammar', { sentence: 'He has a small bag', mistakes: 0, cid: 'g2' })).status, 200);
+  const q = await takeQuiz(rae, 'review-lesson', 'unit:' + unit.id, { right: false });
+  assert.equal(q.status, 200, JSON.stringify(q.data));
+  const afterQuiz = (await rows()).map(x => x.sentence);
+  assert.ok(afterQuiz.includes('He has a small bag') && afterQuiz.includes('They have blue cars'), 'sentences answered wrong in the quiz are weak: ' + afterQuiz);
+
+  // 3) due today: shown with the Review card data, most overdue first
+  await sql(`UPDATE review_items SET due_on = ${dayOffset(0)} WHERE user_id = $1 AND sentence = 'We like red tea'`, [rae.id]);
+  await sql(`UPDATE review_items SET due_on = ${dayOffset(-3)} WHERE user_id = $1 AND sentence = 'I like green apples'`, [rae.id]);
+  assert.deepEqual((await app()).reviews, [{ slug: 'review-lesson', sentence: 'I like green apples', stage: 0 }, { slug: 'review-lesson', sentence: 'We like red tea', stage: 0 }]);
+  const starsBefore = (await app()).lessons[0].units[0].sentences.map(x => x.stars);
+
+  // 4) answering: right moves to the next interval, wrong goes back to 1 day, a resent request counts once
+  const answer = (sentence, mistakes = 0, hints = 0, extra = {}) => rae.as('POST', '/review/answer', { slug: 'review-lesson', sentence, kind: 'build', mistakes, hints, seconds: 4, cid: Math.random().toString(36), ...extra });
+  const dayOne = await answer('I like green apples');
+  assert.deepEqual(dayOne.data, { correct: true, stage: 1, nextInDays: 3, early: false });
+  assert.equal((await answer('I like green apples', 0, 0, { cid: 'dup' })).status, 200);
+  assert.equal((await answer('I like green apples', 5, 5, { cid: 'dup' })).data.duplicate, true);
+  assert.deepEqual((await app()).reviews.map(x => x.sentence), ['We like red tea'], 'answered sentences are no longer due today');
+  const wrong = await answer('We like red tea', 0, 1);                                         // a hint = not right
+  assert.deepEqual(wrong.data, { correct: false, stage: 0, nextInDays: 1, early: false });
+  assert.deepEqual((await app()).reviews, []);
+  // answering before it is due and right: nothing moves (it was just reviewed)
+  const early = await answer('I like green apples');
+  assert.deepEqual([early.data.early, early.data.stage], [true, 1]);
+  // ...but a wrong answer even before it is due sends it back to 1 day
+  assert.deepEqual((await answer('I like green apples', 1)).data, { correct: false, stage: 0, nextInDays: 1, early: false });
+
+  // 5) the whole ladder: 1 -> 3 -> 7 -> 14 -> 30 -> finished
+  const ladder = [];
+  for (let i = 0; i < 5; i++) {
+    await sql(`UPDATE review_items SET due_on = ${dayOffset(0)} WHERE user_id = $1 AND sentence = 'I like green apples'`, [rae.id]);
+    const r = await answer('I like green apples');
+    ladder.push([r.data.stage, r.data.nextInDays]);
+  }
+  assert.deepEqual(ladder, [[1, 3], [2, 7], [3, 14], [4, 30], [5, null]]);
+  const finished = (await rows()).find(x => x.sentence === 'I like green apples');
+  assert.deepEqual([finished.stage, finished.due], [5, null], 'finished: no more reviews');
+  // weak again later (a new mistake in a quiz, say) starts the ladder again at 1 day
+  assert.equal((await rae.as('POST', '/lessons/review-lesson/grammar', { sentence: 'She is reading a book', mistakes: 1, cid: 'g3' })).status, 200);
+  await sql(`UPDATE review_items SET stage = 3, due_on = ${dayOffset(14)} WHERE user_id = $1 AND sentence = 'She is reading a book'`, [rae.id]);
+  await solve(rae, 'review-lesson', 'She is reading a book', 0, 0);                              // practice with no mistakes: nothing changes
+  assert.equal((await rows()).find(x => x.sentence === 'She is reading a book').stage, 3);
+  await rae.as('POST', '/lessons/review-lesson/grammar', { sentence: 'She is reading a book', mistakes: 1, cid: 'g4' });
+  assert.equal((await rows()).find(x => x.sentence === 'She is reading a book').stage, 3, 'a repeat grammar answer is practice, not a new weakness');
+
+  // 6) rules for the endpoint
+  assert.equal((await answer('Not in the lesson')).status, 400);
+  assert.equal((await answer('We like red tea', 0, 0, { kind: 'grammar' })).status, 400, 'no gap in that sentence');
+  assert.equal((await rae.as('POST', '/review/answer', { slug: 'nope', sentence: 'x' })).status, 404);
+  assert.equal((await answer('He has a small bag', 0, 0, { kind: 'grammar' })).status, 200, 'a grammar question about a sentence with a gap');
+  assert.equal((await rae.as('POST', '/review/answer', { slug: 'review-lesson', sentence: 'We like red tea', kind: 'build' })).status, 200);
+  await sql('DELETE FROM review_items WHERE user_id = $1', [rae.id]);
+  assert.equal((await answer('We like red tea')).status, 404, 'not in the review list');
+
+  // 7) stars never changed by any of it
+  assert.deepEqual((await app()).lessons[0].units[0].sentences.map(x => x.stars), starsBefore);
+
+  // 8) the teacher sees it in the timeline; a review counts for the day streak
+  const events = (await admin('GET', `/users/${rae.id}`)).data.events.filter(e => e.type === 'review_answered');
+  assert.ok(events.length >= 8);
+  const wrongEv = events.find(e => e.data.sentence === 'We like red tea' && e.data.correct === false);
+  assert.deepEqual([wrongEv.data.kind, wrongEv.data.hints, wrongEv.data.nextInDays], ['build', 1, 1]);
+  assert.ok(events.some(e => e.data.early === true));
+  assert.equal(events.some(e => 'cid' in e.data), false);
+  await sql("DELETE FROM events WHERE user_id = $1 AND type <> 'review_answered'", [rae.id]);
+  assert.equal((await rae.as('GET', '/me')).data.stats.streak, 1, 'a day with only a review still counts');
+  await sql("DELETE FROM events WHERE user_id = $1", [rae.id]);
+  assert.equal((await rae.as('GET', '/me')).data.stats.streak, 0);
+});
+
+test('daily review: only lessons the student can open, and only sentences that still exist', { skip }, async () => {
+  const ivy = await newStudent('Ivy');
+  const made = await admin('POST', '/lessons', { title: 'Hidden review', slug: 'hidden-review', units: [{ title: 'A', sentences: ['The old sentence is here', 'The second sentence stays'] }] });
+  const unit = (await ivy.as('GET', '/app')).data.lessons.find(l => l.slug === 'hidden-review').units[0];
+  await ivy.as('POST', `/lessons/hidden-review/units/${unit.id}/learn`, { index: 1, done: true });
+  await solve(ivy, 'hidden-review', 'The old sentence is here', 2, 0);
+  await solve(ivy, 'hidden-review', 'The second sentence stays', 1, 0);
+  await withDb(p => p.query('UPDATE review_items SET due_on = (now() AT TIME ZONE \'UTC\')::date WHERE user_id = $1', [ivy.id]));
+  const due = async () => (await ivy.as('GET', '/app')).data.reviews.map(x => x.sentence);
+  assert.deepEqual((await due()).sort(), ['The old sentence is here', 'The second sentence stays']);
+  // the teacher rewrites one sentence: its old text is no longer asked
+  const body = (await admin('GET', `/lessons/${made.data.lesson.id}`)).data.lesson;
+  const edit = { ...body, units: [{ ...body.units[0], sentences: [{ en: 'The new sentence is here' }, body.units[0].sentences[1]] }] };
+  assert.equal((await admin('PUT', `/lessons/${made.data.lesson.id}`, edit)).status, 200);
+  assert.deepEqual(await due(), ['The second sentence stays']);
+  // a draft lesson is not offered
+  assert.equal((await admin('PUT', `/lessons/${made.data.lesson.id}`, { ...edit, published: false })).status, 200);
+  assert.deepEqual(await due(), []);
+});
+
+test('daily review: the upgrade adds sentences students already found hard, spread over 7 days, and does it only once', { skip }, async () => {
+  const { migrate } = require('../src/db');
+  const tom = await newStudent('Tom');
+  const sentences = Array.from({ length: 15 }, (_, i) => `Old hard sentence number ${i + 1} here`);
+  const made = await admin('POST', '/lessons', { title: 'Old lesson', slug: 'old-hard-lesson', units: [{ title: 'A', sentences: [...sentences, 'A perfect old sentence', 'A sentence with a wrong quiz answer', 'A grandfathered quiz sentence'] }] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const lid = made.data.lesson.id;
+  await withDb(async p => {
+    for (const [i, s] of sentences.entries()) await p.query(
+      "INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars, last_solved_at) VALUES ($1,$2,$3,$4,$4, now() - ($5 || ' minutes')::interval)", [tom.id, lid, s, 1 + (i % 2), i]);
+    await p.query("INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars) VALUES ($1,$2,'A perfect old sentence',3,3)", [tom.id, lid]);
+    await p.query("INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars) VALUES ($1,$2,'A sentence with a wrong quiz answer',3,3)", [tom.id, lid]);
+    await p.query("INSERT INTO sentence_progress (user_id, lesson_id, sentence, stars, base_stars) VALUES ($1,$2,'A grandfathered quiz sentence',3,3)", [tom.id, lid]);
+    await p.query("INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, details) VALUES ($1,$2,'final',1,2,false,$3::jsonb)",
+      [tom.id, lid, JSON.stringify([{ sentence: 'A sentence with a wrong quiz answer', correct: false }, { sentence: 'A perfect old sentence', correct: true }])]);
+    await p.query("INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, grandfathered, details) VALUES ($1,$2,'unit:x',1,1,true,true,$3::jsonb)",
+      [tom.id, lid, JSON.stringify([{ sentence: 'A grandfathered quiz sentence', correct: false }])]);
+    await p.query('DELETE FROM review_items WHERE user_id = $1', [tom.id]);
+    await p.query("DELETE FROM app_flags WHERE key = 'review_backfill_v1'");
+    await migrate(p); // what happens on the first start after the update
+  });
+  const rows = () => withDb(async p => (await p.query("SELECT sentence, (due_on - (now() AT TIME ZONE 'UTC')::date) AS d FROM review_items WHERE user_id = $1", [tom.id])).rows);
+  let list = await rows();
+  assert.equal(list.length, 16, '15 first tries with mistakes + 1 wrong quiz answer; the perfect and grandfathered ones are not added');
+  assert.ok(!list.some(x => /perfect old|grandfathered/.test(x.sentence)));
+  const perDay = {};
+  for (const x of list) perDay[x.d] = (perDay[x.d] || 0) + 1;
+  assert.deepEqual(Object.keys(perDay).map(Number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7], 'first reviews are spread over the next 7 days, none today');
+  assert.ok(Math.max(...Object.values(perDay)) <= 3, JSON.stringify(perDay));
+  // running the upgrade again (a restart) changes nothing, even after the student's schedule moved
+  await withDb(async p => { await p.query("UPDATE review_items SET stage = 2 WHERE user_id = $1", [tom.id]); await migrate(p); });
+  list = await rows();
+  assert.equal(list.length, 16);
+  assert.equal((await withDb(p => p.query("SELECT COUNT(*)::int AS n FROM review_items WHERE user_id = $1 AND stage = 2", [tom.id]))).rows[0].n, 16);
+});
+
+test('speaking check: the server scores the heard text itself, keeps the best score, and shows it to the teacher', { skip }, async () => {
+  const pia = await newStudent('Pia');
+  const raj = await newStudent('Raj');
+  const made = await admin('POST', '/lessons', { title: 'Speaking lesson', slug: 'speaking-lesson', units: [{ title: 'A', sentences: ['Where is the check-in desk', 'I would like a window seat', 'We like green tea'] }] });
+  assert.equal(made.status, 201, JSON.stringify(made.data));
+  const lessonId = made.data.lesson.id;
+  const speak = (st, sentence, heard, extra = {}) => st.as('POST', '/lessons/speaking-lesson/speak', { sentence, heard, seconds: 6, cid: Math.random().toString(36), ...extra });
+
+  // scored by the server from the text: the phone cannot send a score (an extra "score" or "passed" is ignored)
+  const first = await speak(pia, 'I would like a window seat', ['i would like seat'], { score: 100, passed: true });
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.deepEqual([first.data.score, first.data.passed, first.data.tries], [66, false, 1]);
+  // a later, better check: the best score is kept, tries add up, the text heard is the best one
+  const second = await speak(pia, 'I would like a window seat', ['i would like a window', 'I would like a window seat'], { cid: 'c2' });
+  assert.deepEqual([second.data.score, second.data.passed, second.data.best, second.data.tries], [100, true, 100, 3]);
+  // a worse check later does not lower the best score or replace the best text
+  const third = await speak(pia, 'I would like a window seat', ['window'], { cid: 'c3' });
+  assert.deepEqual([third.data.score, third.data.best, third.data.passed], [16, 100, false], 'this check did not pass; the best score stays');
+  assert.equal((await speak(pia, 'I would like a window seat', ['window'], { cid: 'c3' })).data.duplicate, true, 'a resent request counts once');
+  // at most 3 tries are read, whatever the phone sends
+  const many = await speak(raj, 'Where is the check-in desk', ['where desk', 'is the', 'check in', 'where is the check in desk'], { cid: 'm1' });
+  assert.deepEqual([many.data.score, many.data.tries, many.data.passed], [33, 3, false], 'only the first 3 tries are read (the perfect 4th is ignored)');
+  await speak(raj, 'We like green tea', ['we like green tea']);
+
+  // rules
+  assert.equal((await speak(pia, 'Not in the lesson', ['hello'])).status, 400);
+  assert.equal((await speak(pia, 'We like green tea', [])).status, 400, 'nothing heard');
+  assert.equal((await speak(pia, 'We like green tea', 'we like green tea')).status, 400, 'heard must be a list');
+  assert.equal((await speak(pia, 'We like green tea', [5, null, {}])).status, 400, 'no text at all');
+  assert.equal((await pia.as('POST', '/lessons/nope/speak', { sentence: 'x', heard: ['x'] })).status, 404);
+
+  // the teacher sees every check in the timeline, with what was heard
+  const events = (await admin('GET', `/users/${pia.id}`)).data.events.filter(e => e.type === 'speak_checked');
+  assert.equal(events.length, 3);
+  const e1 = events.find(e => e.data.score === 66);
+  assert.deepEqual([e1.data.sentence, e1.data.heard, e1.data.tries, e1.data.passed, e1.data.seconds], ['I would like a window seat', 'i would like seat', 1, false, 6]);
+  assert.equal(events.some(e => 'cid' in e.data), false);
+  // ...a summary on the student's card (lowest first)...
+  const card = (await admin('GET', `/users/${pia.id}`)).data.speaking;
+  assert.deepEqual([card.count, card.average], [1, 100]);
+  assert.deepEqual([card.lowest[0].sentence, card.lowest[0].score, card.lowest[0].tries, card.lowest[0].heard, card.lowest[0].passed], ['I would like a window seat', 100, 4, 'I would like a window seat', true], 'passed once = passed');
+  // ...and "hardest to say" on the lesson's progress page: lowest average best score first
+  const hard = (await admin('GET', `/lessons/${lessonId}/speaking`)).data.sentences;
+  assert.deepEqual(hard.map(x => [x.sentence, x.avgScore, x.students, x.notPassed]),
+    [['Where is the check-in desk', 33, 1, 1], ['I would like a window seat', 100, 1, 0], ['We like green tea', 100, 1, 0]]);
+  assert.equal((await admin('GET', '/lessons/nope/speaking')).status, 404);
+  // no effect on progress: nothing was built, no stars
+  const lesson = (await pia.as('GET', '/app')).data.lessons.find(l => l.slug === 'speaking-lesson');
+  assert.equal(lesson.units[0].sentences.every(s => s.stars === 0), true);
+  assert.equal((await pia.as('GET', '/me')).data.stats.streak, 0, 'speaking alone is not a finished sentence');
+});
+
+test('word meanings: kept per lesson, matched without caring about case or punctuation, shown to every student, kept by imports', { skip }, async () => {
+  const wen = await newStudent('Wen');
+  const made = await admin('POST', '/lessons', { title: 'Words lesson', slug: 'words-lesson',
+    words: { Airport: ' مطار ', 'Check-in.': 'تسجيل الوصول', 'Not here': 'ليست هنا' },
+    units: [{ title: 'A', sentences: ['Where is the airport?', 'The check-in desk is open'] }] });
+  assert.equal(made.status, 400, 'two words in one key is refused');
+  assert.match(made.data.error, /not a single word/);
+  const ok = await admin('POST', '/lessons', { title: 'Words lesson', slug: 'words-lesson',
+    words: { Airport: ' مطار ', 'Check-in.': 'تسجيل الوصول', Hotel: 'فندق' },
+    units: [{ title: 'A', sentences: ['Where is the airport?', 'The check-in desk is open'] }] });
+  assert.equal(ok.status, 201, JSON.stringify(ok.data));
+  const lessonId = ok.data.lesson.id;
+
+  // stored with plain keys; the editor gets them back
+  const full = (await admin('GET', `/lessons/${lessonId}`)).data.lesson;
+  assert.deepEqual(full.words, { airport: 'مطار', 'check-in': 'تسجيل الوصول', hotel: 'فندق' });
+  assert.equal(full.wordsCount, 3);
+
+  // every student gets the meanings of the words that are in the lesson, although their Arabic switch for the cards is off
+  const mine = async () => (await wen.as('GET', '/app')).data.lessons.find(l => l.slug === 'words-lesson');
+  let l = await mine();
+  assert.deepEqual(l.words, { airport: 'مطار', 'check-in': 'تسجيل الوصول' }, '"hotel" is not in any sentence, so it is not sent');
+  assert.equal(l.units[0].sentences[0].ar, undefined);
+  assert.equal(l.units[0].sentences[0].arq, undefined);
+  // lessons without a list have no "words" at all (older lessons look the same)
+  const plain = await admin('POST', '/lessons', lessonBody('No words here'));
+  assert.equal((await wen.as('GET', '/app')).data.lessons.find(x => x.slug === plain.data.lesson.slug).words, undefined);
+
+  // the list is checked
+  const base = (await admin('GET', `/lessons/${lessonId}`)).data.lesson;
+  for (const [words, re] of [[{ airport: 'airport' }, /Arabic/], [{ airport: '' }, /empty/], [{ 'two words': 'مطار' }, /single word/], [{ Airport: 'مطار', 'airport.': 'مطار' }, /twice/], [[], /object/]]) {
+    const bad = await admin('PUT', `/lessons/${lessonId}`, { ...base, words });
+    assert.equal(bad.status, 400, JSON.stringify(words));
+    assert.match(bad.data.error, re);
+  }
+  assert.deepEqual((await admin('GET', `/lessons/${lessonId}`)).data.lesson.words, base.words, 'nothing was saved');
+
+  // export -> import round trip keeps the words; an older file with no "words" keeps them; "words": {} clears them
+  const exported = (await admin('GET', '/export')).data.lessons.find(x => x.slug === 'words-lesson');
+  assert.deepEqual(exported.words, base.words);
+  assert.equal((await admin('POST', '/import', { lessons: [{ ...exported, slug: 'words-lesson-copy', title: 'Words copy' }] })).status, 200);
+  const copyId = (await admin('GET', '/lessons')).data.lessons.find(x => x.slug === 'words-lesson-copy').id;
+  assert.deepEqual((await admin('GET', `/lessons/${copyId}`)).data.lesson.words, base.words);
+  const older = { title: 'Words lesson', slug: 'words-lesson', units: [{ title: 'A', sentences: ['Where is the airport?', 'The check-in desk is open'] }] };
+  assert.equal((await admin('POST', '/import', { lessons: [older] })).status, 200);
+  assert.deepEqual((await admin('GET', `/lessons/${lessonId}`)).data.lesson.words, base.words, 'an older file does not erase the list');
+  assert.equal((await admin('PUT', `/lessons/${lessonId}`, { ...base, words: undefined })).status, 200);
+  assert.deepEqual((await admin('GET', `/lessons/${lessonId}`)).data.lesson.words, base.words);
+  assert.equal((await admin('POST', '/import', { lessons: [{ ...older, words: {} }] })).status, 200);
+  assert.deepEqual((await admin('GET', `/lessons/${lessonId}`)).data.lesson.words, {}, 'an explicit empty list clears it');
+});
+
+test('word meanings: download the words without meaning, give them to an AI, paste the answer back (same safety checks as the Arabic)', { skip }, async () => {
+  const one = await admin('POST', '/lessons', { title: 'Flow words one', slug: 'flow-words-one', words: { zebra: 'حمار وحشي' }, units: [{ title: 'A', sentences: ['The Zebra is at the market.', 'A zebra likes quiet gardens'] }] });
+  const two = await admin('POST', '/lessons', { title: 'Flow words two', slug: 'flow-words-two', units: [{ title: 'A', sentences: ['Zebra gardens are quiet'] }] });
+  assert.equal(one.status, 201); assert.equal(two.status, 201);
+  const wordsOf = async l => (await admin('GET', `/lessons/${l.data.lesson.id}`)).data.lesson.words;
+  const unitsBefore = JSON.stringify((await admin('GET', `/lessons/${two.data.lesson.id}`)).data.lesson.units);
+
+  // what the teacher downloads: different words once each (any case), no tiny words, with an example; words that already have a meaning are left out
+  const mine = list => list.filter(x => ['zebra', 'market', 'quiet', 'gardens', 'likes', 'the', 'is', 'at', 'a'].includes(x.word));
+  let ex = (await admin('GET', '/words/export?size=500')).data;
+  assert.match(ex.instructions, /Do NOT change any "word"/);
+  assert.ok(ex.words.every(x => x.ar === '' && typeof x.word === 'string' && typeof x.example === 'string'));
+  assert.equal(new Set(ex.words.map(x => x.word)).size, ex.words.length, 'each word once');
+  assert.deepEqual(mine(ex.words).map(x => x.word).sort(), ['gardens', 'likes', 'market', 'quiet', 'zebra'].sort(), 'zebra is missing in lesson two; tiny words are skipped');
+  assert.equal(ex.words.find(x => x.word === 'market').example, 'The Zebra is at the market.');
+  assert.equal(ex.words.find(x => x.word === 'quiet').word, 'quiet', 'lower case, no punctuation');
+  assert.equal((await admin('GET', '/words/export?size=2')).data.words.length, 2, 'a batch at a time');
+  assert.equal((await admin('GET', '/words/export?size=2')).data.wordsLeft, ex.wordsLeft);
+  const st0 = (await admin('GET', '/words/status')).data;
+  assert.match(st0.prompt, /Modern Standard Arabic/);
+  const l1 = st0.lessons.find(x => x.id === one.data.lesson.id), l2 = st0.lessons.find(x => x.id === two.data.lesson.id);
+  assert.deepEqual([l1.total, l1.ready, l2.total, l2.ready], [5, 1, 3, 0]);
+
+  // the AI's answer: a word it changed does not match, English text is refused, nothing outside the words changes
+  const imp = await admin('POST', '/words/import', { data: { words: [
+    { word: 'Zebra', ar: 'حمار وحشي', example: 'ignored' },                 // capital letter: still the word "zebra"; lesson one already has it, lesson two gets it
+    { word: 'market', ar: 'سوق' },
+    { word: 'quiet', ar: 'quiet' },                                       // not Arabic: refused
+    { word: 'zebras', ar: 'حمر وحشية' },                                   // not a word of any lesson (did the AI change it?): reported, not added
+    { word: 'gardens', ar: 'حدائق' },
+  ] } });
+  assert.equal(imp.status, 200, JSON.stringify(imp.data));
+  assert.deepEqual([imp.data.updated, imp.data.unchanged, imp.data.rejected, imp.data.notFound], [4, 1, 1, 1]); // zebra(two) + market(one) + gardens(one, two)
+  assert.deepEqual(imp.data.notFoundExamples, ['zebras']);
+  assert.deepEqual(imp.data.rejectedExamples, ['quiet']);
+  assert.deepEqual(await wordsOf(one), { zebra: 'حمار وحشي', market: 'سوق', gardens: 'حدائق' });
+  assert.deepEqual(await wordsOf(two), { zebra: 'حمار وحشي', gardens: 'حدائق' }, 'only words that are in that lesson');
+  assert.equal(JSON.stringify((await admin('GET', `/lessons/${two.data.lesson.id}`)).data.lesson.units), unitsBefore, 'sentences and units are untouched');
+
+  // existing meanings are kept unless the teacher asks to replace them; a map and a lessons file work too
+  const keep = await admin('POST', '/words/import', { data: { market: 'سوق آخر', quiet: 'هادئ' } });
+  assert.deepEqual([keep.data.updated, keep.data.unchanged], [2, 1]); // market is kept (already there); "quiet" is new in lesson one and in lesson two
+  assert.equal((await wordsOf(one)).market, 'سوق');
+  const repl = await admin('POST', '/words/import', { replace: true, data: { lessons: [{ title: 'x', words: { market: 'سوق آخر' } }] } });
+  assert.equal(repl.data.updated, 1);
+  assert.equal((await wordsOf(one)).market, 'سوق آخر');
+  assert.equal((await admin('POST', '/words/import', { data: [] })).status, 400);
+  assert.equal((await admin('POST', '/words/import', { data: [{ word: 'x' }] })).status, 400);
+
+  // everything is ready now except the words nobody has given a meaning yet; the downloaded list gets shorter
+  const ex2 = (await admin('GET', '/words/export?size=500')).data;
+  assert.deepEqual(mine(ex2.words).map(x => x.word), ['likes']);
+  const all = (await admin('GET', '/words/export?all=1&size=500')).data.words;
+  assert.equal(all.find(x => x.word === 'market').ar, 'سوق آخر', 'all=1 also lists words that have a meaning');
+});

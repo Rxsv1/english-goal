@@ -73,3 +73,41 @@ test('suggested gaps are always valid lines and only use the safe word families'
     assert.equal(parsed.en, s);
   }
 });
+
+test('"?? reason" after a gap becomes gap.why, and goes back to the same line', () => {
+  const r = G.parseLine('She [is|are|am] reading. ?? We use "is" with she.');
+  assert.equal(r.error, undefined);
+  assert.equal(r.en, 'She is reading.');
+  assert.deepEqual(r.gap, { index: 1, answer: 'is', options: ['is', 'are', 'am'], why: 'We use "is" with she.' });
+  assert.equal(G.toLine({ en: r.en, gap: r.gap }), 'She [is|are|am] reading. ?? We use "is" with she.');
+  // no reason: nothing changes (older lessons and lines behave exactly as before)
+  assert.deepEqual(G.parseLine('She [is|are|am] reading.').gap, { index: 1, answer: 'is', options: ['is', 'are', 'am'] });
+  // the reason may use brackets or bars without confusing the gap
+  assert.equal(G.parseLine('She [is] reading ?? Use [is] with "she" | not are').gap.why, 'Use [is] with "she" | not are');
+});
+
+test('a reason needs a gap, has a length limit, and works together with the Arabic', () => {
+  assert.match(G.parseLine('She is reading ?? why').error, /needs a grammar gap/);
+  assert.match(G.parseLine('She [is] reading ?? ' + 'x'.repeat(141)).error, /140 characters/);
+  assert.match(G.parseLine('She [is] reading ?? a // b').error, /cannot contain \/\//);
+  // "?? reason // الترجمة" and "// الترجمة ?? reason" both give the same two parts
+  for (const line of ['She [is] reading ?? We use is. // هي تقرأ', 'She [is] reading // هي تقرأ ?? We use is.']) {
+    const { text, ar } = G.splitAr(line);
+    assert.equal(ar, 'هي تقرأ');
+    assert.equal(G.parseLine(text).gap.why, 'We use is.');
+  }
+  assert.equal(G.toLine({ en: 'She is reading', gap: { index: 1, answer: 'is', options: ['is', 'are', 'am'], why: 'Because.' }, ar: 'هي تقرأ' }),
+    'She [is|are|am] reading ?? Because. // هي تقرأ');
+  // a normal Arabic line without a reason is untouched
+  assert.deepEqual(G.splitAr('She is reading // هي تقرأ'), { text: 'She is reading', ar: 'هي تقرأ' });
+});
+
+test('"why" sent as data (JSON import) is checked', () => {
+  const gap = why => ({ index: 1, answer: 'is', options: ['is', 'are', 'am'], ...(why === undefined ? {} : { why }) });
+  assert.deepEqual(G.checkGap(gap('Because she is one person.'), 'She is reading').gap.why, 'Because she is one person.');
+  assert.equal(G.checkGap(gap(''), 'She is reading').gap.why, undefined, 'an empty reason is simply left out');
+  assert.equal(G.checkGap(gap('  a   b '), 'She is reading').gap.why, 'a b');
+  assert.match(G.checkGap(gap(5), 'She is reading').error, /must be text/);
+  assert.match(G.checkGap(gap('x'.repeat(141)), 'She is reading').error, /140/);
+  assert.equal(G.checkGap(gap(undefined), 'She is reading').gap.why, undefined);
+});

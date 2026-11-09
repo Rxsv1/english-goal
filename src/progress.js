@@ -61,6 +61,9 @@ function groupGrammar(rows, key = 'lesson_id') {
 /** SQL expression for the extra stars of a sentence_progress row. */
 const EXTRA_SQL = 'GREATEST(stars - COALESCE(base_stars, stars), 0)';
 
+/** Event types that count for the day streak: building, grammar, the Arabic -> English step and daily review sessions. */
+const STREAK_TYPES_SQL = "('sentence_solved','grammar_solved','arbuild_solved','review_answered')";
+
 /** Consecutive days (UTC) with activity, ending today or yesterday. `days` = sorted list of 'YYYY-MM-DD' desc. */
 function streak(days) {
   if (!days.length) return 0;
@@ -80,4 +83,4 @@ function streak(days) {
 const VISIBLE_SQL = `l.published AND (l.visibility = 'public' OR EXISTS (
   SELECT 1 FROM lesson_assignments a WHERE a.lesson_id = l.id AND a.user_id = $1))`;
 
-module.exports = { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, EXTRA_SQL, VISIBLE_SQL };
+module.exports = { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL, VISIBLE_SQL };

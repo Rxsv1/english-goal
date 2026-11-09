@@ -152,6 +152,52 @@ async function migrate(pool) {
 
       -- Arabic translation on the cards: the teacher switches it on for each student (off for everyone by default).
       ALTER TABLE users ADD COLUMN IF NOT EXISTS arabic_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+      -- Arabic -> build the English: an optional step after Build. The teacher can switch it off for each lesson (ar_step), and the result
+      -- of the first try (mistakes, hints, seconds) is kept for the teacher. It never changes stars and is not needed to finish a unit.
+      ALTER TABLE lessons ADD COLUMN IF NOT EXISTS ar_step BOOLEAN NOT NULL DEFAULT TRUE;
+
+      -- Word meanings ("tap a word to see its meaning"): { "airport": "مطار" } for each lesson, keys are lower case words without punctuation.
+      ALTER TABLE lessons ADD COLUMN IF NOT EXISTS words JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_done     BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_mistakes INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_hints    INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_seconds  INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_times    INTEGER NOT NULL DEFAULT 0;
+
+      -- Daily review (spaced repetition): one row for each sentence a student found hard. stage 0..4 = waiting for the 1, 3, 7, 14, 30 day
+      -- review; stage 5 (due_on NULL) = went through every interval. due_on is a UTC date. Reviews never touch sentence_progress stars.
+      CREATE TABLE IF NOT EXISTS review_items (
+        user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id        TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        sentence         TEXT NOT NULL,
+        stage            INTEGER NOT NULL DEFAULT 0,
+        due_on           DATE,
+        weak_count       INTEGER NOT NULL DEFAULT 1,
+        review_count     INTEGER NOT NULL DEFAULT 0,
+        wrong_count      INTEGER NOT NULL DEFAULT 0,
+        last_reviewed_at TIMESTAMPTZ,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, lesson_id, sentence)
+      );
+      CREATE INDEX IF NOT EXISTS review_items_due ON review_items(user_id, due_on);
+
+      -- Speaking check on the learning cards: the student says the sentence and the phone's speech recognition sends back the TEXT it heard (never audio).
+      -- The server scores it (public/speak-core.js). One row per student and sentence: the best score ever, how many tries in all, and the last text heard.
+      CREATE TABLE IF NOT EXISTS speaking_scores (
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id  TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        sentence   TEXT NOT NULL,
+        best_score INTEGER NOT NULL DEFAULT 0,
+        last_score INTEGER NOT NULL DEFAULT 0,
+        tries      INTEGER NOT NULL DEFAULT 0,
+        checks     INTEGER NOT NULL DEFAULT 1,
+        passed     BOOLEAN NOT NULL DEFAULT FALSE,
+        heard      TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, lesson_id, sentence)
+      );
     `);
 
     // Upgrade (once): quizzes became a required step. Whatever a student had already finished before that keeps its credit,
@@ -192,6 +238,28 @@ async function migrate(pool) {
       }
       await client.query("INSERT INTO app_flags (key) VALUES ('quiz_credit_v1') ON CONFLICT DO NOTHING");
       if (credited) console.log(`[db] Quizzes: gave credit for ${credited} units/lessons finished before quizzes existed`);
+    }
+
+    // Upgrade (once): sentences students already found hard before reviews existed (a first try with mistakes or hints, a wrong grammar word, a wrong
+    // quiz answer) enter the review schedule. Their first review is spread over the next 7 days (a student with 40 hard sentences gets about 6 a day,
+    // not 40 on the first morning).
+    const reviewFlag = await client.query("SELECT 1 FROM app_flags WHERE key = 'review_backfill_v1'");
+    if (!reviewFlag.rowCount) {
+      const r = await client.query(`
+        INSERT INTO review_items (user_id, lesson_id, sentence, stage, due_on)
+        SELECT user_id, lesson_id, sentence, 0, (now() AT TIME ZONE 'UTC')::date + 1 + ((rn - 1) % 7)::int
+        FROM (
+          SELECT sp.user_id, sp.lesson_id, sp.sentence,
+                 row_number() OVER (PARTITION BY sp.user_id ORDER BY sp.last_solved_at DESC, sp.sentence) AS rn
+          FROM sentence_progress sp
+          WHERE sp.stars < 3 OR sp.grammar_mistakes > 0 OR EXISTS (
+            SELECT 1 FROM quiz_attempts a, jsonb_array_elements(a.details) d
+            WHERE a.user_id = sp.user_id AND a.lesson_id = sp.lesson_id AND NOT a.grandfathered
+              AND d->>'sentence' = sp.sentence AND d->>'correct' = 'false')
+        ) t
+        ON CONFLICT DO NOTHING`);
+      await client.query("INSERT INTO app_flags (key) VALUES ('review_backfill_v1') ON CONFLICT DO NOTHING");
+      if (r.rowCount) console.log(`[db] Reviews: ${r.rowCount} hard sentences were added to the students' review schedules`);
     }
 
     // Upgrade: lessons made before units existed become a single unit, keeping students' card progress.
