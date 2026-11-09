@@ -85,6 +85,9 @@ before(async () => {
     await new Promise(r => setTimeout(r, 250));
   }
   adminToken = (await call('POST', '/api/admin/login', { password: 'admin-pass' })).data.token;
+  // Lessons open one by one is ON by default; the older tests below use fresh students on any public lesson, so it is switched off here and
+  // the lock tests at the end of this file switch it on again.
+  await call('PUT', '/api/admin/lock', { on: false }, { token: adminToken });
 });
 
 after(() => { if (server) server.kill(); });
@@ -1251,4 +1254,78 @@ test('word meanings: download the words without meaning, give them to an AI, pas
   assert.deepEqual(mine(ex2.words).map(x => x.word), ['likes']);
   const all = (await admin('GET', '/words/export?all=1&size=500')).data.words;
   assert.equal(all.find(x => x.word === 'market').ar, 'سوق آخر', 'all=1 also lists words that have a meaning');
+});
+
+test('lessons open one by one: by level, then order; private lessons and lessons already started stay open; the teacher can switch it off', { skip }, async () => {
+  const { Pool } = require('pg');
+  const Core = require('../public/progress-core.js');
+  // a clean set of lessons (the earlier tests and the starter lessons are removed so the chain is exactly ours)
+  for (const l of (await admin('GET', '/lessons')).data.lessons) await admin('DELETE', `/lessons/${l.id}`);
+  const mk = async (title, level, extra = {}) => {
+    const r = await admin('POST', '/lessons', { title, slug: title.toLowerCase().replace(/ /g, '-'), level, units: [{ title: 'U', sentences: [`${title} first sentence`, `${title} second sentence`] }], ...extra });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    return r.data.lesson;
+  };
+  const one = await mk('Lock one', 'A1'), b1 = await mk('Lock b one', 'B1'), two = await mk('Lock two', 'A1'), a2 = await mk('Lock a two', 'A2');
+  // chain by level, then page order: lock-one, lock-two, lock-a-two, lock-b-one
+  assert.equal((await admin('PUT', '/lock', { on: true })).status, 200);
+  assert.equal((await admin('GET', '/lock')).data.on, true);
+  const ana = await newStudent('Ana');
+  const priv = await admin('POST', `/users/${ana.id}/lessons`, { title: 'Lock private', units: [{ title: 'U', sentences: ['Private lesson sentence one', 'Private lesson sentence two'] }] });
+  assert.equal(priv.status, 201);
+  const open = async slug => (await ana.as('GET', `/lessons/${slug}`)).status;
+
+  assert.deepEqual(await Promise.all(['lock-one', 'lock-two', 'lock-a-two', 'lock-b-one', priv.data.lesson.slug].map(open)), [200, 403, 403, 403, 200]);
+  const closed = await ana.as('GET', '/lessons/lock-two');
+  assert.match(closed.data.error, /Finish “Lock one” first/);
+  assert.equal((await ana.as('GET', '/lessons/lock-b-one')).data.error.includes('Lock a two'), true, 'level B1 waits for the A2 lesson, whatever the page order');
+  // every way in is shut, not only reading
+  const twoUnit = (await admin('GET', `/lessons/${two.id}`)).data.lesson.units[0];
+  assert.equal((await ana.as('POST', `/lessons/lock-two/units/${twoUnit.id}/learn`, { index: 0 })).status, 403);
+  assert.equal((await solve(ana, 'lock-two', 'Lock two first sentence')).status, 403);
+  assert.equal((await ana.as('POST', '/lessons/lock-two/speak', { sentence: 'Lock two first sentence', heard: ['x'] })).status, 403);
+  assert.equal((await ana.as('POST', '/lessons/lock-two/restart', {})).status, 403);
+  // the app gets the setting and works out the same closed lessons with the shared rule
+  const data = (await ana.as('GET', '/app')).data;
+  assert.equal(data.lock, true);
+  const locksOf = d => { const lp = new Map(); return Core.lessonLocks(d.lessons.map(l => ({ slug: l.slug, title: l.title, level: l.level, assigned: l.assigned, started: Boolean(l.lp) || l.unitRows.length > 0, completed: Boolean(l.lp && l.lp.completed_at) }))); };
+  const closedByApp = d => [...locksOf(d)].filter(([, v]) => v.locked).map(([k]) => k).sort();
+  assert.deepEqual(closedByApp(data), ['lock-a-two', 'lock-b-one', 'lock-two']);
+
+  // pass the quiz of the first lesson (one unit: its quiz is the lesson's quiz) -> the next one opens, the rest stay closed
+  const oneUnit = (await ana.as('GET', '/app')).data.lessons.find(l => l.slug === 'lock-one').units[0];
+  await ana.as('POST', `/lessons/lock-one/units/${oneUnit.id}/learn`, { index: 1, done: true });
+  for (const sn of oneUnit.sentences) assert.equal((await solve(ana, 'lock-one', sn.en)).status, 200);
+  assert.deepEqual(await Promise.all(['lock-two', 'lock-a-two'].map(open)), [403, 403], 'built is not enough: the quiz must be passed');
+  const failed = await takeQuiz(ana, 'lock-one', 'unit:' + oneUnit.id, { right: false });
+  assert.equal(failed.data.passed, false);
+  assert.equal(await open('lock-two'), 403, 'a failed quiz does not open the next lesson');
+  const passed = await takeQuiz(ana, 'lock-one', 'unit:' + oneUnit.id, { right: true });
+  assert.equal(passed.data.passed, true);
+  assert.deepEqual(await Promise.all(['lock-two', 'lock-a-two', 'lock-b-one'].map(open)), [200, 403, 403]);
+  assert.match((await ana.as('GET', '/lessons/lock-a-two')).data.error, /Finish “Lock two” first/);
+  assert.deepEqual(closedByApp((await ana.as('GET', '/app')).data), ['lock-a-two', 'lock-b-one'], 'the app agrees with the server');
+
+  // a student who already started a later lesson before the rule existed keeps it (and the one in between stays closed)
+  const old = await newStudent('Olga');
+  const pool = new Pool({ connectionString: DB });
+  await pool.query('INSERT INTO lesson_progress (user_id, lesson_id) VALUES ($1,$2)', [old.id, a2.id]);
+  await pool.query('INSERT INTO lesson_progress (user_id, lesson_id, completed_at) VALUES ($1,$2, now())', [old.id, b1.id]);
+  const oldOpen = async slug => (await old.as('GET', `/lessons/${slug}`)).status;
+  assert.deepEqual(await Promise.all(['lock-one', 'lock-two', 'lock-a-two', 'lock-b-one'].map(oldOpen)), [200, 403, 200, 200]);
+  assert.deepEqual(closedByApp((await old.as('GET', '/app')).data), ['lock-two']);
+
+  // reviews of earlier work are never blocked by the rule
+  await pool.query("INSERT INTO review_items (user_id, lesson_id, sentence, stage, due_on) VALUES ($1,$2,'Lock two first sentence',0,(now() AT TIME ZONE 'UTC')::date)", [ana.id, two.id]);
+  assert.equal((await ana.as('POST', '/review/answer', { slug: 'lock-two', sentence: 'Lock two first sentence', kind: 'build', mistakes: 0, hints: 0 })).status, 200);
+  await pool.end();
+
+  // the teacher switches it off: every lesson is open and the app is told; on again: closed again
+  assert.equal((await admin('PUT', '/lock', { on: false })).data.on, false);
+  assert.deepEqual(await Promise.all(['lock-two', 'lock-a-two', 'lock-b-one'].map(open)), [200, 200, 200]);
+  const dataOff = (await ana.as('GET', '/app')).data;
+  assert.equal(dataOff.lock, false);
+  await admin('PUT', '/lock', { on: true });
+  assert.deepEqual(await Promise.all(['lock-a-two', 'lock-b-one'].map(open)), [403, 403]);
+  await admin('PUT', '/lock', { on: false });
 });

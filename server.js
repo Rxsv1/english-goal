@@ -135,6 +135,7 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'File is too large (max 1 MB).' });
   // Bad requests (for example a malformed URL) are the caller's mistake, not a server failure.
+  if (err.publicMessage) return res.status(err.status || 400).json({ error: err.publicMessage });
   if (err.status >= 400 && err.status < 500) return res.status(err.status).json({ error: 'Bad request.' });
   console.error(err);
   res.status(500).json({ error: 'Something went wrong on the server.' });

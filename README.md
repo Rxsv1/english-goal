@@ -70,6 +70,18 @@ In JSON: `"units": [{ "title": "...", "tip": "...", "tipAr": "...", "sentences":
 Export writes them, import reads them. An older file with **no** `tip` key does not erase the tips already written for a unit with the same title
 (write `"tip": ""` to remove one on purpose).
 
+### Lessons open one by one (teacher)
+
+Lessons for everybody are **closed until the student passes the quiz of the lesson before it**. The order is **by level (A1, A2, B1 …) and then the order on the Lessons page** (drag ☰ to change it).
+
+- **Opening:** the first lesson is open. When a student finishes a lesson (every unit built, grammar answered and its quizzes passed, including the final quiz of a longer lesson), the next one in the order opens at once.
+  "Next lesson" on the celebration screen goes to the next open one. On the home screen the lessons are shown in this order; a closed one shows a 🔒 and "Pass the quiz of “…” to open".
+- **Not part of the rule:** **private lessons** (🔒 selected students, or made from a student's card) are always open and are not in the chain. Drafts are not in it either.
+- **Older progress keeps working:** a lesson a student has already started or finished is never closed by this rule.
+- **Enforced on the server:** a closed lesson cannot be opened, built, quizzed or spoken into, not even by typing its link (the server answers "Finish “…” first to open this lesson."). Daily reviews of earlier work are never blocked.
+- **Teacher switch:** on the Lessons page, **🔒 Lessons open one by one** (on by default). Switch it off to open every lesson; switch it on again and the rule applies again. To let one student skip ahead, give them a private lesson or switch the rule off.
+- Technical: `lessonLocks()` in `public/progress-core.js` (the same code in the app and on the server); the switch is the flag `lessons_open_all` in `app_flags`; `GET /api/app` returns `lock`.
+
 ### Arabic → build the English (optional step)
 
 After **Build** and before **Grammar**, a unit can offer one more step for the sentences that have Arabic: the student sees **only the Arabic** and builds
@@ -120,7 +132,7 @@ student starts it over), and the next sentence stays locked until the sentence i
 - **Up to 3 tries**, then the button becomes **Continue anyway**. A try where nothing was heard (or the student stopped) does not use up a try.
 - **The microphone is asked for only when the student first taps 🎤** (never on page load). If the permission is refused, or speech recognition does not work (for example no
   network for the recognition service, or Siri dictation is off on an iPhone), the old "I said it out loud" button is used from then on, with a short message.
-  While the microphone listens, the Listen and Slowly buttons are switched off so the phone does not hear its own voice. It stops by itself after 9 seconds.
+  While the microphone listens, the Listen and Slowly buttons are switched off so the phone does not hear its own voice. **The microphone is only on after a tap and while the student speaks:** it closes the moment speech stops or a result arrives, after 6 seconds at most, when the student taps the button again, when the app goes to the background, and when the card or page is left.
 - **Only text is sent, never audio.** After the sentence is passed (or the 3rd try is used) the phone sends the text of each try; **the server scores it again with the same
   `speak-core.js`**, so a score cannot be made up by the phone. It keeps, for each student and sentence: the best score ever, the number of tries, whether it was ever passed, and the best
   text heard (table `speaking_scores`). Saving works offline like everything else. It never changes progress, stars or the streak.
@@ -206,6 +218,7 @@ Upgrading is automatic: on start the app adds any new tables, turns older lesson
 
 **After updating to this version** (nothing is required, but this is what happens and what a teacher may want to do):
 - New columns/tables are added on the first start (`lessons.ar_step`, `lessons.words`, `sentence_progress.arb_*`, `review_items`, `speaking_scores`). Nothing is removed or changed, and no one's stars, units, quizzes or lesson completion change.
+- **Lessons open one by one is ON** from the first start: students see unstarted lessons as closed until they pass the quiz of the lesson before it (lessons already started stay open). Switch it off on the Lessons page if you do not want it yet.
 - **Daily review:** on that first start, sentences students already found hard are added to their review schedules, with the first reviews **spread over the next 7 days**. Students will see a **🧠 Review (N)** card from tomorrow.
 - **Arabic → English step:** it appears after Build for every sentence that already has Arabic (it is optional for students). To stop it for a lesson, untick **Arabic → English step** in that lesson's editor.
 - **Grammar tips, "why", word meanings:** nothing shows until the teacher writes them (lesson editor, JSON, or the *Word meanings* download for the AI on the Lessons page).
@@ -391,6 +404,7 @@ test/grammar.test.js    Grammar-gap parsing tests, including tips/"why" (no data
 test/review.test.js     Review schedule rules (no database needed)
 test/speak.test.js      Speaking check scoring (no database needed)
 test/words.test.js      Word meaning matching and checks (no database needed)
+test/locks.test.js      Lesson order rule (no database needed)
 src/seed.js             6 starter lessons (only added to an empty database)
 public/progress-core.js Scoring rules shared by the server and the browser
 public/review-core.js   Review schedule (1, 3, 7, 14, 30 days) shared by the server and the browser

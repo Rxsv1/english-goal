@@ -318,6 +318,7 @@
         stats: { sentencesSolved: toNum(st.sentencesSolved), stars: toNum(st.stars), extraStars: toNum(st.extraStars),
           lessonsCompleted: toNum(st.lessonsCompleted), timeSpent: toNum(st.timeSpent), streak: toNum(st.streak) },
         lessons,
+        lock: d.lock !== false, // lessons open one by one (the teacher can switch it off)
         // the sentences due for review today: { slug, sentence, stage }
         reviews: (Array.isArray(d.reviews) ? d.reviews : []).filter(x => isObj(x) && typeof x.slug === 'string' && typeof x.sentence === 'string')
           .slice(0, 200).map(x => ({ slug: x.slug, sentence: x.sentence, stage: clampNum(x.stage, 0, 5) })),
@@ -362,10 +363,22 @@
   const rawLesson = slug => bySlug.get(slug) || null;
   const modelOf = raw => { let m = models.get(raw); if (!m) models.set(raw, m = Progress.modelOf(raw)); return m; };
 
-  const lessonList = () => S.lessons.map(l => ({
-    slug: l.slug, title: l.title, level: l.level, description: l.description, emoji: l.emoji, assigned: l.assigned,
-    count: l.units.reduce((a, u) => a + u.sentences.length, 0), progress: modelOf(l),
-  }));
+  // Lessons open one by one: the same rule as the server (lessonLocks in progress-core.js). Level (A1 first), then the order of the lessons page.
+  function lessonList() {
+    const items = S.lessons.map(l => ({
+      slug: l.slug, title: l.title, level: l.level, description: l.description, emoji: l.emoji, assigned: l.assigned,
+      count: l.units.reduce((a, u) => a + u.sentences.length, 0), progress: modelOf(l),
+      started: Boolean(l.lp) || (l.unitRows || []).length > 0, finished: Boolean(l.lp && l.lp.completed_at),
+    }));
+    const locks = S.lock === false ? new Map() : Progress.lessonLocks(items.map(l => ({ slug: l.slug, title: l.title, level: l.level, assigned: l.assigned, started: l.started, completed: l.finished })));
+    items.forEach(l => { const k = locks.get(l.slug); l.locked = Boolean(k && k.locked); l.lockedBy = k && k.by ? k.by.title : null; });
+    if (S.lock !== false) { // the lessons are shown in the order they open
+      const rank = l => { const k = Progress.LEVELS.indexOf(String(l.level).toUpperCase()); return k < 0 ? Progress.LEVELS.length : k; };
+      return items.map((l, i) => ({ l, i })).sort((a, b) => rank(a.l) - rank(b.l) || a.i - b.i).map(x => x.l);
+    }
+    return items;
+  }
+  const lockedLesson = slug => (S ? lessonList().find(l => l.slug === slug && l.locked) || null : null);
   // A private copy for a screen to work with (a round must not change under its own feet).
   function lessonView(slug) {
     const raw = rawLesson(slug);
@@ -706,6 +719,11 @@
     if (path === '/signup') return showAuth('signup');
     if (!me) return goLogin();
     let m;
+    // A closed lesson (the one before it is not finished yet) cannot be opened, not even with a typed link.
+    if ((m = path.match(/^\/lesson\/([a-z0-9-]+)(\/|$)/))) {
+      const closed = lockedLesson(m[1]);
+      if (closed) { toast(`Finish “${closed.lockedBy}” first 🔒`); return navigate('/', true); }
+    }
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)$/))) return showLessonHub(m[1]);
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/u\/([a-z0-9]+)\/(learn|build|arbuild|review|grammar|quiz)$/i))) return showLessonStep(m[1], m[2], m[3]);
     if ((m = path.match(/^\/lesson\/([a-z0-9-]+)\/final$/))) return showFinalQuiz(m[1]);
@@ -1038,6 +1056,15 @@
     const fill = h('div', { class: 'mini-fill' });
     fill.style.width = pct + '%';
     const started = didAnything(p);
+    if (l.locked) {
+      // closed: not a link, it only explains what to finish first
+      return h('div', { class: 'lesson-card locked', role: 'button', tabindex: '0', 'aria-disabled': 'true', onclick: () => toast(`Finish “${l.lockedBy}” first 🔒`),
+        onkeydown: e => { if (e.key === 'Enter') toast(`Finish “${l.lockedBy}” first 🔒`); } },
+        h('span', { class: 'emoji', 'aria-hidden': 'true', html: ICON.lock }),
+        h('div', { class: 'body' },
+          h('div', { class: 'title-row' }, h('span', { class: 'title' }, l.title), h('span', { class: 'badges' }, h('span', { class: 'level' }, l.level))),
+          h('div', { class: 'meta' }, h('span', { class: 'status' }, `Pass the quiz of “${l.lockedBy}” to open`))));
+    }
     return h('a', { class: 'lesson-card' + (p.completed ? ' done' : ''), href: `/lesson/${l.slug}`, 'data-link': true },
       h('span', { class: 'emoji', 'aria-hidden': 'true' }, l.emoji || '📘'),
       h('div', { class: 'body' },
@@ -1521,8 +1548,11 @@
         if (!st.startedAt) st.startedAt = Date.now();
         st.heard.push(best.text); st.last = best.result;
         if (best.result.pass) { sendSpeak(); saidOut.add(i); sfx.win(); } else { sfx.wrong(); if (st.heard.length >= Speak.MAX_TRIES) sendSpeak(); }
+        try { r.stop(); } catch (e) { /* already stopped */ }
       };
       r.onerror = ev => { error = (ev && ev.error) || 'error'; };
+      // The microphone is only on while the student is speaking: it closes the moment speech stops, and straight after a result.
+      r.onspeechend = () => { try { r.stop(); } catch (e) { /* already stopped */ } };
       r.onend = () => {
         if (rec !== r) return;
         stopListening();
@@ -1534,7 +1564,12 @@
       };
       try { st.startedAt = st.startedAt || Date.now(); r.start(); } catch (e) { return micFailed('The microphone is not available. Use the button instead.'); }
       listening = true; render(false);
-      micTimer = setTimeout(() => { if (rec === r) { try { r.stop(); } catch (e) { stopListening(); render(false); } } }, 9000); // never listens for ever
+      // Never listens for long: after 6 seconds it is asked to stop, and if it still has not closed 1.5 seconds later it is switched off by force.
+      micTimer = setTimeout(() => {
+        if (rec !== r) return;
+        try { r.stop(); } catch (e) { stopListening(); render(false); return; }
+        micTimer = setTimeout(() => { if (rec === r) { stopListening(); render(false); } }, 1500);
+      }, 6000);
     }
 
     async function go(delta) {
@@ -1584,7 +1619,12 @@
     };
     document.addEventListener('keydown', onKey);
     const stopRelayout = onRelayout(() => fitText(card, text));
-    cleanup = () => { document.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onTapAway); stopRelayout(); stopListening(); hideMeaning(); };
+    // The microphone is switched off at once when the app goes to the background or the page is left.
+    const micOff = () => { if (listening) { stopListening(); render(false); } };
+    const onHidden = () => { if (document.hidden) micOff(); };
+    document.addEventListener('visibilitychange', onHidden);
+    window.addEventListener('pagehide', micOff);
+    cleanup = () => { document.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onTapAway); document.removeEventListener('visibilitychange', onHidden); window.removeEventListener('pagehide', micOff); stopRelayout(); stopListening(); hideMeaning(); };
 
     if (up.status === 'new') sendLearn(0, false, 0).catch(() => {});
     render(true);
@@ -2396,7 +2436,7 @@
   function showLessonComplete(slug, lesson, p) {
     document.title = `Lesson complete · ${lesson.title} · ${config.appName}`;
     const pct = p.maxStars ? p.stars / p.maxStars : 1;
-    const next = lessonList().find(l => l.slug !== slug && !l.progress.completed);
+    const next = lessonList().find(l => l.slug !== slug && !l.progress.completed && !l.locked);
     setView(
       h('div', { class: 'stage celeb' },
         h('div', { class: 'celeb-badge', 'aria-hidden': 'true' }, '🏆'),

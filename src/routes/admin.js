@@ -452,6 +452,17 @@ module.exports = function adminRoutes(pool) {
     res.json({ sentences: rows.map(x => ({ sentence: x.sentence, students: x.students, avgScore: x.avg_score, worst: x.worst, tries: x.tries, notPassed: x.not_passed })) });
   }));
 
+  // "Lessons open one by one": on by default. Off = every lesson is open (the flag 'lessons_open_all' exists).
+  r.get('/lock', wrap(async (req, res) => {
+    res.json({ on: !(await pool.query("SELECT 1 FROM app_flags WHERE key = 'lessons_open_all'")).rowCount });
+  }));
+  r.put('/lock', wrap(async (req, res) => {
+    const on = Boolean(req.body && req.body.on);
+    if (on) await pool.query("DELETE FROM app_flags WHERE key = 'lessons_open_all'");
+    else await pool.query("INSERT INTO app_flags (key) VALUES ('lessons_open_all') ON CONFLICT DO NOTHING");
+    res.json({ on });
+  }));
+
   async function saveAssignments(client, lessonId, userIds) {
     if (userIds === undefined) return;
     await client.query('DELETE FROM lesson_assignments WHERE lesson_id = $1', [lessonId]);

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateUser } = require('../validate');
+const { lessonLocks } = require('../../public/progress-core');
 const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
 const Quiz = require('../../public/quiz-core');
 const Review = require('../../public/review-core');
@@ -130,6 +131,7 @@ module.exports = function studentRoutes(pool) {
     res.json({
       user: publicUser(req.user),
       stats,
+      lock: await lockIsOn(), // lessons open one by one; the app works out which are closed with the same rule (lessonLocks)
       reviews,
       lessons: lessons.rows.map(l => {
         const s = solved.get(l.id) || new Map(), x = extras.get(l.id) || new Map(), g = grammars.get(l.id) || new Set();
@@ -218,9 +220,30 @@ module.exports = function studentRoutes(pool) {
     });
   }));
 
-  async function loadVisibleLesson(uid, slug) {
+  // Lessons open one by one (see lessonLocks in progress-core.js). The teacher can switch this off (app_flags 'lessons_open_all').
+  const lockIsOn = async () => !(await pool.query("SELECT 1 FROM app_flags WHERE key = 'lessons_open_all'")).rowCount;
+
+  // True when this lesson is still closed for the student: a lesson for everybody, not started yet, whose previous lesson (by level, then order) is not finished.
+  async function isLessonLocked(uid, lesson) {
+    if (lesson.visibility !== 'public' || !(await lockIsOn())) return null;
+    const [chain, lp] = await Promise.all([
+      pool.query("SELECT id, slug, title, level FROM lessons WHERE published AND visibility = 'public' ORDER BY position, title"),
+      pool.query('SELECT lesson_id, completed_at FROM lesson_progress WHERE user_id = $1', [uid]),
+    ]);
+    const have = new Map(lp.rows.map(x => [x.lesson_id, x]));
+    const locks = lessonLocks(chain.rows.map(l => ({ slug: l.slug, title: l.title, level: l.level, assigned: false, started: have.has(l.id), completed: Boolean(have.get(l.id) && have.get(l.id).completed_at) })));
+    const lock = locks.get(lesson.slug);
+    return lock && lock.locked ? lock.by : null;
+  }
+
+  async function loadVisibleLesson(uid, slug, { ignoreLock = false } = {}) {
     const { rows } = await pool.query(`SELECT l.* FROM lessons l WHERE l.slug = $2 AND ${VISIBLE_SQL}`, [uid, slug]);
-    return rows[0] || null;
+    const lesson = rows[0] || null;
+    if (lesson && !ignoreLock) {
+      const by = await isLessonLocked(uid, lesson);
+      if (by) throw Object.assign(new Error('lesson locked'), { status: 403, publicMessage: `Finish “${by.title}” first to open this lesson.` });
+    }
+    return lesson;
   }
 
   r.get('/lessons/:slug', wrap(async (req, res) => {
@@ -546,7 +569,7 @@ module.exports = function studentRoutes(pool) {
   r.post('/review/answer', wrap(async (req, res) => {
     const uid = req.user.id;
     const b = req.body || {};
-    const lesson = await loadVisibleLesson(uid, String(b.slug || '').slice(0, 80));
+    const lesson = await loadVisibleLesson(uid, String(b.slug || '').slice(0, 80), { ignoreLock: true }); // reviews of earlier work are never blocked
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
     const sentence = String(b.sentence || '').slice(0, 400);
     const unit = unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence));

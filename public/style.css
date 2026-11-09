@@ -1125,3 +1125,13 @@ html:has(#app.play), html:has(#app.play) body { height: 100%; overflow: hidden; 
 .word-pop.below::after { bottom: auto; top: -6px; border-top: 0; border-bottom: 6px solid var(--ink); }
 @keyframes popIn { from { opacity: 0; transform: translateY(4px) scale(.96); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .word-pop { animation: none; } }
+
+/* A lesson that is still closed (the one before it is not finished) */
+.lesson-card.locked { opacity: .62; cursor: default; box-shadow: none; background: transparent; }
+.lesson-card.locked .emoji { background: var(--surface-2); color: var(--faint); }
+.lesson-card.locked .emoji svg { width: 22px; height: 22px; }
+
+/* A lesson that is still closed (the one before it is not finished) */
+.lesson-card.locked { opacity: .62; cursor: default; box-shadow: none; background: transparent; }
+.lesson-card.locked .emoji { background: var(--surface-2); color: var(--faint); }
+.lesson-card.locked .emoji svg { width: 22px; height: 22px; }

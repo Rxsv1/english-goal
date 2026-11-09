@@ -764,6 +764,7 @@
           h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => fileIn.click() }, 'Import JSON'),
           h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download('/api/admin/export', `lessons-${new Date().toISOString().slice(0, 10)}.json`) }, 'Export all'),
           h('a', { class: 'btn btn-primary btn-sm', href: '#/lessons/new' }, '+ New lesson'), fileIn)),
+      lockSwitch(),
       arabicPanel(),
       wordsPanel(),
       h('p', { class: 'muted' }, 'Drag ☰ to change the order. Drafts are hidden from students. 🔒 lessons are only for selected students.'),
@@ -790,6 +791,22 @@
     try { return JSON.parse(t.slice(from, to + 1)); }
     catch (e) { throw new Error('I could not read that as JSON. Copy the whole answer of the AI (it may have been cut off: ask it to continue, or send fewer sentences).'); }
   }
+  // "Lessons open one by one": a student opens a lesson for everybody only after finishing (passing the quizzes of) the lesson before it, by level
+  // (A1 first) and then by the order on this page. Private lessons are never closed, and a lesson a student already started stays open.
+  function lockSwitch() {
+    const box = h('input', { type: 'checkbox', id: 'lock-on' });
+    box.disabled = true;
+    fetchFresh('/api/admin/lock').then(r => { box.checked = r.on; box.disabled = false; }).catch(() => {});
+    box.addEventListener('change', async () => {
+      try { await api('PUT', '/api/admin/lock', { on: box.checked }); toast(box.checked ? 'Lessons now open one by one' : 'All lessons are open'); }
+      catch (e) { box.checked = !box.checked; toast(e.message); }
+    });
+    return h('div', { class: 'panel' },
+      h('h2', null, '🔒 Lessons open one by one'),
+      h('label', { class: 'switch' }, box, h('span', null, 'A student opens the next lesson only after passing the quiz of the one before it')),
+      h('p', { class: 'muted help' }, 'The order is by level (A1, A2, B1…) and then the order on this page (drag ☰ to change it). Private lessons (🔒 selected students) are always open and are not part of the chain, and a lesson a student has already started stays open. Turn the switch off to open every lesson.'));
+  }
+
   // The Arabic of the cards and the word meanings share one panel: download what is missing, give the file to an AI, paste the answer back.
   function aiPanel(c) {
     let prompt = '';

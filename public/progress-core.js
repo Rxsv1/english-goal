@@ -23,6 +23,29 @@
 
   const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0); // never lets NaN reach the screen
 
+  const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+
+  /**
+   * Which lessons are closed. The lessons for everybody (not the private ones given to one student) form a chain in the order of their level
+   * (A1 first) and then of the lessons page; a lesson opens when the lesson before it in that chain is finished (its quizzes passed). A lesson the
+   * student has already started or finished is never closed (so older progress keeps working), and private lessons are always open.
+   * @param lessons  in the order of the lessons page: [{ slug, title, level, assigned, completed, started }]
+   * @returns Map(slug -> { locked, by }) where `by` is { slug, title } of the lesson to finish first (or null)
+   */
+  function lessonLocks(lessons) {
+    const out = new Map();
+    const list = Array.isArray(lessons) ? lessons : [];
+    const rank = l => { const k = LEVELS.indexOf(String(l.level || '').toUpperCase()); return k < 0 ? LEVELS.length : k; };
+    const chain = list.map((l, i) => ({ l, i })).filter(x => !x.l.assigned).sort((a, b) => rank(a.l) - rank(b.l) || a.i - b.i).map(x => x.l);
+    chain.forEach((l, k) => {
+      const prev = k ? chain[k - 1] : null;
+      const locked = Boolean(prev && !prev.completed && !l.completed && !l.started);
+      out.set(l.slug, { locked, by: locked ? { slug: prev.slug, title: prev.title } : null });
+    });
+    for (const l of list) if (!out.has(l.slug)) out.set(l.slug, { locked: false, by: null });
+    return out;
+  }
+
   /**
    * Combines a lesson with one student's progress.
    * @param lesson   row with .units / .sentences
@@ -240,5 +263,5 @@
     return { completed: m.completed, passed: Boolean(passed) };
   }
 
-  return { starsFor, unitsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyArb, applyQuiz };
+  return { starsFor, unitsOf, LEVELS, lessonLocks, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyArb, applyQuiz };
 });
