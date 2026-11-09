@@ -203,11 +203,19 @@ when every unit is and the final quiz is passed (a lesson with one unit has no f
 
 ## On a computer
 
-From 900 px wide the app uses a calmer desktop layout: text size grows smoothly with the screen, pages are capped at about 1200 px, a lesson
-step is a centred column of about 900 px (buttons keep a sensible width instead of stretching), the "Perfect!" sheet is a card as wide as
-the puzzle, and the lesson page has two columns. Buttons have hover and keyboard-focus feedback, and Enter works as the main button on the
-cards. The teacher pages are up to 1280 px wide, and a student's card has two columns (numbers and lessons on the left, quizzes and the
-timeline on the right). Phones are not affected: all of this is inside `min-width` media queries.
+Windows 900 px wide and up get their own stylesheet, `public/desktop.css` (linked with `media="(min-width: 900px)"` in `index.html` and
+`admin.html`), so the phone styles in `style.css` are never touched by it. What it does:
+
+- Text size grows smoothly with the window. Controls outside the lesson steps are a little smaller than on a phone.
+- **Lesson steps (Cards, Build, Grammar, Quiz):** the top bar spans the whole window; the puzzle and the cards are in a wider box; the word
+  tiles are smaller; the buttons and the result card keep a sensible width instead of stretching.
+- **Lesson page:** left, the summary; right, the units. The steps of a unit open inside its card instead of in a pop-up (the unit you are on
+  is open from the start). On a phone they still open in a bottom sheet.
+- **Home:** a sidebar (stats, Continue, level filter) and a grid of lessons (3 columns on wide windows).
+- **Teacher pages:** Overview / Students / Lessons are a sidebar on the left; a student's card has two columns (numbers and lessons on the
+  left, quizzes and the timeline on the right).
+
+`app.js` builds a different Home and opens unit steps differently when `isPc()` is true, and redraws when the window crosses 900 px.
 
 ## Run locally
 

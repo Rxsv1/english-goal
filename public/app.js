@@ -122,6 +122,11 @@
     return () => window.removeEventListener('resize', fn);
   }
 
+  // True on a computer-sized window (the same 900 px the computer style sheet uses). Phones and narrow windows get the phone layout.
+  const pcQuery = window.matchMedia ? matchMedia('(min-width: 900px)') : null;
+  const isPc = () => Boolean(pcQuery && pcQuery.matches);
+  if (pcQuery && pcQuery.addEventListener) pcQuery.addEventListener('change', () => { closeSheet(); if (rerender) rerender(); });
+
   // A bottom sheet (used for the steps of a unit). It closes on a tap outside, on Escape, and when the screen changes.
   let sheetEl = null;
   function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
@@ -871,15 +876,39 @@
     const hour = new Date().getHours();
     const greet = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
     const firstName = me.name.split(/\s+/)[0];
+    const hello = `${greet}, ${firstName}`;
+    const hint = stats.sentencesSolved ? 'Keep going, you are doing great! ⭐' : 'Tap a lesson to play! 🎈';
+    const emptyText = finished.length ? 'You finished every lesson! 🎉 Play your own text below, or open a finished lesson to play it again.' : 'No lessons yet. Your teacher will add some soon.';
+    const statRow = () => h('div', { class: 'stat-row two' },
+      statTile('star', stats.stars, 'Stars', stats.extraStars ? `+${stats.extraStars} extra` : null),
+      statTile('flame', stats.streak, 'Day streak'));
+
+    // On a computer: the greeting on top, then a sidebar (stats, Continue, level filter) and the grid of lessons.
+    if (isPc()) {
+      return setView(
+        appBar(),
+        h('div', { class: 'home-head' }, h('h1', null, hello), h('p', { class: 'subtitle' }, hint)),
+        h('div', { class: 'home-grid' },
+          h('aside', { class: 'home-side' },
+            showInstallTip ? installTip() : null,
+            statRow(),
+            cont ? continueCard(cont) : null,
+            finished.length ? completedLink(finished) : null,
+            lessons.length && levels.length > 2 ? h('div', { class: 'side-filter' }, h('h2', null, 'Level'), chips) : null),
+          h('div', { class: 'home-main' },
+            assigned.length ? h('section', { class: 'section' }, h('h2', null, 'For you'), h('div', { class: 'lesson-grid' }, assigned.map(lessonCard))) : null,
+            h('section', { class: 'section' },
+              h('h2', null, 'All lessons'),
+              lessons.length ? null : h('p', { class: 'empty' }, emptyText),
+              grid))));
+    }
 
     setView(
       appBar(),
-      h('h1', null, `${greet}, ${firstName}`),
-      h('p', { class: 'subtitle' }, stats.sentencesSolved ? 'Keep going, you are doing great! ⭐' : 'Tap a lesson to play! 🎈'),
+      h('h1', null, hello),
+      h('p', { class: 'subtitle' }, hint),
       showInstallTip ? installTip() : null,
-      h('div', { class: 'stat-row two' },
-        statTile('star', stats.stars, 'Stars', stats.extraStars ? `+${stats.extraStars} extra` : null),
-        statTile('flame', stats.streak, 'Day streak')),
+      statRow(),
       cont ? continueCard(cont) : null,
       finished.length ? completedLink(finished) : null,
       assigned.length ? h('section', { class: 'section' },
@@ -887,7 +916,7 @@
         h('div', { class: 'lesson-grid' }, assigned.map(lessonCard))) : null,
       h('section', { class: 'section' },
         h('h2', null, 'All lessons'),
-        lessons.length ? chips : h('p', { class: 'empty' }, finished.length ? 'You finished every lesson! 🎉 Play your own text below, or open a finished lesson to play it again.' : 'No lessons yet. Your teacher will add some soon.'),
+        lessons.length ? chips : h('p', { class: 'empty' }, emptyText),
         grid)
     );
   }
@@ -1001,7 +1030,7 @@
 
     // The unit that is open now shows its progress and one big button. Every other unit is a single row; tapping a row
     // opens a short list of that unit's steps (cards, practise, grammar, sentences).
-    function openUnit(i) {
+    function buildSteps(i) {
       const unit = lesson.units[i];
       const up = p.units[i];
       const rowLink = (icon, title, sub, href) => h('a', { class: 'srow', href, 'data-link': true },
@@ -1029,7 +1058,18 @@
         list.append(toggle);
         more = ul;
       }
-      showSheet(multi ? `Unit ${i + 1} · ${unit.title}` : 'Your sentences', list, more);
+      return [list, more];
+    }
+    function openUnit(i) {
+      const [list, more] = buildSteps(i);
+      showSheet(multi ? `Unit ${i + 1} · ${lesson.units[i].title}` : 'Your sentences', list, more);
+    }
+    // On a computer the steps open inside the unit's own card instead of a pop-up.
+    function toggleSteps(li, i) {
+      const open = li.querySelector(':scope > .u-steps');
+      if (open) { open.remove(); li.classList.remove('open'); return; }
+      li.append(h('div', { class: 'u-steps' }, ...buildSteps(i)));
+      li.classList.add('open');
     }
 
     const unitCards = lesson.units.map((unit, i) => {
@@ -1052,10 +1092,10 @@
           h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, step), 'data-link': true }, '▶ ', label));
       }
       const sub = up.locked ? `Finish Unit ${i} to open` : up.completed ? `Completed · ★ ${up.stars}${up.extra ? ` +${up.extra}` : ''}` : null;
-      return h('li', { class: 'u-item' + cls },
+      const li = h('li', { class: 'u-item' + cls },
         h('button', {
-          class: 'u-head', type: 'button', 'aria-label': multi ? `Unit ${i + 1}, ${unit.title}` : 'Your sentences',
-          onclick: () => (up.locked ? toast(`Finish Unit ${i} first 🔒`) : openUnit(i)),
+          class: 'u-head', type: 'button', 'aria-label': multi ? `Unit ${i + 1}, ${unit.title}`: 'Your sentences',
+          onclick: () => (up.locked ? toast(`Finish Unit ${i} first 🔒`) : isPc() ? toggleSteps(li, i) : openUnit(i)),
         },
           h('span', { class: 'step-num', html: up.completed ? ICON.check : up.locked ? ICON.lock : null }, up.completed || up.locked ? null : String(i + 1)),
           h('span', { class: 'u-text' },
@@ -1064,6 +1104,8 @@
             sub ? h('span', { class: 'u-sub' }, sub) : null),
           up.locked ? null : h('span', { class: 'chev', html: ICON.next })),
         open);
+      if (current && isPc()) toggleSteps(li, i); // the unit the student is on is open from the start
+      return li;
     });
 
     // The final quiz: the last row, open once every unit is finished.

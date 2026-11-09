@@ -1,9 +1,9 @@
 /* Offline support. Everything is fetched from the network first, so updates show up
    immediately; the saved copy is only used when there is no internet.
    API calls are never cached (progress is queued by the app itself when offline). */
-const VERSION = 'v19';
+const VERSION = 'v21';
 const SHELL = `shell-${VERSION}`;
-const SHELL_FILES = ['/', '/app.js', '/progress-core.js', '/quiz-core.js', '/style.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
+const SHELL_FILES = ['/', '/app.js', '/progress-core.js', '/quiz-core.js', '/style.css', '/desktop.css', '/vendor/Sortable.min.js', '/icons/icon.svg'];
 
 self.addEventListener('install', e => {
   // Each file is saved on its own: addAll() would give up on everything if a single file failed to download.
