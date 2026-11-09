@@ -382,13 +382,6 @@
     models.delete(raw); rev++; saveData();
     return r;
   }
-  // A translation the server just made: kept on the device with the sentence (not progress, so nothing else changes).
-  function rememberArabic(slug, en, ar) {
-    const raw = rawLesson(slug);
-    if (!raw) return;
-    for (const u of raw.units) for (const sn of u.sentences) if (sn.en === en) sn.ar = ar;
-    saveData();
-  }
   function noteSolve(slug, sentence, stars, seconds) {
     const raw = rawLesson(slug);
     const r = raw && Progress.applySolve(raw, S.stats, sentence, stars, seconds, new Date().toISOString());
@@ -1255,10 +1248,10 @@
     const listen = rbtn(ICON.sound, 'Listen');
     const slow = rbtn('🐢', 'Slowly');
     const prev = rbtn(ICON.back, 'Back', { 'aria-label': 'Previous sentence' });
-    // Arabic translation: only there when the teacher switched it on for this student. Tapping the button translates THAT sentence
-    // (once; it is remembered), then the card flips.
-    const hasAr = Boolean(me && me.arabic);
-    let showAr = false, arBusy = false;
+    // Arabic translation: the server only sends the Arabic ("ar") to students the teacher switched it on for, so the button is there
+    // exactly when the lesson has Arabic for this student. Tapping it flips the card; a sentence without Arabic keeps the button off.
+    const hasAr = sentences.some(sn => sn.ar);
+    let showAr = false;
     const arBtn = hasAr ? rbtn('ع', 'Arabic', { 'aria-label': 'Show the Arabic translation' }) : null;
     // One main button: first "I said it out loud", then "Next".
     const next = h('button', { class: 'btn btn-main btn-primary', type: 'button' });
@@ -1321,32 +1314,16 @@
         ]));
       }
       if (arBtn) {
-        arBtn.disabled = arBusy;
-        arBtn.querySelector('.ic').textContent = arBusy ? '…' : showAr ? 'EN' : 'ع';
-        arBtn.querySelector('span:last-child').textContent = arBusy ? 'Translating' : showAr ? 'English' : 'Arabic';
+        arBtn.disabled = !cur.ar;
+        arBtn.querySelector('.ic').textContent = showAr ? 'EN' : 'ع';
+        arBtn.querySelector('span:last-child').textContent = showAr ? 'English' : 'Arabic';
         arBtn.setAttribute('aria-label', showAr ? 'Show the English sentence' : 'Show the Arabic translation');
       }
       fitText(card, text);
     }
-    async function flipArabic() {
-      if (!arBtn || arBusy) return;
-      const cur = sentences[i], at = i;
-      if (showAr) { showAr = false; drawText(); restartAnimation(card, 'flip-card'); return; }
-      if (!cur.ar) {
-        // not translated yet: ask the server for this one sentence (it keeps the answer, so it is only ever translated once)
-        arBusy = true; drawText();
-        try {
-          const r = await api('POST', `/api/lessons/${slug}/translate`, { sentence: cur.en });
-          cur.ar = r.ar;
-          rememberArabic(slug, cur.en, r.ar);
-        } catch (e) {
-          arBusy = false; drawText();
-          return toast(e.status ? e.message : 'You need the internet to translate this sentence.');
-        }
-        arBusy = false;
-        if (i !== at) return drawText(); // the student moved to another card while it was translating
-      }
-      showAr = true;
+    function flipArabic() {
+      if (!arBtn || !sentences[i].ar) return;
+      showAr = !showAr;
       drawText();
       restartAnimation(card, 'flip-card');
     }

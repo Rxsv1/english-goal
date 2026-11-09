@@ -56,10 +56,8 @@ app.get('/healthz', async (req, res) => {
   try { await pool.query('SELECT 1'); res.json({ ok: true }); }
   catch (e) { res.status(503).json({ ok: false }); }
 });
-// Arabic on the cards: a student taps the button and only that sentence is translated (see src/translate.js).
-const translator = require('./src/translate').fromEnv();
-app.use('/api/admin', require('./src/routes/admin')(pool, translator));
-app.use('/api', require('./src/routes/student')(pool, translator));
+app.use('/api/admin', require('./src/routes/admin')(pool));
+app.use('/api', require('./src/routes/student')(pool));
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
 /* ---------- Pages (app name filled in) ---------- */

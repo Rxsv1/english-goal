@@ -457,11 +457,11 @@
       try { await api('PUT', '/api/admin/arabic', { enabled: on }); users.forEach(u => { u.arabic = on; cache.delete(`/api/admin/users/${u.id}`); }); draw(); toast(on ? 'Arabic is on for everyone' : 'Arabic is off for everyone'); }
       catch (e) { toast(e.message); }
     };
-    const arNote = h('small', { class: 'ar-note' }, 'Students translate a sentence themselves by tapping the ع button on a card. Nothing to translate for you.');
-    api('GET', '/api/admin/translate/status').then(st => {
-      arNote.textContent = st.enabled
-        ? `Students translate a sentence themselves by tapping the ع button on a card (service: ${st.provider === 'mymemory' ? 'MyMemory, free' : st.provider}). Nothing to translate for you.`
-        : 'Translation is not set up on the server, so the ع button will say it is not available (see the README).';
+    const arNote = h('small', { class: 'ar-note' }, 'Students see the ع button on a card when the lesson has Arabic for it. Add the Arabic on the Lessons page.');
+    fetchFresh('/api/admin/arabic/status').then(st => {
+      arNote.textContent = st.ready
+        ? `Arabic text is ready for ${st.ready} of ${plural(st.total, 'sentence')}. Add the rest on the Lessons page (Arabic translations).`
+        : 'No lesson has Arabic text yet, so students will not see the ع button. Add it on the Lessons page (Arabic translations).';
     }).catch(() => {});
     const arabicBar = h('div', { class: 'ar-bar' },
       h('span', { class: 'ar-ic', 'aria-hidden': 'true' }, 'ع'), h('div', { class: 'ar-text' }, arCount, arNote), h('span', { class: 'spacer' }),
@@ -743,9 +743,100 @@
           h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => fileIn.click() }, 'Import JSON'),
           h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download('/api/admin/export', `lessons-${new Date().toISOString().slice(0, 10)}.json`) }, 'Export all'),
           h('a', { class: 'btn btn-primary btn-sm', href: '#/lessons/new' }, '+ New lesson'), fileIn)),
+      arabicPanel(),
       h('p', { class: 'muted' }, 'Drag ☰ to change the order. Drafts are hidden from students. 🔒 lessons are only for selected students.'),
       lessons.length ? list : h('p', { class: 'state' }, 'No lessons yet. Click “New lesson” to create one.')
     );
+  }
+
+  // The Arabic of the cards: the teacher sends the sentences to an AI model and pastes its answer back. Only sentences that match
+  // exactly get Arabic, so nothing in a lesson (or any progress) can be damaged.
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+    const ta = h('textarea', { style: 'position:fixed;opacity:0' }, text);
+    document.body.append(ta); ta.select();
+    try { document.execCommand('copy'); } finally { ta.remove(); }
+    return Promise.resolve();
+  }
+  // The AI often wraps its answer in ``` marks or adds a sentence before it: take only the JSON part.
+  function parseAiJson(text) {
+    const t = String(text).replace(/```(?:json)?/gi, '');
+    const starts = [t.indexOf('['), t.indexOf('{')].filter(i => i >= 0);
+    const from = starts.length ? Math.min(...starts) : -1;
+    const to = Math.max(t.lastIndexOf(']'), t.lastIndexOf('}'));
+    if (from < 0 || to < from) throw new Error('I could not find any JSON in that text. Copy the whole answer of the AI.');
+    try { return JSON.parse(t.slice(from, to + 1)); }
+    catch (e) { throw new Error('I could not read that as JSON. Copy the whole answer of the AI (it may have been cut off: ask it to continue, or send fewer sentences).'); }
+  }
+  function arabicPanel() {
+    let prompt = '';
+    const status = h('div', { class: 'ar-status' }, 'Checking…');
+    const missingList = h('div', { class: 'ar-missing muted' });
+    const answer = h('textarea', { class: 'ar-answer', rows: '5', dir: 'ltr', placeholder: 'Paste the AI’s answer here…', 'aria-label': 'The answer of the AI' });
+    const replaceBox = h('input', { type: 'checkbox', id: 'ar-replace' });
+    const result = h('div', { class: 'ar-result', role: 'status' });
+    const promptText = h('p', { class: 'muted' }, 'Loading…');
+    const fileIn = h('input', { type: 'file', accept: 'application/json,.json,.txt', hidden: true });
+    const addBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button' }, 'Add the translations');
+    const dlBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => download('/api/admin/arabic/export', 'sentences-for-translation.json') }, '⬇️ 1. Download the sentences (100 at a time)');
+    const load = async () => {
+      try {
+        const st = await fetchFresh('/api/admin/arabic/status');
+        prompt = st.prompt;
+        promptText.textContent = st.prompt;
+        const pct = st.total ? Math.round((st.ready / st.total) * 100) : 0;
+        const bar = h('span', { class: 'mini-bar wide' }, h('span'));
+        bar.firstChild.style.width = pct + '%';
+        status.replaceChildren(bar, h('b', null, ` Arabic is ready for ${st.ready} of ${plural(st.total, 'sentence')}`),
+          h('span', { class: 'muted' }, ` · switched on for ${st.studentsOn} of ${plural(st.students, 'student')} (Students page)`));
+        dlBtn.disabled = st.ready >= st.total;
+        const open = st.lessons.filter(l => l.ready < l.total);
+        missingList.textContent = open.length ? `Still without Arabic: ${open.slice(0, 6).map(l => `${l.emoji} ${l.title} (${l.ready}/${l.total})`).join(' · ')}${open.length > 6 ? ` · and ${open.length - 6} more` : ''}` : (st.total ? 'Every lesson has its Arabic. ✓' : '');
+      } catch (e) { status.textContent = e.message; }
+    };
+    addBtn.addEventListener('click', async () => {
+      result.className = 'ar-result';
+      if (!answer.value.trim()) { result.textContent = 'Paste the AI’s answer in the box first.'; result.classList.add('bad'); return; }
+      addBtn.disabled = true;
+      try {
+        const data = parseAiJson(answer.value);
+        const r = await api('POST', '/api/admin/arabic/import', { data, replace: replaceBox.checked });
+        const lines = [`Added Arabic to ${plural(r.updated, 'sentence')} in ${plural(r.lessonsChanged, 'lesson')}.`];
+        if (r.unchanged) lines.push(`${r.unchanged} already had Arabic and were left as they were.`);
+        if (r.notFound) lines.push(`${plural(r.notFound, 'sentence')} ${r.notFound === 1 ? 'does' : 'do'} not match any lesson (did the AI change the English?): “${r.notFoundExamples.join('”, “')}”${r.notFound > r.notFoundExamples.length ? ' …' : ''}`);
+        if (r.rejected) lines.push(`${plural(r.rejected, 'answer')} ${r.rejected === 1 ? 'was' : 'were'} not Arabic text and ${r.rejected === 1 ? 'was' : 'were'} ignored: “${r.rejectedExamples.join('”, “')}”${r.rejected > r.rejectedExamples.length ? ' …' : ''}`);
+        result.replaceChildren(...lines.map(t => h('div', null, t)));
+        result.classList.add(r.notFound || r.rejected ? 'warn' : 'good');
+        if (r.updated) answer.value = '';
+        cache.delete('/api/admin/lessons');
+        await load();
+      } catch (e) { result.textContent = e.message; result.classList.add('bad'); }
+      finally { addBtn.disabled = false; }
+    });
+    fileIn.addEventListener('change', async e => {
+      const f = e.target.files[0]; e.target.value = '';
+      if (f) { answer.value = await f.text(); toast('File loaded. Press “Add the translations”.'); }
+    });
+    load();
+    return h('div', { class: 'panel ar-panel' },
+      h('h2', null, 'ع Arabic translations'),
+      status, missingList,
+      h('ol', { class: 'ar-steps' },
+        h('li', null, 'Download the sentences that still need Arabic (a file with up to 100 sentences).'),
+        h('li', null, 'Open your AI (ChatGPT, Claude, Gemini…), copy the instruction below, send it together with the file (or paste the file’s content).'),
+        h('li', null, 'Copy the AI’s whole answer, paste it in the box, and press “Add the translations”. Repeat until everything is ready.'),
+        h('li', null, 'Then switch Arabic on for your students on the Students page.')),
+      h('div', { class: 'toolbar' }, dlBtn,
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: async () => {
+          if (!prompt) return toast('Please wait a moment…');
+          try { await copyText(prompt); toast('Instruction copied. Paste it into the AI.'); } catch (e) { toast('Could not copy. Select the instruction below and copy it.'); }
+        } }, '📋 2. Copy the instruction for the AI')),
+      h('details', { class: 'ar-prompt' }, h('summary', null, 'Show the instruction'), promptText),
+      answer,
+      h('div', { class: 'toolbar' }, addBtn,
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => fileIn.click() }, 'or choose a file'), fileIn,
+        h('label', { class: 'switch ar-replace' }, replaceBox, h('span', null, 'Replace Arabic that already exists'))),
+      result);
   }
 
   // ctx = { userId }: editing from a student's card. The lesson stays private to that student.
@@ -941,7 +1032,7 @@
         h('label', null, 'Units and sentences'),
         h('p', { class: 'muted help' }, 'Split the lesson into small units (5 to 10 sentences each). Students learn and build one unit at a time. Each unit opens when the previous one is finished. Write one sentence per line, 2 to 20 words each.'),
         h('p', { class: 'muted help' }, 'Grammar step: after building, students choose the missing word, and then the unit ends. To choose the gap yourself, write one word of a sentence between brackets, like  She [is|are|am] reading.  The first word is the right answer; the other two are the wrong choices the student sees. Writing just [is] fills in the wrong choices for am/is/are, was/were, have/has and do/does. Sentences without brackets get a gap automatically when you save, if they contain one of those words (see the switch below).'),
-        h('p', { class: 'muted help' }, 'Arabic: you do not need to translate anything. When a student you switched Arabic on for taps the Arabic button on a card, that one sentence is translated automatically and remembered. To use your own wording, write it after // on the same line, like  She is reading a book // هي تقرأ كتاباً.'),
+        h('p', { class: 'muted help' }, 'Arabic: you can add the Arabic of all your lessons at once on the Lessons page (Arabic translations). To change one sentence, write its Arabic after // on its line, like  She is reading a book // هي تقرأ كتاباً.  Students only see it once you switch it on for them.'),
         h('div', { class: 'toolbar' }, suggestBtn, clearGapsBtn),
         h('label', { class: 'switch' }, autoGaps, h('span', null, 'Add grammar gaps automatically when I save')),
         unitsBox,

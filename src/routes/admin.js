@@ -37,7 +37,7 @@ const userOut = u => ({
   arabic: Boolean(u.arabic_enabled),
 });
 
-module.exports = function adminRoutes(pool, translator) {
+module.exports = function adminRoutes(pool) {
   const r = express.Router();
   const loginLimit = auth.limiter(10, 15 * 60 * 1000);
 
@@ -453,8 +453,110 @@ module.exports = function adminRoutes(pool, translator) {
    * Creates or updates a lesson. With { forUser } the lesson is created as private to that one
    * student (link name made unique automatically).
    */
-  // Is translation available? (Shown on the Students page next to the Arabic switches.)
-  r.get('/translate/status', (req, res) => res.json({ enabled: Boolean(translator && translator.enabled), provider: translator ? translator.provider : null }));
+  /* ================= Arabic on the cards =================
+   * The Arabic text of every sentence is stored with the sentence (the "ar" field). The teacher adds it by sending the
+   * lessons' sentences to an AI model and pasting its answer back here (see the Lessons page); a student only sees it when
+   * the teacher switched Arabic on for that student.
+   */
+  const ARABIC_RE = /[\u0600-\u06FF]/;
+  const normEn = t => String(t).trim().replace(/\s+/g, ' '); // sentences are stored with single spaces
+  const ARABIC_PROMPT =
+    'You are a careful translator from English to Modern Standard Arabic for learners of English. ' +
+    'The JSON below has a list "sentences"; each item has an "en" (English) and an empty "ar". ' +
+    'Fill in every "ar" with a natural, correct Arabic translation of its "en" (clear everyday Arabic, no transliteration, no explanations). ' +
+    'Do NOT change any "en" (not even a typo), keep the same items in the same order, and do not add or remove items. ' +
+    'Answer with ONLY the JSON, in exactly the same shape, with no text before or after it and no markdown.';
+
+  // Every sentence of every lesson that has no Arabic yet (once per different English text), a batch at a time, for the AI.
+  r.get('/arabic/export', wrap(async (req, res) => {
+    const size = Math.min(300, Math.max(1, parseInt(req.query.size, 10) || 100));
+    const all = req.query.all === '1';
+    const { rows } = await pool.query('SELECT units FROM lessons ORDER BY position, title');
+    const seen = new Set(), list = [];
+    for (const l of rows) for (const u of unitsOf(l)) for (const sn of u.sentences) {
+      if (seen.has(sn.en) || (!all && sn.ar)) continue;
+      seen.add(sn.en);
+      list.push({ en: sn.en, ar: all ? sn.ar || '' : '' });
+    }
+    res.set('Content-Disposition', 'attachment; filename="sentences-for-translation.json"');
+    res.json({ instructions: ARABIC_PROMPT, sentencesLeft: list.length, sentences: list.slice(0, size) });
+  }));
+
+  // How far the lessons have got, and the instruction to give to the AI.
+  r.get('/arabic/status', wrap(async (req, res) => {
+    const [{ rows }, { rows: [c] }] = await Promise.all([
+      pool.query('SELECT id, title, emoji, units FROM lessons ORDER BY position, title'),
+      pool.query('SELECT COUNT(*)::int AS students, COUNT(*) FILTER (WHERE arabic_enabled)::int AS on FROM users'),
+    ]);
+    let total = 0, ready = 0;
+    const lessons = rows.map(l => {
+      const sents = unitsOf(l).flatMap(u => u.sentences);
+      const done = sents.filter(sn => sn.ar).length;
+      total += sents.length; ready += done;
+      return { id: l.id, title: l.title, emoji: l.emoji, total: sents.length, ready: done };
+    });
+    res.json({ total, ready, lessons, students: c.students, studentsOn: c.on, prompt: ARABIC_PROMPT });
+  }));
+
+  // Walks through whatever the AI sent back and collects English -> Arabic pairs. Understands: the file from "Download" (a list of
+  // { en, ar }), a plain map { "English": "Arabic" }, and the lessons file (units > sentences > { en, ar }).
+  function collectPairs(node, out = new Map(), depth = 0) {
+    if (depth > 8 || out.size > 50000 || node === null || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { node.slice(0, 50000).forEach(x => collectPairs(x, out, depth + 1)); return out; }
+    if (typeof node.en === 'string') { if (typeof node.ar === 'string') out.set(normEn(node.en), node.ar); return out; }
+    const entries = Object.entries(node);
+    if (entries.length && entries.every(([, v]) => typeof v === 'string')) { entries.forEach(([k, v]) => out.set(normEn(k), v)); return out; }
+    entries.forEach(([, v]) => collectPairs(v, out, depth + 1));
+    return out;
+  }
+
+  // Adds the Arabic to the sentences it matches EXACTLY. Nothing else in a lesson is touched (so progress is safe), a sentence the AI
+  // changed simply does not match, and an answer that is not Arabic text is refused. `replace` also overwrites Arabic that exists.
+  r.post('/arabic/import', wrap(async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Nothing to add. Paste the AI\'s answer first.' });
+    const replace = !Array.isArray(body) && Boolean(body.replace);
+    const pairs = collectPairs(Array.isArray(body) ? body : (body.data !== undefined ? body.data : body));
+    pairs.delete('replace');
+    if (!pairs.size) return res.status(400).json({ error: 'No translations found in that text. It should be a list of items like {"en": "...", "ar": "..."}.' });
+    const rejected = [];
+    const good = new Map();
+    for (const [en, raw] of pairs) {
+      const ar = String(raw).trim().replace(/\s+/g, ' ');
+      if (!ar || ar.length > 300 || !ARABIC_RE.test(ar)) rejected.push(en); else good.set(en, ar);
+    }
+    const matched = new Set();
+    let updated = 0, unchanged = 0, lessonsChanged = 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query('SELECT id, units FROM lessons FOR UPDATE');
+      for (const l of rows) {
+        const units = unitsOf(l);
+        let changed = false;
+        for (const u of units) for (const sn of u.sentences) {
+          const ar = good.get(sn.en);
+          if (ar === undefined) continue;
+          matched.add(sn.en);
+          if (sn.ar && (!replace || sn.ar === ar)) { unchanged++; continue; }
+          sn.ar = ar; updated++; changed = true;
+        }
+        if (changed) {
+          await client.query('UPDATE lessons SET units = $2::jsonb, sentences = $3::jsonb, updated_at = now() WHERE id = $1',
+            [l.id, JSON.stringify(units), JSON.stringify(units.flatMap(u => u.sentences))]);
+          lessonsChanged++;
+        }
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    const notFound = [...good.keys()].filter(en => !matched.has(en));
+    res.json({ updated, unchanged, lessonsChanged, received: pairs.size, notFound: notFound.length, notFoundExamples: notFound.slice(0, 5), rejected: rejected.length, rejectedExamples: rejected.slice(0, 5) });
+  }));
 
   // Arabic on the cards: switched on for one student, or for everyone at once.
   r.put('/users/:id/arabic', wrap(async (req, res) => {

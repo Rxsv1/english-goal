@@ -10,7 +10,7 @@ const Quiz = require('../../public/quiz-core');
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const clampInt = (v, min, max) => Math.min(max, Math.max(min, Number.isFinite(+v) ? Math.round(+v) : 0));
 
-module.exports = function studentRoutes(pool, translator) {
+module.exports = function studentRoutes(pool) {
   const r = express.Router();
   const requireUser = auth.userMiddleware(pool);
   const loginLimit = auth.limiter(10, 15 * 60 * 1000);
@@ -520,60 +520,6 @@ module.exports = function studentRoutes(pool, translator) {
     } finally {
       client.release();
     }
-  }));
-
-  // Arabic on a card: the student taps the button and ONLY THAT SENTENCE is translated. The translation is stored with the sentence,
-  // so it is asked for once for everybody (the free service's daily limit goes a long way), and the teacher never has to translate.
-  // Only for students the teacher switched Arabic on for.
-  const translateLimit = auth.limiter(60, 10 * 60 * 1000);
-  const translating = new Map(); // lessonId|sentence -> the translation in progress, so two students tapping at once cost one request
-  r.post('/lessons/:slug/translate', wrap(async (req, res) => {
-    if (!req.user.arabic_enabled) return res.status(403).json({ error: 'Arabic is not switched on for you. Ask your teacher.' });
-    const lesson = await loadVisibleLesson(req.user.id, req.params.slug);
-    if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
-    const sentence = String((req.body && req.body.sentence) || '').slice(0, 400);
-    const found = unitsOf(lesson).flatMap(u => u.sentences).find(sn => sn.en === sentence);
-    if (!found) return res.status(400).json({ error: 'This sentence is not in the lesson any more.' });
-    if (found.ar) return res.json({ ar: found.ar });
-    if (!translator || !translator.enabled) return res.status(503).json({ error: 'Translation is not available right now.' });
-    if (translateLimit.hit(req.user.id)) return res.status(429).json({ error: 'Too many translations. Wait a few minutes and try again.' }); // only taps that need the service count
-
-    const key = lesson.id + '|' + sentence;
-    if (!translating.has(key)) {
-      translating.set(key, (async () => {
-        const [ar] = await translator.translate([sentence]);
-        if (!ar) return '';
-        // Store it, unless the teacher already wrote one (or changed the lesson) in the meantime.
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-          const { rows: [row] } = await client.query('SELECT units FROM lessons WHERE id = $1 FOR UPDATE', [lesson.id]);
-          if (row) {
-            const units = unitsOf(row);
-            const sn = units.flatMap(u => u.sentences).find(x => x.en === sentence);
-            if (sn && !sn.ar) {
-              sn.ar = ar;
-              await client.query('UPDATE lessons SET units = $2::jsonb, sentences = $3::jsonb WHERE id = $1',
-                [lesson.id, JSON.stringify(units), JSON.stringify(units.flatMap(u => u.sentences))]);
-            } else if (sn && sn.ar) { await client.query('COMMIT'); return sn.ar; }
-          }
-          await client.query('COMMIT');
-        } catch (e) {
-          await client.query('ROLLBACK').catch(() => {});
-          throw e;
-        } finally {
-          client.release();
-        }
-        return ar;
-      })().finally(() => translating.delete(key)));
-    }
-    let ar;
-    try { ar = await translating.get(key); } catch (e) {
-      console.error('[translate]', e.message); // the detail is for the teacher/admin (server log); the student gets a simple message
-      return res.status(502).json({ error: /limit/i.test(e.message) ? 'Translation is not available today. Try again tomorrow.' : 'Translation is not available right now. Try again later.' });
-    }
-    if (!ar) return res.status(422).json({ error: 'No translation was found for this sentence.' });
-    res.json({ ar });
   }));
 
   // "Start over": the student replays a unit (or the whole lesson) from the first sentence. Nothing is

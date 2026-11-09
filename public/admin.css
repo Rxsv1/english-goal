@@ -239,3 +239,20 @@ table.data a { color: inherit; }
 .ar-toggle:focus-visible { outline: none; box-shadow: var(--ring); }
 .ar-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 260px; }
 .ar-note { color: var(--muted); font-weight: 500; }
+
+/* ---- Arabic translations panel ---- */
+.ar-panel { display: flex; flex-direction: column; gap: 12px; }
+.ar-panel h2 { margin: 0; }
+.ar-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.mini-bar.wide { width: 140px; }
+.ar-steps { margin: 0; padding-left: 1.3rem; display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+.ar-prompt summary { cursor: pointer; font-weight: 600; color: var(--muted); }
+.ar-prompt p { margin: 8px 0 0; padding: 10px 12px; background: var(--surface-2); border-radius: 12px; font-size: .9rem; line-height: 1.5; user-select: all; }
+.ar-answer { width: 100%; min-height: 110px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); font: inherit; font-size: .9rem; resize: vertical; outline: none; }
+.ar-answer:focus { border-color: var(--accent); }
+.ar-replace { margin-left: auto; font-size: .875rem; }
+.ar-result:empty { display: none; }
+.ar-result { padding: 10px 12px; border-radius: 12px; font-weight: 600; display: flex; flex-direction: column; gap: 4px; background: var(--surface-2); }
+.ar-result.good { background: var(--success); color: var(--success-text); }
+.ar-result.warn { background: #FFF1D6; color: #8A4B00; }
+.ar-result.bad { background: var(--danger-soft); color: var(--danger); }

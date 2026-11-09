@@ -220,30 +220,26 @@ Windows 900 px wide and up get their own stylesheet, `public/desktop.css` (linke
 
 ## Arabic translation on the cards
 
-A student can flip a card to see its Arabic translation (the **ع Arabic** button; **EN** flips back). It is **off for everybody by default**:
-the teacher switches it on for each student (the **ع** switch on the Students page, or the switch on the student's own card), or for all
-students at once with **Enable for all / Disable for all**. That is all the teacher does: **nobody translates anything in advance.**
+A student can flip a card to see its Arabic translation (the **ع Arabic** button; **EN** flips back). Cards only. It is **off for everybody by
+default**: the teacher switches it on for each student (the **ع** switch on the Students page, or on the student's own card), or for all students
+at once with **Enable for all / Disable for all**. The server only sends the Arabic to students it is switched on for, and a student sees the button
+on a card when that sentence has Arabic. There is no online translation service: the Arabic comes from an AI model, in a few minutes, like this.
 
-When a student taps the button on a card, **only that sentence** is translated by an online service and the card flips. The translation is
-stored with the sentence, so a sentence is translated **once for everybody** (the next student, or the same student again, gets it
-instantly and without a request). Cards only. The Arabic is only sent to students it is switched on for. If the service is not available
-the student sees a short message and the card stays in English.
+### Adding the Arabic with an AI (Lessons page > "Arabic translations")
 
-The service is **MyMemory**: free, no account, no key. Only the English sentence is sent to it. Machine translation can be wrong (MyMemory
-is free and not as good as the paid services). To use your own wording for a sentence, write it after `//` in the lesson editor
-(`She is reading a book // هي تقرأ كتاباً`); a translation that exists is never replaced.
+1. Press **Download the sentences** (a file with up to 100 sentences that have no Arabic yet, each only once).
+2. Open your AI (ChatGPT, Claude, Gemini...), press **Copy the instruction for the AI**, and send the instruction together with the file (or paste
+   the file's content).
+3. Copy the AI's whole answer, paste it into the box and press **Add the translations**. Repeat from step 1 until the page says everything is ready.
 
-### Settings (all optional; on CranL they are environment variables, the same place as `DATABASE_URL`)
-
-| Variable | Meaning |
-|---|---|
-| `TRANSLATE_EMAIL` | **Recommended.** Any email address of yours. MyMemory then allows 50,000 characters a day instead of 5,000. No sign-up. |
-| `TRANSLATE_PROVIDER` | `mymemory` (default, free) · `libretranslate` (free software you run yourself) · `google` · `deepl` |
-| `TRANSLATE_API_URL` | LibreTranslate: the address of your server, e.g. `https://translate.example.com` |
-| `TRANSLATE_API_KEY` | google / deepl: the key. LibreTranslate: only if your server asks for one |
-
-Because every sentence is translated only once, 5,000 characters a day is already about 100 different sentences tapped for the first time.
-If the daily limit is used up, students see "not available today" and it works again the next day (sentences already translated keep working).
+The app is careful with what comes back, so nothing can be damaged:
+- It understands the answer even if the AI adds a sentence before it or wraps it in a code block. It also accepts a plain list of `{"en", "ar"}`,
+  a map `{"English": "Arabic"}`, or the lessons file (Export all > the AI adds `"ar"` to each sentence > Import).
+- Arabic is only added to sentences that match **exactly** (every lesson that has that sentence). If the AI changed the English of a sentence, it
+  is reported and not added. An answer that is not Arabic text is refused. Nothing else in a lesson is touched, and students' progress is not affected.
+- Arabic that already exists is kept, unless you tick **Replace Arabic that already exists**.
+- You can also write or change one sentence yourself in the lesson editor, after `//`: `She is reading a book // هي تقرأ كتاباً`.
+- New sentences added to a lesson later simply show up in the next download.
 
 ## Run locally
 
