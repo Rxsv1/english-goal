@@ -157,6 +157,14 @@ async function migrate(pool) {
       -- of the first try (mistakes, hints, seconds) is kept for the teacher. It never changes stars and is not needed to finish a unit.
       ALTER TABLE lessons ADD COLUMN IF NOT EXISTS ar_step BOOLEAN NOT NULL DEFAULT TRUE;
 
+      -- Requirements the teacher can switch on or off for each student (all ON, as before): say each sentence out loud, quizzes needed to finish,
+      -- lessons open one by one, the grammar step, the Arabic -> English step.
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_speak   BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_quiz    BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_order   BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_grammar BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_arstep  BOOLEAN NOT NULL DEFAULT TRUE;
+
       -- Word meanings ("tap a word to see its meaning"): { "airport": "مطار" } for each lesson, keys are lower case words without punctuation.
       ALTER TABLE lessons ADD COLUMN IF NOT EXISTS words JSONB NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_done     BOOLEAN NOT NULL DEFAULT FALSE;

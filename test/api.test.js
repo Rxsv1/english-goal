@@ -1329,3 +1329,121 @@ test('lessons open one by one: by level, then order; private lessons and lessons
   assert.deepEqual(await Promise.all(['lock-a-two', 'lock-b-one'].map(open)), [403, 403]);
   await admin('PUT', '/lock', { on: false });
 });
+
+test('requirements per student: speaking, quizzes, lessons one by one, grammar and the Arabic step can be switched off for one student or for all', { skip }, async () => {
+  const Core = require('../public/progress-core.js');
+  const plain = m => { const o = JSON.parse(JSON.stringify(m)); for (const k of ['startedAt', 'lastActivityAt', 'completedAt']) o[k] = o[k] ? 'set' : null; return o; };
+  const mkLesson = async (title, units) => {
+    const r = await admin('POST', '/lessons', { title, slug: title.toLowerCase().replace(/ /g, '-'), level: 'C2', units });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    return r.data.lesson;
+  };
+  const les = await mkLesson('Req lesson', [
+    { title: 'A', sentences: ['She [is|are|am] reading a book // هي تقرأ كتابا', 'We like green tea'] },
+    { title: 'B', sentences: ['They like red apples'] }]);
+  const appOf = async st => (await st.as('GET', '/app')).data;
+  const lessonOf = async st => (await appOf(st)).lessons.find(l => l.slug === 'req-lesson');
+  const setReq = (id, body) => admin('PUT', `/users/${id}/requirements`, body);
+  const buildAll = async (st, withGrammar, { slug = 'req-lesson', onlyFirst = false } = {}) => {
+    const l = (await appOf(st)).lessons.find(x => x.slug === slug);
+    for (const u of onlyFirst ? l.units.slice(0, 1) : l.units) {
+      await st.as('POST', `/lessons/${slug}/units/${u.id}/learn`, { index: u.sentences.length - 1, done: true });
+      for (const sn of u.sentences) assert.equal((await solve(st, slug, sn.en)).status, 200);
+      if (withGrammar) for (const sn of u.sentences.filter(x => x.gap)) await st.as('POST', `/lessons/${slug}/grammar`, { sentence: sn.en, mistakes: 0, cid: Math.random().toString(36) });
+    }
+  };
+
+  // 1) everything is ON by default, for the student and for the teacher
+  const usual = await newStudent('Usual');
+  assert.deepEqual((await appOf(usual)).user.req, { speak: true, quiz: true, order: true, grammar: true, arStep: true });
+  assert.deepEqual((await admin('GET', `/users/${usual.id}`)).data.user.req, { speak: true, quiz: true, order: true, grammar: true, arStep: true });
+
+  // 2) rules for the endpoint
+  assert.equal((await setReq(usual.id, {})).status, 400);
+  assert.equal((await setReq(usual.id, { speak: 'no', nothing: false })).status, 400, 'only true/false of known switches count');
+  assert.equal((await setReq('nobody', { speak: false })).status, 404);
+  assert.equal((await admin('PUT', '/requirements', {})).status, 400);
+
+  // 3) speaking: the app is told (it then needs no "say it" step); nothing else changes
+  const r1 = await setReq(usual.id, { speak: false });
+  assert.deepEqual(r1.data, { req: { speak: false, quiz: true, order: true, grammar: true, arStep: true }, finished: 0 });
+  assert.equal((await appOf(usual)).user.req.speak, false);
+
+  // 4) quizzes off: units and the lesson finish without a quiz, exactly as the shared rule says; the device rule matches
+  const noQuiz = await newStudent('NoQuiz');
+  assert.equal((await setReq(noQuiz.id, { quiz: false })).status, 200);
+  await buildAll(noQuiz, true);
+  const classic = (await noQuiz.as('GET', '/lessons/req-lesson')).data.progress;
+  assert.deepEqual([classic.completed, classic.hasFinal, classic.units.map(u => u.completed), classic.units.map(u => u.quizReady)], [true, false, [true, true], [false, false]]);
+  const rawNoQuiz = await lessonOf(noQuiz);
+  assert.equal(rawNoQuiz.lp.completed_at !== null, true, 'the lesson was finished on the server too');
+  assert.deepEqual(plain(Core.modelOf({ ...rawNoQuiz, quizOff: true })), plain(classic), 'the phone works out the same progress');
+  assert.equal(Core.modelOf(rawNoQuiz).completed, false, '...and with the quiz required the same data is not finished');
+  // a student with quizzes on is not affected: still needs the quizzes (and unit B stays closed until unit A's quiz is passed)
+  const withQuiz = await newStudent('WithQuiz');
+  await buildAll(withQuiz, true, { onlyFirst: true });
+  const strict = (await withQuiz.as('GET', '/lessons/req-lesson')).data.progress;
+  assert.deepEqual([strict.completed, strict.units.map(u => u.quizReady), strict.units[1].locked], [false, [true, false], true]);
+
+  // 5) switching quizzes off for a student who was waiting at the quiz finishes the lesson now (once); switching on again takes nothing back
+  const single = await mkLesson('Req single', [{ title: 'A', sentences: ['The only unit sentence', 'The only unit second sentence'] }]);
+  const waiting = await newStudent('Waiting');
+  await buildAll(waiting, true, { slug: 'req-single' });
+  const stuck = (await admin('GET', `/users/${waiting.id}`)).data.lessons.find(l => l.slug === 'req-single').progress;
+  assert.deepEqual([stuck.completed, stuck.units[0].quizReady], [false, true], 'built, waiting at the quiz');
+  const sw = await setReq(waiting.id, { quiz: false });
+  assert.equal(sw.data.finished, 1);
+  const lp = async () => (await appOf(waiting)).lessons.find(l => l.slug === 'req-single').lp;
+  assert.equal((await lp()).completed_at !== null, true);
+  assert.equal((await admin('GET', `/users/${waiting.id}`)).data.lessons.find(l => l.slug === 'req-single').progress.completed, true, 'the teacher sees it finished');
+  const evs = (await admin('GET', `/users/${waiting.id}`)).data.events.filter(e => e.type === 'lesson_complete');
+  assert.deepEqual([evs.length, evs[0].data.byTeacherSwitch], [1, true]);
+  assert.equal((await setReq(waiting.id, { quiz: false })).data.finished, 0, 'nothing is finished twice');
+  await setReq(waiting.id, { quiz: true });
+  assert.equal((await lp()).completed_at !== null, true, 'switching it on again does not take progress away');
+
+  // 6) grammar off: the unit needs no grammar, the quiz comes right after building; the device rule matches
+  const noGrammar = await newStudent('NoGrammar');
+  await setReq(noGrammar.id, { grammar: false });
+  await buildAll(noGrammar, false, { onlyFirst: true });
+  const g = (await noGrammar.as('GET', '/lessons/req-lesson')).data.progress;
+  assert.deepEqual([g.grammarTotal, g.units[0].grammarReady, g.units[0].quizReady], [0, false, true]);
+  assert.deepEqual(plain(Core.modelOf({ ...(await lessonOf(noGrammar)), grammarOff: true })), plain(g));
+  const unitA = (await lessonOf(noGrammar)).units[0];
+  const q = await takeQuiz(noGrammar, 'req-lesson', 'unit:' + unitA.id);
+  assert.equal(q.status, 200, JSON.stringify(q.data));
+  assert.equal(q.data.unitCompleted, true, 'the unit is finished by building and the quiz, without grammar');
+  const normal = await newStudent('NormalGrammar');
+  await buildAll(normal, false, { onlyFirst: true });
+  assert.equal((await normal.as('GET', '/lessons/req-lesson')).data.progress.units[0].grammarReady, true, 'a student with grammar on still has it');
+
+  // 7) the Arabic -> English step off: the Arabic of the step is not sent and results are refused
+  const arStudent = await newStudent('ArStep');
+  assert.equal((await lessonOf(arStudent)).units[0].sentences[0].arq, 'هي تقرأ كتابا');
+  await setReq(arStudent.id, { arStep: false });
+  assert.equal((await lessonOf(arStudent)).units[0].sentences[0].arq, undefined);
+  await buildAll(arStudent, true, { onlyFirst: true });
+  assert.equal((await arStudent.as('POST', '/lessons/req-lesson/arbuild', { sentence: 'She is reading a book', mistakes: 0, hints: 0 })).status, 400);
+
+  // 8) lessons one by one off for one student: the others stay closed
+  const second = await mkLesson('Req second', [{ title: 'A', sentences: ['This is the second lesson', 'Another second lesson sentence'] }]);
+  await admin('PUT', '/lock', { on: true });
+  const closed = await newStudent('Closed'), freed = await newStudent('Freed');
+  await setReq(freed.id, { order: false });
+  const first = (await appOf(closed)).lessons.map(l => l.slug);
+  assert.equal((await closed.as('GET', `/lessons/${second.slug}`)).status, first.includes(second.slug) ? 403 : 404);
+  assert.equal((await freed.as('GET', `/lessons/${second.slug}`)).status, 200);
+  assert.equal((await appOf(closed)).lock, true);
+  assert.equal((await appOf(freed)).lock, false);
+  await admin('PUT', '/lock', { on: false });
+
+  // 9) everybody at once
+  const all = await admin('PUT', '/requirements', { speak: false, grammar: false });
+  assert.equal(all.status, 200);
+  const users = (await admin('GET', '/users')).data.users;
+  assert.equal(all.data.count, users.length);
+  assert.ok(users.every(u => u.req.speak === false && u.req.grammar === false));
+  assert.equal((await appOf(closed)).user.req.speak, false);
+  await admin('PUT', '/requirements', { speak: true, grammar: true });
+  assert.ok((await admin('GET', '/users')).data.users.every(u => u.req.speak === true && u.req.grammar === true));
+});

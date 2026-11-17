@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const auth = require('../auth');
 const { validateUser } = require('../validate');
-const { lessonLocks } = require('../../public/progress-core');
+const { lessonLocks, reqOf, optsOf } = require('../../public/progress-core');
 const { starsFor, summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL, VISIBLE_SQL } = require('../progress');
 const Quiz = require('../../public/quiz-core');
 const Review = require('../../public/review-core');
@@ -26,7 +26,10 @@ module.exports = function studentRoutes(pool) {
   // The activity log is for the teacher. If writing to it fails, the student must still be able to log in or sign up.
   const logQuietly = (...args) => logEvent(...args).catch(e => console.error('[events] could not log:', e.message));
 
-  const publicUser = u => ({ id: u.id, name: u.name, email: u.email, createdAt: u.created_at, arabic: Boolean(u.arabic_enabled) });
+  // `req` = the requirements the teacher switched on or off for this student (speak, quiz, order, grammar, arStep)
+  const publicUser = u => ({ id: u.id, name: u.name, email: u.email, createdAt: u.created_at, arabic: Boolean(u.arabic_enabled), req: reqOf(u) });
+  // The switches that change when a unit counts as finished (quizzes, grammar), read inside a transaction too.
+  const userOpts = async (db, uid) => optsOf((await db.query('SELECT req_quiz, req_grammar FROM users WHERE id = $1', [uid])).rows[0]);
 
   /* ================= Auth ================= */
   r.get('/config', (req, res) => res.json({ appName: process.env.APP_NAME || 'WordStack', allowSignup }));
@@ -131,7 +134,7 @@ module.exports = function studentRoutes(pool) {
     res.json({
       user: publicUser(req.user),
       stats,
-      lock: await lockIsOn(), // lessons open one by one; the app works out which are closed with the same rule (lessonLocks)
+      lock: (await lockIsOn()) && reqOf(req.user).order, // lessons open one by one (the teacher can switch it off for everybody or for this student); the app works out which are closed with the same rule (lessonLocks)
       reviews,
       lessons: lessons.rows.map(l => {
         const s = solved.get(l.id) || new Map(), x = extras.get(l.id) || new Map(), g = grammars.get(l.id) || new Set();
@@ -162,7 +165,7 @@ module.exports = function studentRoutes(pool) {
             // the Arabic is only sent to students the teacher switched it on for
             sentences: u.sentences.map(sn => ({ en: sn.en, stars: s.get(sn.en) || 0, extra: x.get(sn.en) || 0, ...(sn.gap ? { gap: sn.gap, gdone: g.has(sn.en) } : {}), ...(req.user.arabic_enabled && sn.ar ? { ar: sn.ar } : {}),
               // The Arabic -> English step shows the Arabic whether or not the card switch is on, so it travels in its own field ("arq").
-              ...(l.ar_step !== false && sn.ar ? { arq: sn.ar, ...(arbDone.has(l.id + '|' + sn.en) ? { arbDone: true } : {}) } : {}) })),
+              ...(l.ar_step !== false && reqOf(req.user).arStep && sn.ar ? { arq: sn.ar, ...(arbDone.has(l.id + '|' + sn.en) ? { arbDone: true } : {}) } : {}) })),
           })),
           lp: p ? { started_at: iso(p.started_at), last_activity_at: iso(p.last_activity_at), completed_at: iso(p.completed_at), time_spent_sec: p.time_spent_sec } : null,
           unitRows: [...(unitMap.get(l.id) || new Map()).values()].map(r => ({ unit_id: r.unit_id, learn_index: r.learn_index, learned_at: iso(r.learned_at) })),
@@ -215,7 +218,7 @@ module.exports = function studentRoutes(pool) {
         emoji: l.emoji,
         assigned: l.visibility === 'assigned',
         count: l.sentences.length,
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id), optsOf(req.user)),
       })),
     });
   }));
@@ -226,6 +229,7 @@ module.exports = function studentRoutes(pool) {
   // True when this lesson is still closed for the student: a lesson for everybody, not started yet, whose previous lesson (by level, then order) is not finished.
   async function isLessonLocked(uid, lesson) {
     if (lesson.visibility !== 'public' || !(await lockIsOn())) return null;
+    if (reqOf((await pool.query('SELECT req_order FROM users WHERE id = $1', [uid])).rows[0]).order === false) return null; // the teacher opened every lesson for this student
     const [chain, lp] = await Promise.all([
       pool.query("SELECT id, slug, title, level FROM lessons WHERE published AND visibility = 'public' ORDER BY position, title"),
       pool.query('SELECT lesson_id, completed_at FROM lesson_progress WHERE user_id = $1', [uid]),
@@ -277,7 +281,7 @@ module.exports = function studentRoutes(pool) {
           sentences: u.sentences.map(s => ({ en: s.en, stars: solved.get(s.en) || 0, extra: extras.get(s.en) || 0, ...(s.gap ? { gap: s.gap, gdone: grammar.has(s.en) } : {}) })),
         })),
       },
-      progress: summarize(lesson, lp.rows[0], solved, unitRows, extras, grammar, quiz),
+      progress: summarize(lesson, lp.rows[0], solved, unitRows, extras, grammar, quiz, optsOf(req.user)),
     });
   }));
 
@@ -289,7 +293,7 @@ module.exports = function studentRoutes(pool) {
       db.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]),
     ]);
     const p = summarize(lesson, null, new Map(sp.rows.map(x => [x.sentence, x.stars])), new Map(up.rows.map(x => [x.unit_id, x])),
-      undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id));
+      undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id), await userOpts(db, uid));
     const u = p.units.find(x => x.id === unitId);
     return Boolean(u && u.locked);
   }
@@ -329,9 +333,10 @@ module.exports = function studentRoutes(pool) {
     const quiz = groupQuiz(qa.rows).get(lesson.id) || { units: new Set(), final: false };
     const solved = new Map(rows.map(x => [x.sentence, x.stars]));
     const answered = new Set(rows.filter(x => x.grammar_done).map(x => x.sentence));
-    const isDone = u => u.sentences.every(sn => solved.has(sn.en) && (!sn.gap || answered.has(sn.en))) && quiz.units.has(u.id);
+    const o = await userOpts(client, uid); // quizzes / grammar switched off for this student by the teacher
+    const isDone = u => u.sentences.every(sn => solved.has(sn.en) && (o.grammarOff || !sn.gap || answered.has(sn.en))) && (o.quizOff || quiz.units.has(u.id));
     const allSentences = unitsOf(lesson).flatMap(u => u.sentences);
-    const allDone = unitsOf(lesson).every(isDone) && (unitsOf(lesson).length < 2 || quiz.final);
+    const allDone = unitsOf(lesson).every(isDone) && (unitsOf(lesson).length < 2 || o.quizOff || quiz.final);
     const unitDone = unit ? isDone(unit) : false;
     let justCompleted = false, unitJustCompleted = false;
     if (unit && unitDone) {
@@ -624,7 +629,7 @@ module.exports = function studentRoutes(pool) {
     if (!lesson) return res.status(404).json({ error: 'Lesson not found.' });
     const b = req.body || {};
     const sentence = String(b.sentence || '').slice(0, 400);
-    const unit = lesson.ar_step === false ? null : unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence && sn.ar));
+    const unit = lesson.ar_step === false || !reqOf(req.user).arStep ? null : unitsOf(lesson).find(u => u.sentences.some(sn => sn.en === sentence && sn.ar));
     if (!unit) return res.status(400).json({ error: 'This sentence has no Arabic step.' });
     const mistakes = clampInt(b.mistakes, 0, 999);
     const hints = clampInt(b.hints, 0, 999);
@@ -705,7 +710,7 @@ module.exports = function studentRoutes(pool) {
       const up = await client.query('SELECT * FROM unit_progress WHERE user_id = $1 AND lesson_id = $2', [uid, lesson.id]);
       const qa = await client.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND lesson_id = $2 AND ${PASSED_QUIZ_SQL}`, [uid, lesson.id]);
       const state = summarize(lesson, null, new Map(sp.rows.map(x => [x.sentence, x.stars])), new Map(up.rows.map(x => [x.unit_id, x])),
-        undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id));
+        undefined, new Set(sp.rows.filter(x => x.gdone).map(x => x.sentence)), groupQuiz(qa.rows).get(lesson.id), await userOpts(client, uid));
       if (unit) {
         const u = state.units.find(x => x.id === unit.id);
         if (u.locked) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Finish the previous unit first.' }); }

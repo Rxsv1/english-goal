@@ -47,6 +47,20 @@
   }
 
   /**
+   * The requirements the teacher can switch on or off for each student (all on by default):
+   *   speak (say each sentence on the cards), quiz (quizzes are needed to finish), order (lessons open one by one),
+   *   grammar (the grammar step is needed), arStep (the Arabic -> English step is offered).
+   * `row` is a users row (req_speak ...) or the object the app gets ({ speak, quiz, ... }).
+   */
+  const reqOf = row => {
+    const r = row || {};
+    const on = (a, b) => (r[a] !== undefined ? r[a] !== false : r[b] !== false);
+    return { speak: on('req_speak', 'speak'), quiz: on('req_quiz', 'quiz'), order: on('req_order', 'order'), grammar: on('req_grammar', 'grammar'), arStep: on('req_arstep', 'arStep') };
+  };
+  /** What summarize() needs to know about the switches: quizzes and the grammar step can be switched off for a student. */
+  const optsOf = row => { const r = reqOf(row); return { quizOff: !r.quiz, grammarOff: !r.grammar }; };
+
+  /**
    * Combines a lesson with one student's progress.
    * @param lesson   row with .units / .sentences
    * @param lp       lesson_progress row (or undefined)
@@ -56,17 +70,20 @@
    * @param grammar  Set(sentenceText) of sentences whose grammar gap the student has answered
    * @param quiz     { units: Set|Array of unit ids whose quiz is passed, final: true when the final quiz is passed }
    *
+   * @param opts     { quizOff, grammarOff }: the teacher switched quizzes / the grammar step off for this student (see optsOf)
+   *
    * A unit is finished when everything is built, every grammar gap is answered AND its quiz is passed.
    * A lesson is finished when every unit is finished AND (for a lesson with more than one unit) the final quiz is passed.
    */
-  function summarize(lesson, lp, solved, unitRows, extra, grammar, quiz) {
+  function summarize(lesson, lp, solved, unitRows, extra, grammar, quiz, opts) {
+    const quizOff = Boolean(opts && opts.quizOff), grammarOff = Boolean(opts && opts.grammarOff);
     solved = solved || new Map();
     unitRows = unitRows || new Map();
     extra = extra || new Map();
     grammar = grammar || new Set();
     const quizUnits = new Set(quiz && quiz.units ? [...quiz.units] : []);
     const unitList = unitsOf(lesson);
-    const hasFinal = unitList.length > 1; // one unit: its own quiz is the lesson's quiz
+    const hasFinal = unitList.length > 1 && !quizOff; // one unit: its own quiz is the lesson's quiz; no quizzes: no final quiz
     let prevDone = true;
     const units = unitList.map(u => {
       const list = Array.isArray(u.sentences) ? u.sentences : [];
@@ -79,10 +96,10 @@
       const row = unitRows.get(u.id);
       const learned = Boolean(row && row.learned_at);
       // A unit is finished when every sentence is built AND every grammar gap (if the teacher added any) is answered.
-      const grammarTotal = list.filter(x => x.gap).length;
-      const grammarDone = list.filter(x => x.gap && grammar.has(x.en)).length;
+      const grammarTotal = grammarOff ? 0 : list.filter(x => x.gap).length;
+      const grammarDone = grammarOff ? 0 : list.filter(x => x.gap && grammar.has(x.en)).length;
       const built = total > 0 && done === total && grammarDone === grammarTotal;
-      const quizPassed = quizUnits.has(u.id);
+      const quizPassed = quizOff || quizUnits.has(u.id);
       const completed = built && quizPassed;
       // A unit is only locked while it is brand new. Anything the student already started or finished
       // stays open (e.g. when a teacher adds a unit before it), so they can always go back.
@@ -101,6 +118,7 @@
         grammarDone,
         grammarReady: total > 0 && done === total && grammarDone < grammarTotal, // everything built, the grammar step is next
         quizPassed,
+        quizOff,
         quizReady: built && !quizPassed, // built and grammar done: the unit quiz is next
         learnIndex: row ? Math.max(0, Math.min(num(row.learn_index), total - 1)) : 0,
         completed,
@@ -128,6 +146,7 @@
       learned: units.every(u => u.learned),
       completed,
       hasFinal,
+      quizOff,
       finalPassed: hasFinal && finalPassed,
       finalReady: hasFinal && unitsDone && !finalPassed, // every unit finished: the final quiz is next
       grammarTotal: units.reduce((a, u) => a + u.grammarTotal, 0),
@@ -161,7 +180,7 @@
     }
     const rows = new Map((raw.unitRows || []).map(r => [r.unit_id, r]));
     const quiz = { units: (raw.units || []).filter(u => u.quizPassed).map(u => u.id), final: Boolean(raw.finalPassed) };
-    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra, grammar, quiz);
+    return summarize({ units: raw.units }, raw.lp || undefined, solved, rows, extra, grammar, quiz, { quizOff: raw.quizOff, grammarOff: raw.grammarOff });
   }
 
   function touchLesson(raw, seconds, now) {
@@ -263,5 +282,5 @@
     return { completed: m.completed, passed: Boolean(passed) };
   }
 
-  return { starsFor, unitsOf, LEVELS, lessonLocks, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyArb, applyQuiz };
+  return { starsFor, unitsOf, LEVELS, lessonLocks, reqOf, optsOf, summarize, modelOf, applyLearn, applySolve, applyGrammar, applyArb, applyQuiz };
 });

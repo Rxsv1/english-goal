@@ -7,6 +7,7 @@ const { validateLesson, validateUser, LEVELS } = require('../validate');
 const { summarize, unitsOf, groupSolved, groupGrammar, groupUnits, groupQuiz, PASSED_QUIZ_SQL, streak, STREAK_TYPES_SQL, EXTRA_SQL } = require('../progress');
 const { slugify } = require('../validate');
 const Words = require('../../public/words-core');
+const { reqOf, optsOf } = require('../../public/progress-core');
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 // A list of ids sent by the dashboard: strings only, and not absurdly many.
@@ -38,6 +39,7 @@ const userOut = u => ({
   createdAt: u.created_at,
   lastSeenAt: u.last_seen_at,
   arabic: Boolean(u.arabic_enabled),
+  req: reqOf(u), // the requirements the teacher switched on or off for this student
 });
 
 module.exports = function adminRoutes(pool) {
@@ -298,7 +300,7 @@ module.exports = function adminRoutes(pool) {
         ...lessonOut(l, { assignedCount: l.assigned_count }),
         assignedToUser: assignedIds.has(l.id),
         visibleToUser: l.published && (l.visibility === 'public' || assignedIds.has(l.id)),
-        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id)),
+        progress: summarize(l, lpMap.get(l.id), solved.get(l.id), unitMap.get(l.id), extras.get(l.id), grammars.get(l.id), quizBy.get(l.id), optsOf(u)),
       })),
       daily: daily.rows,
       events,
@@ -409,7 +411,7 @@ module.exports = function adminRoutes(pool) {
     const grammarByUser = groupGrammar(sp.rows, 'user_id');
     res.json({
       lesson: lessonOut(l, { units: unitsOf(l).map(u => ({ id: u.id, title: u.title, count: u.sentences.length })) }),
-      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id), grammarByUser.get(u.id), quizByUser.get(u.id)) })),
+      students: users.rows.map(u => ({ ...userOut(u), progress: summarize(l, lpMap.get(u.id), byUser.get(u.id), unitsByUser.get(u.id), extraByUser.get(u.id), grammarByUser.get(u.id), quizByUser.get(u.id), optsOf(u)) })),
     });
   }));
 
@@ -700,6 +702,65 @@ module.exports = function adminRoutes(pool) {
     res.json({ updated, unchanged, lessonsChanged, received: pairs.size, notFound: notFound.length, notFoundExamples: notFound.slice(0, 5), rejected: rejected.length, rejectedExamples: rejected.slice(0, 5) });
   }));
 
+  /* ================= Requirements for each student =================
+   * speak: the student must say each sentence on the cards; quiz: quizzes are needed to finish a unit / lesson; order: lessons open one by one;
+   * grammar: the grammar step is needed; arStep: the Arabic -> English step is offered. All ON by default. The teacher switches them for one student or for all.
+   */
+  const REQ_COLUMNS = { speak: 'req_speak', quiz: 'req_quiz', order: 'req_order', grammar: 'req_grammar', arStep: 'req_arstep' };
+  const pickReq = body => {
+    const out = {};
+    for (const [k, col] of Object.entries(REQ_COLUMNS)) if (body && typeof body[k] === 'boolean') out[col] = body[k];
+    return out;
+  };
+
+  // When quizzes or the grammar step are switched off, a lesson the student already did everything else for is finished now: it is marked finished
+  // (once, with a note in the log), so the next lesson opens and nothing waits for a quiz that is no longer needed. Nothing ever goes back.
+  async function finishLessonsNowDone(userIds) {
+    if (!userIds.length) return 0;
+    const [lessons, users] = await Promise.all([pool.query('SELECT * FROM lessons'), pool.query('SELECT * FROM users WHERE id = ANY($1::text[])', [userIds])]);
+    let finished = 0;
+    for (const u of users.rows) {
+      const [lp, sp, up, qa] = await Promise.all([
+        pool.query('SELECT * FROM lesson_progress WHERE user_id = $1 AND completed_at IS NULL', [u.id]),
+        pool.query('SELECT lesson_id, sentence, stars, grammar_done AS gdone FROM sentence_progress WHERE user_id = $1', [u.id]),
+        pool.query('SELECT * FROM unit_progress WHERE user_id = $1', [u.id]),
+        pool.query(`SELECT lesson_id, scope, passed FROM quiz_attempts WHERE user_id = $1 AND ${PASSED_QUIZ_SQL}`, [u.id]),
+      ]);
+      const solved = groupSolved(sp.rows), grammars = groupGrammar(sp.rows), unitMap = groupUnits(up.rows), quizBy = groupQuiz(qa.rows);
+      for (const row of lp.rows) {
+        const l = lessons.rows.find(x => x.id === row.lesson_id);
+        if (!l) continue;
+        const p = summarize(l, row, solved.get(l.id), unitMap.get(l.id), undefined, grammars.get(l.id), quizBy.get(l.id), optsOf(u));
+        if (!p.completed) continue;
+        const upd = await pool.query('UPDATE lesson_progress SET completed_at = now() WHERE user_id = $1 AND lesson_id = $2 AND completed_at IS NULL', [u.id, l.id]);
+        if (upd.rowCount) {
+          finished++;
+          await pool.query("INSERT INTO events (user_id, lesson_id, type, data) VALUES ($1,$2,'lesson_complete',$3::jsonb)",
+            [u.id, l.id, JSON.stringify({ stars: p.stars, maxStars: p.maxStars, byTeacherSwitch: true })]);
+        }
+      }
+    }
+    return finished;
+  }
+
+  r.put('/users/:id/requirements', wrap(async (req, res) => {
+    const set = pickReq(req.body);
+    const cols = Object.keys(set);
+    if (!cols.length) return res.status(400).json({ error: 'Nothing to change.' });
+    const { rows: [u] } = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')} WHERE id = $1 RETURNING *`, [req.params.id, ...cols.map(c => set[c])]);
+    if (!u) return res.status(404).json({ error: 'Student not found.' });
+    const finished = set.req_quiz === false || set.req_grammar === false ? await finishLessonsNowDone([u.id]) : 0;
+    res.json({ req: reqOf(u), finished });
+  }));
+  r.put('/requirements', wrap(async (req, res) => {
+    const set = pickReq(req.body);
+    const cols = Object.keys(set);
+    if (!cols.length) return res.status(400).json({ error: 'Nothing to change.' });
+    const { rows } = await pool.query(`UPDATE users SET ${cols.map((c, i) => `${c} = $${i + 1}`).join(', ')} RETURNING id`, cols.map(c => set[c]));
+    const finished = set.req_quiz === false || set.req_grammar === false ? await finishLessonsNowDone(rows.map(x => x.id)) : 0;
+    res.json({ count: rows.length, finished });
+  }));
+
   // Arabic on the cards: switched on for one student, or for everyone at once.
   r.put('/users/:id/arabic', wrap(async (req, res) => {
     const enabled = Boolean(req.body && req.body.enabled);
@@ -910,7 +971,7 @@ module.exports = function adminRoutes(pool) {
         const k = u.id + '|' + l.id;
         const visible = l.visibility === 'public' || assignedSet.has(l.id + '|' + u.id);
         if (!visible && !lpMap.has(k)) continue;
-        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k), grMap.get(k), qzMap.get(k));
+        const p = summarize(l, lpMap.get(k), spMap.get(k), upMap.get(k), exMap.get(k), grMap.get(k), qzMap.get(k), optsOf(u));
         lines.push([u.name, u.email, l.title, l.level, p.status, p.unitsCompleted, p.unitsTotal, p.units.filter(u => u.learned).length + '/' + p.unitsTotal, p.solved, p.total, p.stars, p.extra, p.maxStars,
           Math.round(p.timeSpent / 60), p.completedAt ? new Date(p.completedAt).toISOString() : '',
           p.lastActivityAt ? new Date(p.lastActivityAt).toISOString() : ''].map(esc).join(','));

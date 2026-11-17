@@ -450,6 +450,59 @@
     );
   }
 
+  /* ================= requirements for each student ================= */
+  // What a student has to do in the lessons. All ON by default; the teacher can switch each one off for one student, or for everybody.
+  const REQUIREMENTS = [
+    { key: 'speak', icon: '🎤', title: 'Say every sentence out loud', help: 'On the Learn cards the student must say each sentence (microphone or “I said it out loud”) before the next one. Off: the cards are free to move through, with no microphone.' },
+    { key: 'quiz', icon: '❓', title: 'Pass the quizzes', help: 'A unit and a lesson finish only after the quiz is passed. Off: they finish after building (and the grammar), so the next lesson opens without a quiz. Lessons already built are finished now.' },
+    { key: 'order', icon: '🔒', title: 'Lessons open one by one', help: 'The next lesson opens only after the one before it is finished. Off: every lesson is open for this student (the setting on the Lessons page still applies to the others).' },
+    { key: 'grammar', icon: '✏️', title: 'Grammar step', help: 'The “choose the missing word” step after building is required. Off: it is skipped (and daily reviews have no grammar questions).' },
+    { key: 'arStep', icon: '🔤', title: 'Arabic → English step', help: 'After Build, the student builds the English from the Arabic (only for sentences that have Arabic). Off: this step is not offered.' },
+  ];
+  const reqValue = (u, key) => !(u && u.req && u.req[key] === false);
+  const reqToast = (what, on, r) => toast(`${what}: ${on ? 'ON' : 'OFF'}${r && r.finished ? ` · ${plural(r.finished, 'lesson')} finished now` : ''}`);
+
+  // On a student's card: one switch for each requirement.
+  function requirementsPanel(u, id) {
+    const rows = REQUIREMENTS.map(q => {
+      const box = h('input', { type: 'checkbox', checked: reqValue(u, q.key), 'aria-label': q.title });
+      box.addEventListener('change', async () => {
+        try {
+          const r = await api('PUT', `/api/admin/users/${id}/requirements`, { [q.key]: box.checked });
+          u.req = r.req; cache.delete('/api/admin/users'); cache.delete(`/api/admin/users/${id}`);
+          reqToast(`${q.title} for ${u.name}`, box.checked, r);
+        } catch (e) { box.checked = !box.checked; toast(e.message); }
+      });
+      return h('div', { class: 'req-row' }, h('label', { class: 'switch' }, box, h('span', null, `${q.icon} ${q.title}`)), h('small', { class: 'muted' }, q.help));
+    });
+    return h('div', { class: 'panel' }, h('h2', null, '⚙️ Requirements for this student'),
+      h('p', { class: 'muted' }, 'Everything is ON by default. Switch a requirement off for this student only. Their progress, stars and earlier results are never changed.'), ...rows);
+  }
+
+  // On the Students page: the same switches for all students at once.
+  function requirementsBar(users) {
+    const draw = () => body.replaceChildren(...REQUIREMENTS.map(q => {
+      const on = users.filter(u => reqValue(u, q.key)).length;
+      const setAll = async value => {
+        if (!users.length) return;
+        if (!confirm(`${value ? 'Turn ON' : 'Turn OFF'} “${q.title}” for all ${plural(users.length, 'student')}?`)) return;
+        try {
+          const r = await api('PUT', '/api/admin/requirements', { [q.key]: value });
+          users.forEach(u => { u.req = { ...(u.req || {}), [q.key]: value }; cache.delete(`/api/admin/users/${u.id}`); });
+          cache.delete('/api/admin/users'); draw(); reqToast(`${q.title} for everyone`, value, r);
+        } catch (e) { toast(e.message); }
+      };
+      return h('div', { class: 'req-row all' },
+        h('div', { class: 'req-text' }, h('b', null, `${q.icon} ${q.title}`), h('small', { class: 'muted' }, ` · on for ${on} of ${plural(users.length, 'student')}`)),
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setAll(true) }, 'On for all'),
+        h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => setAll(false) }, 'Off for all'));
+    }));
+    const body = h('div', null);
+    draw();
+    return h('details', { class: 'panel req-bar' }, h('summary', null, '⚙️ Requirements for all students'),
+      h('p', { class: 'muted' }, 'Switch a lesson requirement on or off for everybody at once. To change one student, open the student’s card.'), body);
+  }
+
   /* ================= students ================= */
   async function showStudents() {
     const my = viewId;
@@ -546,6 +599,7 @@
       addForm,
       h('div', { class: 'section' }, search),
       arabicBar,
+      requirementsBar(users),
       h('div', { class: 'section' }, filterRow),
       h('div', { class: 'section' }, list)
     );
@@ -684,6 +738,7 @@
           h('div', { class: 'muted' }, `${u.email} · joined ${new Date(u.createdAt).toLocaleDateString()} · last seen ${timeAgo(u.lastSeenAt)}`))),
       h('div', { class: 'section' }, actions),
       editForm,
+      h('div', { class: 'section' }, requirementsPanel(u, id)),
       // Two columns on a computer: the student's numbers and lessons on the left, the quizzes and the timeline on the right.
       h('div', { class: 'cols section' },
       h('div', { class: 'col' },

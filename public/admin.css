@@ -265,3 +265,12 @@ table.data a { color: inherit; }
 
 /* Word meanings box in the lesson editor */
 .form .words-edit textarea { min-height: 120px; direction: ltr; background: var(--surface); }
+
+/* Requirements (what a student has to do): switches on the student's card and for all students */
+.req-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); }
+.req-row:first-of-type { border-top: 0; }
+.req-row small { margin-left: 2.6rem; }
+.req-row.all { flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; }
+.req-row.all .req-text { flex: 1; min-width: 12rem; }
+.req-bar > summary { cursor: pointer; font-weight: 700; font-size: 1.0625rem; }
+.req-bar[open] > summary { margin-bottom: 8px; }

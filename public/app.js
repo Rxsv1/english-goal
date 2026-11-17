@@ -305,6 +305,8 @@
           slug: l.slug, title: text(l.title), level: text(l.level), description: text(l.description), emoji: text(l.emoji) || '📘',
           assigned: Boolean(l.assigned),
           finalPassed: Boolean(l.finalPassed),
+          // quizzes / the grammar step switched off for this student: the progress rules (progress-core.js) then do not need them
+          quizOff: Progress.reqOf(d.user.req).quiz === false, grammarOff: Progress.reqOf(d.user.req).grammar === false,
           // word meanings { word: Arabic }: only plain strings are kept
           words: isObj(l.words) ? Object.fromEntries(Object.entries(l.words).filter(([k, v]) => k.length <= 40 && typeof v === 'string' && v.trim()).slice(0, 1000).map(([k, v]) => [k, v.slice(0, 80)])) : {},
           units,
@@ -314,7 +316,8 @@
         });
       }
       return {
-        user: { id: d.user.id, name: text(d.user.name), email: text(d.user.email), createdAt: d.user.createdAt || null, arabic: Boolean(d.user.arabic) },
+        // req = the requirements the teacher switched on or off for this student (everything is on unless the server says false)
+        user: { id: d.user.id, name: text(d.user.name), email: text(d.user.email), createdAt: d.user.createdAt || null, arabic: Boolean(d.user.arabic), req: Progress.reqOf(d.user.req) },
         stats: { sentencesSolved: toNum(st.sentencesSolved), stars: toNum(st.stars), extraStars: toNum(st.extraStars),
           lessonsCompleted: toNum(st.lessonsCompleted), timeSpent: toNum(st.timeSpent), streak: toNum(st.streak) },
         lessons,
@@ -368,7 +371,7 @@
     const items = S.lessons.map(l => ({
       slug: l.slug, title: l.title, level: l.level, description: l.description, emoji: l.emoji, assigned: l.assigned,
       count: l.units.reduce((a, u) => a + u.sentences.length, 0), progress: modelOf(l),
-      started: Boolean(l.lp) || (l.unitRows || []).length > 0, finished: Boolean(l.lp && l.lp.completed_at),
+      started: Boolean(l.lp) || (l.unitRows || []).length > 0, finished: Boolean(l.lp && l.lp.completed_at) || modelOf(l).completed,
     }));
     const locks = S.lock === false ? new Map() : Progress.lessonLocks(items.map(l => ({ slug: l.slug, title: l.title, level: l.level, assigned: l.assigned, started: l.started, completed: l.finished })));
     items.forEach(l => { const k = locks.get(l.slug); l.locked = Boolean(k && k.locked); l.lockedBy = k && k.by ? k.by.title : null; });
@@ -378,6 +381,8 @@
     }
     return items;
   }
+  // The requirements the teacher switched on or off for this student (speak, quiz, order, grammar, arStep); all on unless switched off.
+  const reqOn = key => !(S && S.user && S.user.req && S.user.req[key] === false);
   const lockedLesson = slug => (S ? lessonList().find(l => l.slug === slug && l.locked) || null : null);
   // A private copy for a screen to work with (a round must not change under its own feet).
   function lessonView(slug) {
@@ -421,7 +426,7 @@
     for (const r of (S && S.reviews) || []) {
       const raw = rawLesson(r.slug);
       const sn = raw && raw.units.flatMap(u => u.sentences).find(x => x.en === r.sentence);
-      if (sn) out.push({ slug: r.slug, sentence: r.sentence, stage: r.stage, hasGap: Boolean(sn.gap) });
+      if (sn) out.push({ slug: r.slug, sentence: r.sentence, stage: r.stage, hasGap: Boolean(sn.gap) && reqOn('grammar') }); // no Grammar questions when that step is off
     }
     return out;
   }
@@ -1126,7 +1131,7 @@
         up.learned && up.solved === up.total && arbCounts(unit).total ? rowLink('🔤', 'Arabic → English', `Build the English from the Arabic · ${arbCounts(unit).done} of ${arbCounts(unit).total} done`,
           unitPath(slug, unit, 'arbuild') + (arbCounts(unit).done === arbCounts(unit).total ? '?replay=1' : '')) : null,
         up.learned && up.grammarTotal && up.solved === up.total ? rowLink('✏️', 'Grammar', `Choose the missing word · ${up.grammarDone} of ${up.grammarTotal}`, unitPath(slug, unit, 'grammar') + '?replay=1') : null,
-        up.quizReady || up.quizPassed ? rowLink('❓', 'Quiz', up.quizPassed ? 'Passed · take it again if you like' : 'The last step of this unit', unitPath(slug, unit, 'quiz')) : null);
+        !up.quizOff && (up.quizReady || up.quizPassed) ? rowLink('❓', 'Quiz', up.quizPassed ? 'Passed · take it again if you like' : 'The last step of this unit', unitPath(slug, unit, 'quiz')) : null);
       let more = null;
       if (up.learned) {
         const ul = h('ul', { class: 'sn-list', hidden: true }, unit.sentences.map((sn, k) => h('li', null,
@@ -1176,7 +1181,7 @@
             h('span', { class: up.solved === up.total ? 'ok' : '', html: ICON.puzzle }, `Build ${up.solved}/${up.total}`),
             ab.total ? h('span', { class: ab.done === ab.total ? 'ok' : '' }, `🔤 Arabic ${ab.done}/${ab.total}`) : null,
             up.grammarTotal ? h('span', { class: up.grammarDone === up.grammarTotal ? 'ok' : '' }, `✏️ Grammar ${up.grammarDone}/${up.grammarTotal}`) : null,
-            h('span', { class: up.quizPassed ? 'ok' : '' }, `❓ Quiz ${up.quizPassed ? '✓' : '–'}`),
+            up.quizOff ? null : h('span', { class: up.quizPassed ? 'ok' : '' }, `❓ Quiz ${up.quizPassed ? '✓' : '–'}`),
             up.stars ? h('span', { class: 'star', html: ICON.star }, String(up.stars)) : null),
           h('a', { class: 'btn btn-primary btn-block btn-play', href: unitPath(slug, unit, step), 'data-link': true }, '▶ ', label));
       }
@@ -1290,6 +1295,7 @@
       return runPuzzle({ ...ctx, items, mode: 'arbuild', replay, exitPath: `/lesson/${slug}` });
     }
     if (step === 'grammar') {
+      if (!reqOn('grammar')) return navigate(`/lesson/${slug}`, true); // the teacher switched the grammar step off for this student
       // Normally only the gaps still to answer, once everything is built; a replay (or a restart) plays them all again.
       const replay = q.get('replay') === '1' || flags.restart;
       if (!replay && up.solved < up.total) { toast('Build the sentences first 🧩'); return navigate(unitPath(slug, unit, 'build'), true); }
@@ -1357,7 +1363,7 @@
     // One main button: first "I said it out loud", then "Next".
     const next = h('button', { class: 'btn btn-main btn-primary', type: 'button' });
     // The first time through (and when starting over) every sentence must be said out loud before moving on.
-    const needSay = !up.learned || restart;
+    const needSay = (!up.learned || restart) && reqOn('speak'); // the teacher can switch "say every sentence" off for a student
     const saidOut = new Set();
     // Speaking check: with speech recognition the "I said it out loud" button becomes a microphone. The student says the sentence, the phone compares
     // what it heard with the sentence (speak-core.js) and colours the words it did not hear. Up to 3 tries, then they may continue anyway.
