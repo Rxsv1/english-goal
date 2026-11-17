@@ -6,6 +6,8 @@ const MAX_SENTENCES = 200;
 const MAX_UNITS = 30;
 const UNIT_ID_RE = /^[a-z0-9]{4,24}$/i;
 const crypto = require('crypto');
+const Grammar = require('../public/grammar-core'); // understands [is|are|am] gaps (shared with the editor and the app)
+const Words = require('../public/words-core');     // word meanings: { "airport": "مطار" } (shared with the editor and the app)
 const newUnitId = () => crypto.randomBytes(5).toString('hex');
 
 function slugify(text) {
@@ -29,6 +31,9 @@ function countWords(en) {
 }
 
 const str = v => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ') : '');
+// A grammar tip may have several short lines: spaces are tidied inside each line, empty lines are dropped.
+const MAX_TIP = 300;
+const tipText = v => (typeof v === 'string' ? v.split(/\r?\n/).map(x => x.trim().replace(/\s+/g, ' ')).filter(Boolean).join('\n') : '');
 
 /**
  * Validates and normalises lesson input from the admin API.
@@ -42,7 +47,7 @@ function validateLesson(input) {
   if (!title) errors.push('Title is required.');
   else if (title.length > 80) errors.push('Title must be 80 characters or fewer.');
 
-  let slug = str(input.slug).toLowerCase() || slugify(title);
+  const slug = str(input.slug).toLowerCase() || slugify(title);
   if (!slug) errors.push('Link name (slug) is required.');
   else if (!SLUG_RE.test(slug) || slug.length > 60)
     errors.push('Link name may use only a-z, 0-9 and single dashes (max 60 characters).');
@@ -57,6 +62,14 @@ function validateLesson(input) {
   if ([...emoji].length > 8) errors.push('Icon must be a single emoji.');
 
   const published = input.published === undefined ? true : Boolean(input.published);
+  // Arabic -> English step on/off for this lesson. Left undefined when the input does not say, so an older file never changes the setting.
+  // Word meanings. Left undefined when the input does not mention them, so an older file never erases the list.
+  let words;
+  if (input.words !== undefined && input.words !== null) {
+    const checked = Words.check(input.words);
+    if (checked.error) errors.push(checked.error); else words = checked.words;
+  }
+  const arStep = input.arStep === undefined || input.arStep === null ? undefined : Boolean(input.arStep);
 
   const visibility = input.visibility === 'assigned' ? 'assigned' : 'public';
   let assignedUserIds;
@@ -67,7 +80,7 @@ function validateLesson(input) {
     else assignedUserIds = [...new Set(input.assignedUserIds)];
   }
 
-  // Units: [{ id?, title, sentences:[{en}] }]. A plain "sentences" list becomes one unit.
+  // Units: [{ id?, title, tip?, tipAr?, sentences:[{en}] }]. A plain "sentences" list becomes one unit.
   let rawUnits = input.units;
   if (!Array.isArray(rawUnits) || rawUnits.length === 0) {
     rawUnits = Array.isArray(input.sentences) && input.sentences.length ? [{ title: 'Unit 1', sentences: input.sentences }] : [];
@@ -86,12 +99,29 @@ function validateLesson(input) {
       let id = typeof (u && u.id) === 'string' && UNIT_ID_RE.test(u.id) ? u.id : newUnitId();
       while (seenIds.has(id)) id = newUnitId();
       seenIds.add(id);
+      const tip = tipText(u && u.tip), tipAr = tipText(u && u.tipAr);
+      if (tip.length > MAX_TIP) errors.push(`Unit ${un} (${utitle}): the grammar tip must be ${MAX_TIP} characters or fewer.`);
+      if (tipAr.length > MAX_TIP) errors.push(`Unit ${un} (${utitle}): the Arabic grammar tip must be ${MAX_TIP} characters or fewer.`);
       const list = Array.isArray(u && u.sentences) ? u.sentences : [];
+      if (list.length > MAX_SENTENCES) { errors.push(`Unit ${un} (${utitle}): at most ${MAX_SENTENCES} sentences.`); return; }
       if (!list.length) errors.push(`Unit ${un} (${utitle}): add at least one sentence.`);
       const out = [];
       list.forEach((sn, i) => {
-        const en = str(typeof sn === 'string' ? sn : sn && sn.en);
         const where = rawUnits.length > 1 ? `Unit ${un}, sentence ${i + 1}` : `Sentence ${i + 1}`;
+        // A line may carry one grammar gap, written like: She [is|are|am] reading a book.
+        // ...and its Arabic translation after " // " (or in an "ar" field when the lesson comes from a file)
+        const { text: lineText, ar: lineAr } = Grammar.splitAr(typeof sn === 'string' ? sn : sn && typeof sn.en === 'string' ? sn.en : '');
+        const parsed = Grammar.parseLine(lineText);
+        if (parsed.error) return errors.push(`${where}: ${parsed.error}`);
+        const ar = str(lineAr || (sn && typeof sn === 'object' && typeof sn.ar === 'string' ? sn.ar : ''));
+        if (ar.length > 300) return errors.push(`${where}: the Arabic translation must be 300 characters or fewer.`);
+        const en = str(parsed.en);
+        let gap = parsed.gap;
+        if (!gap && sn && typeof sn === 'object' && sn.gap !== undefined && sn.gap !== null) {
+          const checked = Grammar.checkGap(sn.gap, en);
+          if (checked.error) return errors.push(`${where}: ${checked.error}`);
+          gap = checked.gap;
+        }
         if (!en) return errors.push(`${where}: English text is required.`);
         if (en.length > 200) return errors.push(`${where}: must be 200 characters or fewer.`);
         if (!/\p{Script=Latin}/u.test(en)) return errors.push(`${where}: must contain English words.`);
@@ -99,17 +129,17 @@ function validateLesson(input) {
         if (countWords(en) > 20) return errors.push(`${where}: has more than 20 words - split it up.`);
         if (seenText.has(en)) return errors.push(`${where}: this sentence is already used (${seenText.get(en)}).`);
         seenText.set(en, where);
-        out.push({ en });
+        out.push({ en, ...(gap ? { gap } : {}), ...(ar ? { ar } : {}) });
       });
       total += out.length;
-      units.push({ id, title: utitle, sentences: out });
+      units.push({ id, title: utitle, ...(tip ? { tip } : {}), ...(tipAr ? { tipAr } : {}), sentences: out });
     });
     if (total > MAX_SENTENCES) errors.push(`A lesson can have at most ${MAX_SENTENCES} sentences in total.`);
   }
   const sentences = units.flatMap(u => u.sentences);
 
   if (errors.length) return { errors };
-  return { lesson: { title, slug, level, description, emoji, published, visibility, units, sentences }, assignedUserIds };
+  return { lesson: { title, slug, level, description, emoji, published, visibility, units, sentences, ...(arStep === undefined ? {} : { arStep }), ...(words === undefined ? {} : { words }) }, assignedUserIds };
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

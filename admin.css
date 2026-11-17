@@ -143,3 +143,134 @@ table.data a { color: inherit; }
 .give-existing { margin-top: 14px; }
 .give-existing > summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
 .admin-item .btns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* ---------- Skeleton screens (shimmer + base styles live in style.css) ---------- */
+#view { position: relative; }
+.sk-admin-title { width: 180px; height: 34px; margin: 0; }
+.sk-admin-btn { width: 130px; height: 40px; }
+.sk-tile-v { height: 32px; width: 50%; margin-bottom: 8px; }
+.sk-chart { height: 120px; margin-top: 14px; border-radius: 10px; }
+.sk-rows { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.sk-row { height: 22px; border-radius: 6px; }
+.sk-search { height: 44px; border-radius: 12px; margin-bottom: 14px; }
+.sk-item { min-height: 72px; pointer-events: none; }
+.sk-item .info { display: flex; flex-direction: column; }
+
+/* Large screens: the dashboard uses the width of the screen (phones and narrow windows are unchanged) */
+@media (min-width: 1100px) {
+  .admin-page { max-width: 87.5rem; }
+  .tiles { grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); }
+}
+
+/* ---- v5: monitoring ---- */
+.tag-warn { background: #FFF1D6; color: #B35C00; }
+:root[data-theme="dark"] .tag-warn { background: #3A3016; color: #F6C768; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .tag-warn { background: #3A3016; color: #F6C768; } }
+.chips-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+.admin-item .sub + .sub { margin-top: 1px; }
+.panel.attention { border-color: #F4CE6A; }
+.panel.attention .admin-item { background: transparent; }
+
+.tl-day { margin-top: 14px; }
+.tl-day h3 { margin: 0 0 6px; font-size: .9375rem; }
+.tl-day h3 small { color: var(--muted); font-weight: 600; }
+
+.sub-h { margin: 18px 0 8px; font-size: .9375rem; }
+.attempts { display: flex; flex-direction: column; gap: 8px; }
+.attempt { border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.attempt.pass { border-left: 4px solid var(--success-dark); }
+.attempt.fail { border-left: 4px solid #F59F00; }
+.attempt.voided { opacity: .6; }
+.attempt > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; cursor: pointer; padding: 10px 14px; list-style: none; }
+.attempt > summary::-webkit-details-marker { display: none; }
+.attempt .sc { font-weight: 800; font-variant-numeric: tabular-nums; min-width: 2.8em; }
+.attempt .what { font-weight: 600; flex: 1 1 200px; }
+.attempt .when { color: var(--muted); font-size: .875rem; }
+.qa-list { margin: 0; padding: 4px 14px 12px 14px; list-style: none; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); }
+.qa-list li { display: flex; gap: 10px; padding-top: 8px; }
+.qa-list .mark { font-weight: 800; width: 1.2em; flex: none; }
+.qa-list li.ok .mark { color: var(--success-dark); }
+.qa-list li.bad .mark { color: var(--danger); }
+.qa-list .qk { font-weight: 600; }
+.qa-list small { color: var(--muted); display: block; }
+.qa-list small b { color: var(--text); }
+
+/* ---- v6: computers ---- */
+.admin-page { max-width: 1280px; }
+.cols { display: block; }
+@media (min-width: 1300px) {
+  .cols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 0 20px; align-items: start; }
+  .cols .col { min-width: 0; }
+  .cols .tiles { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+}
+.admin-item:focus-visible, .chip:focus-visible, .attempt > summary:focus-visible, .tabs a:focus-visible { outline: none; box-shadow: var(--ring); }
+.attempt > summary:hover { background: var(--surface-2); border-radius: 14px; }
+.tabs a:hover { color: var(--text); }
+@media (min-width: 1300px) {
+  .cols .data { font-size: .875rem; }
+  .cols .data th, .cols .data td { padding-left: 6px; padding-right: 6px; }
+  .cols .data th:nth-child(6), .cols .data td:nth-child(6) { display: none; } /* the time column: it is on the student's tiles already */
+  .cols .data td:first-child { min-width: 9rem; }
+  .cols .data .mini-bar { width: 56px; }
+}
+
+/* ---- v7: on a computer the sections (Overview, Students, Lessons) are a sidebar on the left ---- */
+@media (min-width: 1000px) {
+  .admin-page { max-width: 1560px; display: grid; grid-template-columns: 13.5rem minmax(0, 1fr); grid-template-rows: auto 1fr; column-gap: 2rem; align-items: start; }
+  .admin-page:has(> #tabs[hidden]) { display: block; max-width: 1000px; }   /* the login screen has no sidebar */
+  .admin-page > .appbar { grid-column: 1; grid-row: 1; flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: .75rem; padding-top: .25rem; }
+  .admin-page > .tabs { grid-column: 1; grid-row: 2; flex-direction: column; gap: 4px; margin: 0; border-bottom: 0; overflow: visible; position: sticky; top: 1rem; }
+  .admin-page > #view { grid-column: 2; grid-row: 1 / span 2; min-width: 0; }
+  .tabs a { margin: 0; border-bottom: 0; border-radius: .75rem; padding: .625rem .875rem; }
+  .tabs a:hover { background: var(--surface-2); }
+  .tabs a[aria-current="page"] { background: var(--surface); box-shadow: var(--shadow-sm); border: 1px solid var(--line); padding: calc(.625rem - 1px) calc(.875rem - 1px); }
+}
+
+/* ---- v8: Arabic switches ---- */
+.ar-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 0; padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+.ar-ic { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; background: var(--accent-soft); color: var(--accent-dark); font-weight: 700; font-size: 1.1rem; }
+.ar-count { font-weight: 600; }
+.ar-toggle {
+  min-width: 38px; height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface-2);
+  color: var(--faint); font-weight: 700; font-size: .95rem; cursor: pointer; line-height: 1;
+}
+.ar-toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ar-toggle:hover { border-color: var(--accent); }
+.ar-toggle:focus-visible { outline: none; box-shadow: var(--ring); }
+.ar-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 260px; }
+.ar-note { color: var(--muted); font-weight: 500; }
+
+/* ---- Arabic translations panel ---- */
+.ar-panel { display: flex; flex-direction: column; gap: 12px; }
+.ar-panel h2 { margin: 0; }
+.ar-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.mini-bar.wide { width: 140px; }
+.ar-steps { margin: 0; padding-left: 1.3rem; display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+.ar-prompt summary { cursor: pointer; font-weight: 600; color: var(--muted); }
+.ar-prompt p { margin: 8px 0 0; padding: 10px 12px; background: var(--surface-2); border-radius: 12px; font-size: .9rem; line-height: 1.5; user-select: all; }
+.ar-answer { width: 100%; min-height: 110px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); font: inherit; font-size: .9rem; resize: vertical; outline: none; }
+.ar-answer:focus { border-color: var(--accent); }
+.ar-replace { margin-left: auto; font-size: .875rem; }
+.ar-result:empty { display: none; }
+.ar-result { padding: 10px 12px; border-radius: 12px; font-weight: 600; display: flex; flex-direction: column; gap: 4px; background: var(--surface-2); }
+.ar-result.good { background: var(--success); color: var(--success-text); }
+.ar-result.warn { background: #FFF1D6; color: #8A4B00; }
+.ar-result.bad { background: var(--danger-soft); color: var(--danger); }
+
+/* Grammar tip box inside a unit of the lesson editor */
+.unit-tip { margin-top: 4px; }
+.unit-tip > summary { cursor: pointer; font-weight: 600; font-size: .9375rem; color: var(--muted); padding: 6px 0; }
+.unit-tip .help { margin: 4px 0 8px; }
+.form .unit-edit textarea.tip-input { min-height: 64px; margin-bottom: 8px; }
+
+/* Word meanings box in the lesson editor */
+.form .words-edit textarea { min-height: 120px; direction: ltr; background: var(--surface); }
+
+/* Requirements (what a student has to do): switches on the student's card and for all students */
+.req-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); }
+.req-row:first-of-type { border-top: 0; }
+.req-row small { margin-left: 2.6rem; }
+.req-row.all { flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; }
+.req-row.all .req-text { flex: 1; min-width: 12rem; }
+.req-bar > summary { cursor: pointer; font-weight: 700; font-size: 1.0625rem; }
+.req-bar[open] > summary { margin-bottom: 8px; }

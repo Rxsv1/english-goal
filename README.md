@@ -70,6 +70,25 @@ In JSON: `"units": [{ "title": "...", "tip": "...", "tipAr": "...", "sentences":
 Export writes them, import reads them. An older file with **no** `tip` key does not erase the tips already written for a unit with the same title
 (write `"tip": ""` to remove one on purpose).
 
+### Requirements for each student (teacher)
+
+Everything a student has to do can be switched **off for one student, or for all students**, without touching their progress. All switches are **ON** by default (the app works as before).
+Open a student's card: **⚙️ Requirements for this student**; on the Students page: **⚙️ Requirements for all students** (On for all / Off for all, with how many students have it on).
+
+| Switch | When it is OFF for a student |
+|---|---|
+| 🎤 **Say every sentence out loud** | The Learn cards have no microphone and no "I said it out loud" lock: the student moves through the cards freely. |
+| ❓ **Pass the quizzes** | A unit and a lesson finish after building (and the grammar), with no unit or final quiz, so the next lesson opens too. |
+| 🔒 **Lessons open one by one** | Every lesson is open for this student (the Lessons page switch still applies to the others). |
+| ✏️ **Grammar step** | The grammar step is skipped; it is not needed to finish a unit; daily reviews have no grammar questions. |
+| 🔤 **Arabic → English step** | The step is not offered (the Arabic of the step is not sent). |
+
+- **Lessons already done are finished now.** When quizzes or the grammar step are switched off, a lesson the student already built (and was only waiting at a quiz or grammar for) is marked
+  finished at once (with a note in the timeline, "completed … by teacher switch"), so the next lesson opens. Switching a requirement back **on** never takes anything away: finished lessons stay finished.
+- **Same rules everywhere:** the app and the server use the same code (`summarize(…, opts)` and `reqOf` in `public/progress-core.js`), so what the student sees, the teacher's reports and the CSV agree.
+- Technical: five columns on `users` (`req_speak`, `req_quiz`, `req_order`, `req_grammar`, `req_arstep`); `PUT /api/admin/users/:id/requirements` and `PUT /api/admin/requirements` with
+  `{ "speak": false, … }`; the student's `GET /api/app` returns `user.req`.
+
 ### Lessons open one by one (teacher)
 
 Lessons for everybody are **closed until the student passes the quiz of the lesson before it**. The order is **by level (A1, A2, B1 …) and then the order on the Lessons page** (drag ☰ to change it).
@@ -219,6 +238,7 @@ Upgrading is automatic: on start the app adds any new tables, turns older lesson
 **After updating to this version** (nothing is required, but this is what happens and what a teacher may want to do):
 - New columns/tables are added on the first start (`lessons.ar_step`, `lessons.words`, `sentence_progress.arb_*`, `review_items`, `speaking_scores`). Nothing is removed or changed, and no one's stars, units, quizzes or lesson completion change.
 - **Lessons open one by one is ON** from the first start: students see unstarted lessons as closed until they pass the quiz of the lesson before it (lessons already started stay open). Switch it off on the Lessons page if you do not want it yet.
+- **Requirements per student:** five new switches per student, all ON, so nothing changes until the teacher switches one off (see "Requirements for each student").
 - **Daily review:** on that first start, sentences students already found hard are added to their review schedules, with the first reviews **spread over the next 7 days**. Students will see a **🧠 Review (N)** card from tomorrow.
 - **Arabic → English step:** it appears after Build for every sentence that already has Arabic (it is optional for students). To stop it for a lesson, untick **Arabic → English step** in that lesson's editor.
 - **Grammar tips, "why", word meanings:** nothing shows until the teacher writes them (lesson editor, JSON, or the *Word meanings* download for the AI on the Lessons page).

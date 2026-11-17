@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const seed = require('./seed');
 const { newUnitId } = require('./validate');
+const { summarize, unitsOf } = require('../public/progress-core');
 
 function createPool() {
   if (!process.env.DATABASE_URL && !process.env.PGHOST) {
@@ -14,7 +15,14 @@ function createPool() {
   }
   const ssl = /^(1|true|require)$/i.test(process.env.PGSSL || '') ? { rejectUnauthorized: false } : undefined;
   // pg also reads PGPASSWORD / PGUSER / PGHOST etc. for anything missing from DATABASE_URL.
-  return new Pool({ connectionString: process.env.DATABASE_URL, ssl, max: 10 });
+  return new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl,
+    max: 10,
+    connectionTimeoutMillis: 10000, // fail fast instead of queueing forever when the database is unreachable
+    idleTimeoutMillis: 30000,
+    statement_timeout: 30000,       // one runaway query must not hold a connection for ever
+  });
 }
 
 /** Creates or upgrades all tables. Safe to run on every start. */
@@ -111,9 +119,156 @@ async function migrate(pool) {
       ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS base_stars INTEGER;
       UPDATE sentence_progress SET base_stars = stars WHERE base_stars IS NULL;
 
+      -- Grammar step: a sentence with a gap is answered once (the right word chosen); mistakes are kept for the teacher.
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS grammar_done BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS grammar_mistakes INTEGER NOT NULL DEFAULT 0;
+
       -- Speeds up the "already finished this unit/lesson?" checks as the activity log grows.
       CREATE INDEX IF NOT EXISTS events_user_lesson_type ON events(user_id, lesson_id, type);
+
+      -- Quizzes: every attempt is kept (with each question and the student's answer) for the teacher. scope is 'final' or
+      -- 'unit:<unitId>'. A unit/lesson counts as passed while it has a passed attempt that was not "voided" (the teacher
+      -- voids a scope's attempts to make the student take that quiz again). grandfathered = credit given automatically to
+      -- progress that was finished before quizzes existed.
+      CREATE TABLE IF NOT EXISTS quiz_attempts (
+        id            BIGSERIAL PRIMARY KEY,
+        user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id     TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        scope         TEXT NOT NULL,
+        score         INTEGER NOT NULL,
+        total         INTEGER NOT NULL,
+        passed        BOOLEAN NOT NULL,
+        details       JSONB NOT NULL DEFAULT '[]'::jsonb,
+        seconds       INTEGER NOT NULL DEFAULT 0,
+        cid           TEXT,
+        voided        BOOLEAN NOT NULL DEFAULT FALSE,
+        grandfathered BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS quiz_attempts_user_lesson ON quiz_attempts(user_id, lesson_id, scope, created_at DESC);
+      CREATE INDEX IF NOT EXISTS quiz_attempts_lesson ON quiz_attempts(lesson_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS quiz_attempts_cid ON quiz_attempts(user_id, cid) WHERE cid IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS app_flags (key TEXT PRIMARY KEY, set_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+      -- Arabic translation on the cards: the teacher switches it on for each student (off for everyone by default).
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS arabic_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+      -- Arabic -> build the English: an optional step after Build. The teacher can switch it off for each lesson (ar_step), and the result
+      -- of the first try (mistakes, hints, seconds) is kept for the teacher. It never changes stars and is not needed to finish a unit.
+      ALTER TABLE lessons ADD COLUMN IF NOT EXISTS ar_step BOOLEAN NOT NULL DEFAULT TRUE;
+
+      -- Requirements the teacher can switch on or off for each student (all ON, as before): say each sentence out loud, quizzes needed to finish,
+      -- lessons open one by one, the grammar step, the Arabic -> English step.
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_speak   BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_quiz    BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_order   BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_grammar BOOLEAN NOT NULL DEFAULT TRUE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS req_arstep  BOOLEAN NOT NULL DEFAULT TRUE;
+
+      -- Word meanings ("tap a word to see its meaning"): { "airport": "مطار" } for each lesson, keys are lower case words without punctuation.
+      ALTER TABLE lessons ADD COLUMN IF NOT EXISTS words JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_done     BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_mistakes INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_hints    INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_seconds  INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sentence_progress ADD COLUMN IF NOT EXISTS arb_times    INTEGER NOT NULL DEFAULT 0;
+
+      -- Daily review (spaced repetition): one row for each sentence a student found hard. stage 0..4 = waiting for the 1, 3, 7, 14, 30 day
+      -- review; stage 5 (due_on NULL) = went through every interval. due_on is a UTC date. Reviews never touch sentence_progress stars.
+      CREATE TABLE IF NOT EXISTS review_items (
+        user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id        TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        sentence         TEXT NOT NULL,
+        stage            INTEGER NOT NULL DEFAULT 0,
+        due_on           DATE,
+        weak_count       INTEGER NOT NULL DEFAULT 1,
+        review_count     INTEGER NOT NULL DEFAULT 0,
+        wrong_count      INTEGER NOT NULL DEFAULT 0,
+        last_reviewed_at TIMESTAMPTZ,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, lesson_id, sentence)
+      );
+      CREATE INDEX IF NOT EXISTS review_items_due ON review_items(user_id, due_on);
+
+      -- Speaking check on the learning cards: the student says the sentence and the phone's speech recognition sends back the TEXT it heard (never audio).
+      -- The server scores it (public/speak-core.js). One row per student and sentence: the best score ever, how many tries in all, and the last text heard.
+      CREATE TABLE IF NOT EXISTS speaking_scores (
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lesson_id  TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+        sentence   TEXT NOT NULL,
+        best_score INTEGER NOT NULL DEFAULT 0,
+        last_score INTEGER NOT NULL DEFAULT 0,
+        tries      INTEGER NOT NULL DEFAULT 0,
+        checks     INTEGER NOT NULL DEFAULT 1,
+        passed     BOOLEAN NOT NULL DEFAULT FALSE,
+        heard      TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, lesson_id, sentence)
+      );
     `);
+
+    // Upgrade (once): quizzes became a required step. Whatever a student had already finished before that keeps its credit,
+    // so nobody sees a finished unit or lesson become unfinished.
+    const flagged = await client.query("SELECT 1 FROM app_flags WHERE key = 'quiz_credit_v1'");
+    if (!flagged.rowCount) {
+      const lessons = await client.query('SELECT * FROM lessons');
+      const lps = await client.query('SELECT * FROM lesson_progress');
+      const sps = await client.query('SELECT user_id, lesson_id, sentence, stars, grammar_done AS gdone FROM sentence_progress');
+      const ups = await client.query('SELECT * FROM unit_progress');
+      const key = (u, l) => u + '|' + l;
+      const spBy = new Map(), upBy = new Map(), lpBy = new Map(lps.rows.map(x => [key(x.user_id, x.lesson_id), x]));
+      for (const r of sps.rows) { const k = key(r.user_id, r.lesson_id); if (!spBy.has(k)) spBy.set(k, []); spBy.get(k).push(r); }
+      for (const r of ups.rows) { const k = key(r.user_id, r.lesson_id); if (!upBy.has(k)) upBy.set(k, new Map()); upBy.get(k).set(r.unit_id, r); }
+      const lessonById = new Map(lessons.rows.map(l => [l.id, l]));
+      let credited = 0;
+      for (const [k, rows] of spBy) {
+        const [userId, lessonId] = k.split('|');
+        const l = lessonById.get(lessonId);
+        if (!l) continue;
+        const all = unitsOf(l);
+        // Pretend every quiz is passed: then "completed" simply means "built, and grammar answered".
+        const p = summarize(l, lpBy.get(k), new Map(rows.map(x => [x.sentence, x.stars])), upBy.get(k),
+          undefined, new Set(rows.filter(x => x.gdone).map(x => x.sentence)), { units: all.map(u => u.id), final: true });
+        for (const [i, u] of p.units.entries()) {
+          if (!u.completed) continue;
+          await client.query(
+            `INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, grandfathered) VALUES ($1,$2,$3,$4,$4,TRUE,TRUE)`,
+            [userId, lessonId, 'unit:' + all[i].id, all[i].sentences.length]);
+          credited++;
+        }
+        if (p.completed && p.hasFinal) {
+          await client.query(
+            `INSERT INTO quiz_attempts (user_id, lesson_id, scope, score, total, passed, grandfathered) VALUES ($1,$2,'final',$3,$3,TRUE,TRUE)`,
+            [userId, lessonId, all.reduce((a, u) => a + u.sentences.length, 0)]);
+          credited++;
+        }
+      }
+      await client.query("INSERT INTO app_flags (key) VALUES ('quiz_credit_v1') ON CONFLICT DO NOTHING");
+      if (credited) console.log(`[db] Quizzes: gave credit for ${credited} units/lessons finished before quizzes existed`);
+    }
+
+    // Upgrade (once): sentences students already found hard before reviews existed (a first try with mistakes or hints, a wrong grammar word, a wrong
+    // quiz answer) enter the review schedule. Their first review is spread over the next 7 days (a student with 40 hard sentences gets about 6 a day,
+    // not 40 on the first morning).
+    const reviewFlag = await client.query("SELECT 1 FROM app_flags WHERE key = 'review_backfill_v1'");
+    if (!reviewFlag.rowCount) {
+      const r = await client.query(`
+        INSERT INTO review_items (user_id, lesson_id, sentence, stage, due_on)
+        SELECT user_id, lesson_id, sentence, 0, (now() AT TIME ZONE 'UTC')::date + 1 + ((rn - 1) % 7)::int
+        FROM (
+          SELECT sp.user_id, sp.lesson_id, sp.sentence,
+                 row_number() OVER (PARTITION BY sp.user_id ORDER BY sp.last_solved_at DESC, sp.sentence) AS rn
+          FROM sentence_progress sp
+          WHERE sp.stars < 3 OR sp.grammar_mistakes > 0 OR EXISTS (
+            SELECT 1 FROM quiz_attempts a, jsonb_array_elements(a.details) d
+            WHERE a.user_id = sp.user_id AND a.lesson_id = sp.lesson_id AND NOT a.grandfathered
+              AND d->>'sentence' = sp.sentence AND d->>'correct' = 'false')
+        ) t
+        ON CONFLICT DO NOTHING`);
+      await client.query("INSERT INTO app_flags (key) VALUES ('review_backfill_v1') ON CONFLICT DO NOTHING");
+      if (r.rowCount) console.log(`[db] Reviews: ${r.rowCount} hard sentences were added to the students' review schedules`);
+    }
 
     // Upgrade: lessons made before units existed become a single unit, keeping students' card progress.
     const old = await client.query('SELECT id FROM lessons WHERE units IS NULL');
@@ -129,8 +284,10 @@ async function migrate(pool) {
     }
     if (old.rows.length) console.log(`[db] Upgraded ${old.rows.length} lessons to units`);
 
-    const { rows } = await client.query('SELECT COUNT(*)::int AS n FROM lessons');
-    if (rows[0].n === 0) {
+    // Starter lessons go into a brand-new database only. A teacher who deleted every lesson on purpose
+    // (and already has students) must not see them come back after a restart.
+    const { rows } = await client.query('SELECT (SELECT COUNT(*) FROM lessons)::int AS lessons, (SELECT COUNT(*) FROM users)::int AS users');
+    if (rows[0].lessons === 0 && rows[0].users === 0) {
       for (const [i, l] of seed.entries()) {
         await client.query(
           `INSERT INTO lessons (id, slug, title, level, description, emoji, published, position, units, sentences)
